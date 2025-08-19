@@ -1,5 +1,7 @@
 # LFR Main Pump Ternary Impeller Structure Optimization 🚀💧
 
+> For Academic/Educational purpose only. Commercial use is NOT ALLOWED.
+
 ## 1. Background
 
 ### 1.1 Digital Twin Goals and Ternary Impeller Structure
@@ -37,5 +39,6 @@ Our contribution?
 - **Reduce computation per simulation** 🏎️  
 - **Shorten the overall design cycle** ⏱️  
 - **Support complex, changing boundary conditions** 🌊  
+
 
 In short: we make pump optimization faster, smarter, and slightly more magical. ✨
