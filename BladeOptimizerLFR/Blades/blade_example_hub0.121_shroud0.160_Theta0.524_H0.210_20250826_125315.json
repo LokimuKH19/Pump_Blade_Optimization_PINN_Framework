@@ -1,0 +1,65 @@
+{
+    "layers": [
+        {
+            "theta0": 0.0,
+            "h_max": 0.02,
+            "t_max": 0.01,
+            "alpha": 0.4,
+            "a": 0.2,
+            "b": 0.8,
+            "beta": 0.3,
+            "mode": "extended",
+            "kappa": 1.5
+        },
+        {
+            "theta0": 0.005,
+            "h_max": 0.022,
+            "t_max": 0.011,
+            "alpha": 0.41,
+            "a": 0.2,
+            "b": 0.8,
+            "beta": 0.3,
+            "mode": "extended",
+            "kappa": 1.55
+        },
+        {
+            "theta0": 0.01,
+            "h_max": 0.024,
+            "t_max": 0.012,
+            "alpha": 0.42,
+            "a": 0.2,
+            "b": 0.8,
+            "beta": 0.3,
+            "mode": "extended",
+            "kappa": 1.6
+        },
+        {
+            "theta0": 0.015,
+            "h_max": 0.026,
+            "t_max": 0.013,
+            "alpha": 0.43,
+            "a": 0.2,
+            "b": 0.8,
+            "beta": 0.3,
+            "mode": "extended",
+            "kappa": 1.65
+        },
+        {
+            "theta0": 0.02,
+            "h_max": 0.028,
+            "t_max": 0.014,
+            "alpha": 0.44,
+            "a": 0.2,
+            "b": 0.8,
+            "beta": 0.3,
+            "mode": "extended",
+            "kappa": 1.7
+        }
+    ],
+    "Theta": 0.5235987755982988,
+    "H": 0.21,
+    "z0": -0.1,
+    "hub_radius": 0.121,
+    "shroud_radius": 0.16,
+    "timestamp": "20250826_125315"
+}

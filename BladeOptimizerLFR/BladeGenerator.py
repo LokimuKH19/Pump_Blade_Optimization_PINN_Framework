@@ -2,6 +2,9 @@ import numpy as np
 import pyvista as pv
 import matplotlib.pyplot as plt
 import trimesh
+import json
+import os
+from datetime import datetime
 
 
 # ---------- shape primitives (gamma/tau) ----------
@@ -26,8 +29,6 @@ def beta_distribution_extended(x, alpha, kappa=1.0):
     Formula:
         γ_ext(x) = [x^(κ·α) * (1-x)^(κ·(1-α))] /
                    [(α^α * (1-α)^(1-α))^κ]
-    - kappa > 1 sharpens the peak
-    - kappa < 1 flattens the curve
     """
     x = np.asarray(x)
     eps = 1e-9
@@ -71,7 +72,6 @@ def tapered_thickness_distribution(x, a=0.2, b=0.8, beta=0.3, taper=0.5):
     Formula:
         τ_tape(x) = τ(x) * (1 - taper·x)
     - taper ∈ [0,1]; higher values reduce thickness at the trailing tip
-    - prevents excessive curling at the blade tip
     """
     base = thickness_distribution(x, a, b, beta)
     return base * (1.0 - taper * x)
@@ -102,6 +102,9 @@ class Blade3D:
         self.faces_lower = None
         self.faces_center = None
 
+        # unique timestamp for consistent filenames
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     def _layer_radius(self, i, n):
         li = self.layers[i]
         if 'radius' in li and li['radius'] is not None:
@@ -110,13 +113,14 @@ class Blade3D:
         return (1.0 - w) * self.hub_radius + w * self.shroud_radius
 
     def generate_surface(self, points_per_chord=300):
+        """
+        Generate layered blade surfaces (upper/lower/center).
+        """
         num_layers = len(self.layers)
         N = int(points_per_chord)
         xi = np.linspace(0.0, 1.0, N)
 
-        verts_upper = []
-        verts_lower = []
-        verts_center = []
+        verts_upper, verts_lower, verts_center = [], [], []
 
         for i in range(num_layers):
             prm = self.layers[i]
@@ -178,6 +182,9 @@ class Blade3D:
         self.faces_center = build_faces(self.vertices_center, N, num_layers)
 
     def to_pyvista_mesh(self, mode="both"):
+        """
+        Convert to PyVista PolyData for visualization/export.
+        """
         if self.vertices_upper is None:
             self.generate_surface()
         meshes = []
@@ -192,6 +199,9 @@ class Blade3D:
         return meshes[0].merge(meshes[1:])
 
     def visualize(self, mode="both"):
+        """
+        Show blade in interactive PyVista viewer.
+        """
         mesh = self.to_pyvista_mesh(mode)
         plotter = pv.Plotter()
         plotter.add_mesh(mesh, color='lightblue', show_edges=True)
@@ -199,32 +209,23 @@ class Blade3D:
 
     def _generate_solid_from_surfaces(self, mode="both"):
         """
-        Generate a solid mesh by connecting upper and lower surfaces.
-        - mode: "upper", "lower", "both" (used for surface selection)
-        Returns:
-            trimesh.Trimesh object
+        Generate a solid trimesh mesh by connecting upper and lower surfaces.
         """
-        # Ensure surfaces are generated
         if self.vertices_upper is None:
             self.generate_surface()
 
-        # Number of layers and points per chord
         num_layers = len(self.layers)
         N = len(self.vertices_upper) // num_layers
 
-        # Build vertices
         vertices = []
         if mode in ["upper", "both"]:
             vertices.extend(self.vertices_upper.tolist())
         if mode in ["lower", "both"]:
             vertices.extend(self.vertices_lower.tolist())
-
         vertices = np.array(vertices)
 
-        # Build faces
         faces = []
-
-        # Upper surface faces
+        # Upper faces
         if mode in ["upper", "both"]:
             for i in range(num_layers - 1):
                 base0 = i * N
@@ -237,7 +238,7 @@ class Blade3D:
                     faces.append([v0, v1, v2])
                     faces.append([v0, v2, v3])
 
-        # Lower surface faces (offset by upper vertices)
+        # Lower faces (offset if both included)
         offset = len(self.vertices_upper) if mode in ["both"] else 0
         if mode in ["lower", "both"]:
             for i in range(num_layers - 1):
@@ -248,10 +249,10 @@ class Blade3D:
                     v1 = base0 + j + 1
                     v2 = base1 + j + 1
                     v3 = base1 + j
-                    faces.append([v0, v2, v1])  # reverse order to flip normals
+                    faces.append([v0, v2, v1])
                     faces.append([v0, v3, v2])
 
-        # Side faces connecting upper and lower surfaces
+        # Side faces
         if mode == "both":
             for i in range(num_layers):
                 base_upper = i * N
@@ -264,20 +265,116 @@ class Blade3D:
                     faces.append([v0, v1, v2])
                     faces.append([v0, v2, v3])
 
-        # Create trimesh
         solid_mesh = trimesh.Trimesh(vertices=vertices, faces=np.array(faces))
         solid_mesh.remove_duplicate_faces()
         solid_mesh.remove_unreferenced_vertices()
         solid_mesh.fill_holes()
         return solid_mesh
 
-    def export_mesh(self, filename: str, mode: str = "both", as_solid: bool = False):
+    def save_metadata(self, filename_prefix: str):
+        """
+        Save blade parameters to JSON.
+        Ensures filename includes timestamp and key parameters.
+        """
+
+        # Ensure directory exists
+        dir_path = os.path.dirname(filename_prefix)
+        if dir_path and not os.path.exists(dir_path):
+            os.makedirs(dir_path, exist_ok=True)
+
+        metadata = {
+            "layers": self.layers,
+            "Theta": self.Theta,
+            "H": self.H,
+            "z0": self.z0,
+            "hub_radius": self.hub_radius,
+            "shroud_radius": self.shroud_radius,
+            "timestamp": self.timestamp,
+        }
+
+        fname = (
+            f"{filename_prefix}_hub{self.hub_radius:.3f}"
+            f"_shroud{self.shroud_radius:.3f}"
+            f"_Theta{self.Theta:.3f}"
+            f"_H{self.H:.3f}_{self.timestamp}.json"
+        )
+        with open(fname, "w") as f:
+            json.dump(metadata, f, indent=4)
+        return fname
+
+    @classmethod
+    def load_metadata(cls, filename: str):
+        """
+        Load Blade3D parameters from JSON file.
+        """
+        with open(filename, "r") as f:
+            metadata = json.load(f)
+        obj = cls(
+            span_layers=metadata["layers"],
+            Theta=metadata["Theta"],
+            H=metadata["H"],
+            z0=metadata["z0"],
+            hub_radius=metadata["hub_radius"],
+            shroud_radius=metadata["shroud_radius"],
+        )
+        obj.timestamp = metadata.get("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S"))
+        return obj
+
+    def export_mesh(self, filename_prefix: str, mode: str = "both", as_solid: bool = False, save_params: bool = True):
+        """
+        Export blade mesh as STL and optionally save JSON metadata.
+        Both files will share the same prefix and timestamp.
+        """
+        # Ensure directory exists
+        dir_path = os.path.dirname(filename_prefix)
+        if dir_path and not os.path.exists(dir_path):
+            os.makedirs(dir_path, exist_ok=True)
+
+        # Ensure surfaces exist
+        if self.vertices_upper is None:
+            self.generate_surface()
+
+        # Base filename with parameters + timestamp
+        base_name = (
+            f"{filename_prefix}_hub{self.hub_radius:.3f}"
+            f"_shroud{self.shroud_radius:.3f}"
+            f"_Theta{self.Theta:.3f}"
+            f"_H{self.H:.3f}_{self.timestamp}"
+        )
+
+        stl_file = base_name + (".stl" if as_solid else "_surf.stl")
+
         if as_solid:
             mesh = self._generate_solid_from_surfaces(mode)
-            mesh.export(filename)
-            return
-        mesh = self.to_pyvista_mesh(mode)
-        mesh.save(filename)
+            mesh.export(stl_file)
+        else:
+            mesh = self.to_pyvista_mesh(mode)
+            mesh.save(stl_file)
+
+        if save_params:
+            json_file = self.save_metadata(filename_prefix)
+            print(f"✅ STL exported: {stl_file}")
+            print(f"✅ Params saved: {json_file}")
+        return stl_file
+
+    # -------- batch utilities --------
+    @staticmethod
+    def batch_load_blades(folder: str):
+        """
+        Batch load all blades from a folder.
+        Returns list of Blade3D objects.
+        Only loads JSON (STL assumed paired by naming).
+        """
+        blades = []
+        for f in os.listdir(folder):
+            if f.endswith(".json"):
+                fullpath = os.path.join(folder, f)
+                try:
+                    blade = Blade3D.load_metadata(fullpath)
+                    blades.append(blade)
+                except Exception as e:
+                    print(f"⚠️ Failed to load {f}: {e}")
+        return blades
 
 
 # ------------- example -------------
@@ -305,44 +402,14 @@ if __name__ == "__main__":
     )
     blade.generate_surface(points_per_chord=300)
 
-    blade.visualize(mode="both")
-    blade.export_mesh("blade_example_solid.stl", mode="both", as_solid=True)
-    blade.export_mesh("blade_example_surface.stl", mode="both", as_solid=False)
+    # Export both solid and surface with consistent timestamp + JSON
+    blade.export_mesh("./Blades/blade_example", mode="both", as_solid=True)
+    blade.export_mesh("./Blades/blade_example", mode="both", as_solid=False)
 
-    # -------- validation script: plot one cross-section --------
-    test_layer_index = 1
-    test_layer = layers_params[test_layer_index]
-    N = 200
-    xi = np.linspace(0.0, 1.0, N)
+    # Batch load example
+    loaded_blades = Blade3D.batch_load_blades(".")
+    print(f"Loaded {len(loaded_blades)} blades from folder.")
 
-    mode = test_layer.get('mode', 'basic')
-    if mode == 'extended':
-        gamma = beta_distribution_extended(xi, test_layer['alpha'], test_layer.get('kappa', 1.5))
-    else:
-        gamma = beta_distribution(xi, test_layer['alpha'])
+    # reconstruct one blade from file
+    # blade = Blade3D.load_metadata("blade_example_hub0.121_shroud0.160_Theta0.524_H0.210_20250826_120301.json")
 
-    if mode == 'tapered':
-        tau = tapered_thickness_distribution(xi, test_layer['a'], test_layer['b'], test_layer['beta'], test_layer.get('taper', 0.5))
-    else:
-        tau = thickness_distribution(xi, test_layer['a'], test_layer['b'], test_layer['beta'])
-
-    theta0 = float(test_layer['theta0'])
-    h_max = float(test_layer['h_max'])
-    t_max = float(test_layer['t_max'])
-    theta = theta0 + xi * blade.Theta
-
-    z_center = blade.z0 + xi * blade.H - h_max * gamma
-    z_upper = z_center + t_max * tau
-    z_lower = z_center - t_max * tau
-
-    plt.figure(figsize=(6, 4))
-    plt.plot(xi, z_center, 'k-', label="camber line")
-    plt.plot(xi, z_upper, 'r-', label="upper surface")
-    plt.plot(xi, z_lower, 'b-', label="lower surface")
-    plt.xlabel("Relative chord position ξ")
-    plt.ylabel("z (relative)")
-    plt.title(f"Blade cross-section (span={test_layer_index/(len(layers_params)-1)} ({mode} mode)")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
