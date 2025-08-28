@@ -35,8 +35,7 @@ The program leverages **trimesh** for geometry handling and **pyvista** for expo
 
 - **Function:** `create_diffuser(shape, radius_base, radius_top, height, z_base, position)`  
 - **Purpose:** Parametric modeling of pump inlet/outlet shapes.  
-- **Supported Shapes:**  
-  - Hemisphere 🌐:
+- Hemisphere Supported 🌐:
 ```math
 X = R \sin(\Theta) \cos(\Phi), \quad Y = R \sin(\Theta) \sin(\Phi), \quad Z = 
 \begin{cases} 
@@ -44,7 +43,7 @@ X = R \sin(\Theta) \cos(\Phi), \quad Y = R \sin(\Theta) \sin(\Phi), \quad Z =
 r \cos(\Theta) + z_{\text{base}}, & \text{top outlet hemisphere} 
 \end{cases}
 ```
-  - Paraboloid 🔺  
+- Paraboloid Supported 🔺:
 ```math
 X = R \cos(\Phi), \quad Y = R \sin(\Phi), \quad Z = 
 \begin{cases} 
