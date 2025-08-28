@@ -106,7 +106,7 @@ z_{±}(r', θ'_r) = θ_0(r') + θ'_r * H - h_\rm{max}(r') \cdot γ_{r'}(θ'_r) �
 
 - Parameters $a_{r'}, b_{r'}$ control the plateau, $β_{r'}$ controls steepness.
 
-- Each layer has 7 parameters: $θ_0(r'), h_max(r'), t_max(r'), α_{r'}, a_{r'}, b_{r'}, β_{r'}$. With 5 layers plus global $Θ, H$, total **37 parameters per blade**.
+- Each layer has 7 parameters: $θ_0(r') h_\rm{max}(r') t_\rm{max}(r') α_{r'} a_{r'} b_{r'} β_{r'}$. With 5 layers plus global $Θ, H$, total **37 parameters per blade**.
 
 ---
 
