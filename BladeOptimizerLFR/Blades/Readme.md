@@ -26,9 +26,9 @@ Each layer shares the same leading and trailing edge heights. The angular coordi
 
 We define the **chord line** as the line between the leading edge and trailing edge:  
 
-math''
-C(θ, r′) = z₀ + (θ - θ₀)/Θ ⋅ H
-''
+math'''
+   C(θ, r′)=z₀+\frac{(θ - θ₀)}{Θ}\cdot H
+'''
 
 Then, the blade surface is constructed using the chord line, thickness, and camber (curvature).  
 Let:  
