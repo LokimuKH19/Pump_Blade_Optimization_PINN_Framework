@@ -31,7 +31,7 @@ z_{±}(θ, r') = -h(θ, r') ± t(θ, r')
 Define maximum camber and thickness per layer:
 
 ```math
-h(θ, r') = h_{\rm{max}}(r') \cdot γ_{r'}(θ), t(θ, r') = t_\rm{max}(r') * τ_{r'}(θ)
+h(θ, r') = h_{\rm{max}}(r') \cdot γ_{r'}(θ), t(θ, r') = t_\rm{max}(r') \cdot τ_{r'}(θ)
 ```
 
 where $γ_{r'}(θ)$ and $τ_{r'}(θ)$ are relative camber and thickness functions:
@@ -41,7 +41,7 @@ where $γ_{r'}(θ)$ and $τ_{r'}(θ)$ are relative camber and thickness function
 ```
 
 ```math
-\frac{d^2γ_{r'}}{dθ²}, \frac{d^2τ_{r'}}{dθ^2} ≤ 0, θ \in (θ_0, θ_0+Θ); \frac{dγ_r'}{dθ}, frac{dτ_{r'}}{dθ} \neq 0, θ ∈ {θ_0, θ_0+Θ}
+\frac{d^2γ_{r'}}{dθ^2}, \frac{d^2τ_{r'}}{dθ^2} ≤ 0, θ \in (θ_0, θ_0+Θ); \frac{dγ_r'}{dθ}, frac{dτ_{r'}}{dθ} \neq 0, θ ∈ {θ_0, θ_0+Θ}
 ```
 
 So the final upper/lower surface becomes:
@@ -116,7 +116,7 @@ z_{±}(r', θ'_r) = θ_0(r') + θ'_r * H - h_\rm{max}(r') \cdot γ_{r'}(θ'_r) �
 - Use **dual-parameter distribution**:
 
 ```math
-γ_{r'}(·) = \frac{((·)^{κ·α}(1 - ·)^{κ·(1-α)})}{(α^α(1-α)^(1-α))^κ}
+γ_{r'}(·) = \frac{(·)^{κ·α}(1 - ·)^{κ·(1-α)}}{(α^α(1-α)^(1-α))^κ}
 ```
 
 - Extra parameter $κ$ improves smoothness at blade tip. The parameters finally comes to **42**.
