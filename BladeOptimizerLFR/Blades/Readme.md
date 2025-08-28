@@ -47,7 +47,7 @@ where $γ_{r'}(θ)$ and $τ_{r'}(θ)$ are relative camber and thickness function
 So the final upper/lower surface becomes:
 
 ```math
-z_{±}(r', θ) = z_0 + (θ - θ_0(r'))/Θ * H - h_{\rm{max}}(r') * γ_{r'}(θ) ± t_{\rm{max}(r') * τ_{r'}(θ)
+z_{±}(r', θ) = z_0 + \frac{(θ - θ_0(r'))}{Θ} \cdot H - h_{\rm{max}}(r') \cdot γ_{r'}(θ) ± t_{\rm{max}}(r') \cdot τ_{r'}(θ)
 ```
 
 ---
@@ -90,7 +90,7 @@ z_{±}(r', θ'_r) = θ_0(r') + θ'_r * H - h_\rm{max}(r') \cdot γ_{r'}(θ'_r) �
 - **Camber γ(r')** using Beta-like distribution (single parameter α):
 
 ```math
-γ_{r'}(·) = \frac{(·)^{α_{r'}}(1 - ·)^{1 - α_{r'}}}{(α_{r'}^{α_{r'}}(1 - α_{r'})^{1 - α_{r'}})}
+γ_{r'}(·) = \frac{(·)^{α_{r'}}(1 - (·))^{1 - α_{r'}}}{(α_{r'}^{α_{r'}}(1 - α_{r'})^{1 - α_{r'}})}
 ```
 
 - **Thickness τ(r')** to keep uniform midspan:
