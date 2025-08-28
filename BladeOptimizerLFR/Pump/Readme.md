@@ -108,8 +108,7 @@ The goal is to connect `Assembly.py` with an **interactive Blade Parameterizatio
 
 - **Diffuser Geometry Control:**  
   The UI will support parameterization of inlet and outlet diffusers:  
-  - **Hemisphere 🌐** – Generated using polar (`θ`) and azimuthal (`φ`) subdivisions.  
-  - **Paraboloid 🔺** – Defined via radial (`r`) and azimuthal (`φ`) mesh with quadratic height function.  
+  - **Hemisphere 🌐** – Generated using polar (`θ`) and azimuthal (`φ`) subdivisions.
 
 ```math
 X = R \sin(\Theta) \cos(\Phi), \quad Y = R \sin(\Theta) \sin(\Phi), \quad Z = 
@@ -119,8 +118,14 @@ r \cos(\Theta) + z_{\text{base}}, & \text{top outlet hemisphere}
 \end{cases}
 ```
 
+  - **Paraboloid 🔺** – Defined via radial (`r`) and azimuthal (`φ`) mesh with quadratic height function.  
+
 ```math
-# Placeholder for paraboloid formula #
+X = R \cos(\Phi), \quad Y = R \sin(\Phi), \quad Z = 
+\begin{cases} 
+h \left(\frac{R}{R_{\text{base}}}\right)^2 + z_{\text{base}}, & \text{bottom paraboloid (inlet)} \\
+h \left(1 - \left(\frac{R}{R_{\text{base}}}\right)^2\right) + z_{\text{base}}, & \text{top paraboloid (outlet)} 
+\end{cases}
 ```
 
 - **Real-time Assembly Preview:**  
