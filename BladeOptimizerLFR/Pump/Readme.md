@@ -48,7 +48,7 @@ r \cos(\Theta) + z_{\text{base}}, & \text{top outlet hemisphere}
 X = R \cos(\Phi), \quad Y = R \sin(\Phi), \quad Z = 
 \begin{cases} 
 h \left(\frac{R}{R_{\text{base}}}\right)^2 + z_{\text{base}}, & \text{bottom inlet hemisphere} \\
-h \left(1 - \left(\frac{R}{R_{\text{base}}}\right)^2\right) + z_{\text{base}}, & \text{top outlet hemisphere}} 
+h \left(1 - \left(\frac{R}{R_{\text{base}}}\right)^2\right) + z_{\text{base}}, & \text{top outlet hemisphere} 
 \end{cases}
 ```
 #### Hemisphere Diffuser
