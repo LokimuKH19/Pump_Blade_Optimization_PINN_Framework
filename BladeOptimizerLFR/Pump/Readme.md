@@ -36,9 +36,22 @@ The program leverages **trimesh** for geometry handling and **pyvista** for expo
 - **Function:** `create_diffuser(shape, radius_base, radius_top, height, z_base, position)`  
 - **Purpose:** Parametric modeling of pump inlet/outlet shapes.  
 - **Supported Shapes:**  
-  - Hemisphere 🌐  
+  - Hemisphere 🌐:
+```math
+X = R \sin(\Theta) \cos(\Phi), \quad Y = R \sin(\Theta) \sin(\Phi), \quad Z = 
+\begin{cases} 
+-r \cos(\Theta) + z_{\text{base}} + r, & \text{bottom inlet hemisphere} \\
+r \cos(\Theta) + z_{\text{base}}, & \text{top outlet hemisphere} 
+\end{cases}
+```
   - Paraboloid 🔺  
-
+```math
+X = R \cos(\Phi), \quad Y = R \sin(\Phi), \quad Z = 
+\begin{cases} 
+h \left(\frac{R}{R_{\text{base}}}\right)^2 + z_{\text{base}}, & \text{bottom paraboloid (inlet)} \\
+h \left(1 - \left(\frac{R}{R_{\text{base}}}\right)^2\right) + z_{\text{base}}, & \text{top paraboloid (outlet)} 
+\end{cases}
+```
 #### Hemisphere Diffuser
 
 - Uses spherical coordinates with azimuthal (`φ`) and polar (`θ`) subdivisions.  
@@ -109,24 +122,7 @@ The goal is to connect `Assembly.py` with an **interactive Blade Parameterizatio
 - **Diffuser Geometry Control:**  
   The UI will support parameterization of inlet and outlet diffusers:  
   - **Hemisphere 🌐** – Generated using polar (`θ`) and azimuthal (`φ`) subdivisions.
-
-```math
-X = R \sin(\Theta) \cos(\Phi), \quad Y = R \sin(\Theta) \sin(\Phi), \quad Z = 
-\begin{cases} 
--r \cos(\Theta) + z_{\text{base}} + r, & \text{bottom inlet hemisphere} \\
-r \cos(\Theta) + z_{\text{base}}, & \text{top outlet hemisphere} 
-\end{cases}
-```
-
   - **Paraboloid 🔺** – Defined via radial (`r`) and azimuthal (`φ`) mesh with quadratic height function.  
-
-```math
-X = R \cos(\Phi), \quad Y = R \sin(\Phi), \quad Z = 
-\begin{cases} 
-h \left(\frac{R}{R_{\text{base}}}\right)^2 + z_{\text{base}}, & \text{bottom paraboloid (inlet)} \\
-h \left(1 - \left(\frac{R}{R_{\text{base}}}\right)^2\right) + z_{\text{base}}, & \text{top paraboloid (outlet)} 
-\end{cases}
-```
 
 - **Real-time Assembly Preview:**  
   As users adjust blade parameters or diffuser shapes, the full pump assembly can be instantly updated and visualized.  
