@@ -41,7 +41,7 @@ where $γ_{r'}(θ)$ and $τ_{r'}(θ)$ are relative camber and thickness function
 ```
 
 ```math
-\frac{d^2γ_{r'}}{dθ^2}, \frac{d^2τ_{r'}}{dθ^2} ≤ 0, θ \in (θ_0, θ_0+Θ); \frac{dγ_r'}{dθ}, frac{dτ_{r'}}{dθ} \neq 0, θ ∈ {θ_0, θ_0+Θ}
+\frac{d^2γ_{r'}}{dθ^2}, \frac{d^2τ_{r'}}{dθ^2} ≤ 0, θ \in (θ_0, θ_0+Θ); \frac{dγ_r'}{dθ}, \frac{dτ_{r'}}{dθ} \neq 0, θ ∈ {θ_0, θ_0+Θ}
 ```
 
 So the final upper/lower surface becomes:
