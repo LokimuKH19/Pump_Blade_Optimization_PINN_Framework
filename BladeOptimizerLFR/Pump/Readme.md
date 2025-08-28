@@ -45,19 +45,11 @@ The program leverages **trimesh** for geometry handling and **pyvista** for expo
 - Bottom diffuser: convex downward (apex at top, base at z_base).  
 - Top diffuser: convex upward (apex at top, base at z_base).
 
-````math
-# Hemisphere formula placeholder #
-````
-
 #### Paraboloid Diffuser
 
 - Radial and azimuthal subdivisions (`r`, `φ`) generate mesh.  
 - Bottom: convex downward, `Z = height * (R / radius_base)^2 + z_base`.  
 - Top: convex upward, `Z = height * (1 - (R / radius_base)^2) + z_base`.
-
-````math
-# Paraboloid formula placeholder #
-````
 
 ---
 
@@ -109,18 +101,33 @@ export_pump(meshes, directory='./Pump', export_format="stl")
 ---
 ## Future Integration with Blade UI 🖥️
 
-- Goal: Connect Assembly.py with a Blade Parameterization UI.
+The goal is to connect `Assembly.py` with an **interactive Blade Parameterization UI**, allowing engineers to visually design and adjust pump components. Key points include:
 
-- Users can visually define:
+- **Interactive Blade Editing:**  
+  Users can define rotor and vane blade shapes, specify spanwise camber and thickness distributions, and preview changes in real-time.  
 
--- Rotor and vane blade shapes.
+- **Diffuser Geometry Control:**  
+  The UI will support parameterization of inlet and outlet diffusers:  
+  - **Hemisphere 🌐** – Generated using polar (`θ`) and azimuthal (`φ`) subdivisions.  
+  - **Paraboloid 🔺** – Defined via radial (`r`) and azimuthal (`φ`) mesh with quadratic height function.  
 
--- Spanwise distribution of camber and thickness.
+```math
+X = R \sin(\Theta) \cos(\Phi), \quad Y = R \sin(\Theta) \sin(\Phi), \quad Z = 
+\begin{cases} 
+-r \cos(\Theta) + z_{\text{base}} + r, & \text{bottom inlet hemisphere} \\
+r \cos(\Theta) + z_{\text{base}}, & \text{top outlet hemisphere} 
+\end{cases}
+```
 
--- Inlet/outlet diffuser geometry.
+```math
+# Placeholder for paraboloid formula #
+```
 
-- Diffuser integration:
+- **Real-time Assembly Preview:**  
+  As users adjust blade parameters or diffuser shapes, the full pump assembly can be instantly updated and visualized.  
 
--- Hemisphere: defined via polar/azimuthal mesh generation.
+- **Seamless Export:**  
+  Meshes can be exported in STL or VTK directly from the UI, ready for CFD or CAD analysis.  
 
--- Paraboloid: defined via radial/azimuthal mesh and quadratic height function.
+- **Parameter Synchronization:**  
+  Changes made in the UI will map directly to the `Assembly.py` parameters, ensuring consistency between interactive design and programmatic assembly.
