@@ -1,4 +1,4 @@
-# Assembly.py Overview 🏭
+# How to Assemble the Blades to the Pump? 🏭
 
 This markdown file provides an introduction to the **`Assembly.py`** program, which is designed for assembling pump geometries using parameterized blade models generated from `BladeGenerator.py`. It supports rotor blades, optional vanes, and inlet/outlet diffusers, all in a flexible parametric way.
 
@@ -109,6 +109,8 @@ meshes = assemble_pump(
 )
 export_pump(meshes, directory='./Pump', export_format="stl")
 ```
+
+Feel free to expore the `.stl` files in this filefolder.
 
 ---
 ## Future Integration with Blade UI 🖥️
