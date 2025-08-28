@@ -136,9 +136,11 @@ z_{±}(r', θ'_r) = θ_0(r') + θ'_r * H - h_\rm{max}(r') \cdot γ_{r'}(θ'_r) �
 ## Figures and Models 🖼️
 
 - **Blade Before and After Centerline Optimization**
-  ![Blade Comparison](./Conparison.stl)
+
+  ![Blade Comparison](./Conparison.png)
   
 - **An example of Blade**:
+
   ![Blade Model](./blade_example_hub0.121_shroud0.160_Theta0.524_H0.210_20250826_125315.stl)
 
 
