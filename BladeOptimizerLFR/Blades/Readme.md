@@ -57,12 +57,12 @@ z_{±}(r', θ) = z_0 + \frac{(θ - θ_0(r'))}{Θ} \cdot H - h_{\rm{max}}(r') \cd
 - Non-dimensional angle along the chord:
 
 ```math
-θ'_r = \frac{(θ - θ_0(r'))}{Θ}
+θ'_r = \frac{θ - θ_0(r')}{Θ}
 ```
 - Relative camber and thickness functions become:
 
 ```math
-γ_{r'}(θ'_r) = γ_{r'}\left( \frac{(θ - θ_0(r'))}{Θ} \right), τ_{r'}(θ'_r) = τ_{r'}\left( \frac{(θ - θ_0(r'))}{Θ} \right)
+γ_{r'}(θ'_r) = γ_{r'}\left( \frac{θ - θ_0(r')}{Θ} \right), τ_{r'}(θ'_r) = τ_{r'}\left( \frac{θ - θ_0(r')}{Θ} \right)
 ```
 
 - Boundary constraints:
@@ -96,12 +96,12 @@ z_{±}(r', θ'_r) = θ_0(r') + θ'_r * H - h_\rm{max}(r') \cdot γ_{r'}(θ'_r) �
 - **Thickness τ(r')** to keep uniform midspan:
 
 ```math
-τ_{r'}(·) =
+τ_{r'}(·) = \begin{cases}
 {
-((1 - cos(π * · / a_{r'}))/2)^{β_{r'}}, (·) ∈ [0, a_{r'}]
-1, (·) ∈ (a_{r'}, b_{r'})
-((1 + cos(π * (· - b_{r'})/(1 - b_{r'})))/2)^{β_{r'}}, (·) ∈ [b_{r'}, 1]
-}
+((1 - cos(π * · / a_{r'}))/2)^{β_{r'}}, (·) ∈ [0, a_{r'}] //
+1, (·) ∈ (a_{r'}, b_{r'}) // 
+((1 + cos(π * (· - b_{r'})/(1 - b_{r'})))/2)^{β_{r'}}, (·) ∈ [b_{r'}, 1] //
+}\end{cases}
 ```
 
 - Parameters $a_{r'}, b_{r'}$ control the plateau, $β_{r'}$ controls steepness.
