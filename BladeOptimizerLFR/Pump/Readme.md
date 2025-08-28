@@ -47,8 +47,8 @@ r \cos(\Theta) + z_{\text{base}}, & \text{top outlet hemisphere}
 ```math
 X = R \cos(\Phi), \quad Y = R \sin(\Phi), \quad Z = 
 \begin{cases} 
-h \left(\frac{R}{R_{\text{base}}}\right)^2 + z_{\text{base}}, & \text{bottom paraboloid (inlet)} \\
-h \left(1 - \left(\frac{R}{R_{\text{base}}}\right)^2\right) + z_{\text{base}}, & \text{top paraboloid (outlet)} 
+h \left(\frac{R}{R_{\text{base}}}\right)^2 + z_{\text{base}}, & \text{bottom inlet hemisphere} \\
+h \left(1 - \left(\frac{R}{R_{\text{base}}}\right)^2\right) + z_{\text{base}}, & \text{top outlet hemisphere}} 
 \end{cases}
 ```
 #### Hemisphere Diffuser
