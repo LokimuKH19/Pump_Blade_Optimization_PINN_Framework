@@ -8,7 +8,9 @@ This folder contains blade models generated via the parameterized `../BladeGener
 
 Consider a single blade with angular span Θ and height along the z-axis H. The dimensionless radial parameter $r' \in [0,1]$ represents the normalized blade height (spanwise position).
 
-For a single blade, we sample **5 cylindrical layers** along its height (see in the Figure). Each layer's shape curve is sampled in the θ-z plane as in Fig(a). Note that for a fixed blade, all layers share the same leading/trailing edge height. If the blade’s top and bottom are straight, the leading/trailing edge angle is the same. Twists can be added in the modeling process.
+![Blade Geometry](./Illustration.png)
+
+For a single blade, we sample **5 cylindrical layers** along its height (see in the Figure above). Each layer's shape curve is sampled in the θ-z plane as in Figure(a). Note that for a fixed blade, all layers share the same leading/trailing edge height. If the blade’s top and bottom are straight, the leading/trailing edge angle is the same. Twists can be added in the modeling process. For the blade chord and centerline illustration, see in Figure (b). 
 
 ### Blade Geometry Definition 📐
 
@@ -99,7 +101,7 @@ z_{±}(r', θ'_r) = θ_0(r') + θ'_r * H - h_\rm{max}(r') \cdot γ_{r'}(θ'_r) �
 τ_{r'}(·) = \begin{cases}
 ((1 - \rm{cos}(π (·) / a_{r'}))/2)^{β_{r'}}, (·) ∈ [0, a_{r'}] \\
 1, (·) ∈ (a_{r'}, b_{r'}) \\
-((1 + \rm{cos}(π (·) - b_{r'})/(1 - b_{r'})))/2)^{β_{r'}}, (·) ∈ [b_{r'}, 1] \\
+((1 + \rm{cos}(π (·) - b_{r'})/(1 - b_{r'})))/2)^{β_{r'}}, (·) ∈ [b_{r'}, 1]
 \end{cases}
 ```
 
@@ -133,8 +135,12 @@ z_{±}(r', θ'_r) = θ_0(r') + θ'_r * H - h_\rm{max}(r') \cdot γ_{r'}(θ'_r) �
 
 ## Figures and Models 🖼️
 
-- **Figure 2.4(a)**: Blade θ-z sampling (insert your image here)  
-- **Figure 2.4(b)**: Blade chord and centerline illustration (insert your image here)
+- **Blade Before and After Centerline Optimization**
+  ![Blade Comparison](./Conparison.stl)
+  
+- **An example of Blade**:
+  ![Blade Model](./blade_example_hub0.121_shroud0.160_Theta0.524_H0.210_20250826_125315.stl)
+
 
 ---
 
