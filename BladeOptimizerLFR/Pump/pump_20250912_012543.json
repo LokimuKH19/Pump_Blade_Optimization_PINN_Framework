@@ -1,0 +1,13 @@
+{
+    "rotor_blade_file": "./Blades/blade_example_hub0.121_shroud0.160_Theta1.047_H0.210_20250909_103633.json",
+    "vane_blade_file": "./Blades/blade_example_hub0.121_shroud0.160_Theta0.524_H0.210_20250826_125315.json",
+    "rotor_height": 0.25,
+    "vane_height": 0.25,
+    "n_rotor_blades": 6,
+    "n_vane_blades": 10,
+    "outlet_shaft_radius": 0.05,
+    "outlet_shaft_length": 0.3,
+    "inlet_shape": "paraboloid",
+    "outlet_shape": "hemisphere",
+    "as_solid": true
+}
