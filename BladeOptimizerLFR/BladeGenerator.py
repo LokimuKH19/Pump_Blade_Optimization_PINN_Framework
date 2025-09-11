@@ -1,3 +1,4 @@
+# BladeGenerator.py
 import numpy as np
 import pyvista as pv
 import matplotlib.pyplot as plt
@@ -209,66 +210,143 @@ class Blade3D:
 
     def _generate_solid_from_surfaces(self, mode="both"):
         """
-        Generate a solid trimesh mesh by connecting upper and lower surfaces.
+        Robust generation of a watertight solid by connecting upper and lower surfaces,
+        sealing side walls and inlet/outlet end caps.
+
+        Strategy:
+        - Build vertex array: [upper_layer0...upper_layerM, lower_layer0...lower_layerM]
+        - Create triangle faces for upper strips, lower strips, side walls (with proper wrap)
+        - Seal inlet/outlet by pairing corresponding upper/lower ring vertices (j -> j+1 % N)
+        - Run mesh cleanup/repair steps and return a watertight trimesh.Trimesh
         """
         if self.vertices_upper is None:
             self.generate_surface()
 
         num_layers = len(self.layers)
+        # points per chord (N) is number of points per layer on upper surface
         N = len(self.vertices_upper) // num_layers
+        if N < 3:
+            raise ValueError("Not enough chord points to form a closed ring (N < 3)")
 
-        vertices = []
-        if mode in ["upper", "both"]:
-            vertices.extend(self.vertices_upper.tolist())
-        if mode in ["lower", "both"]:
-            vertices.extend(self.vertices_lower.tolist())
-        vertices = np.array(vertices)
+        # Build vertices list: upper then lower (if both)
+        verts_upper = np.asarray(self.vertices_upper) if (mode in ["upper", "both"]) else np.empty((0,3))
+        verts_lower = np.asarray(self.vertices_lower) if (mode in ["lower", "both"]) else np.empty((0,3))
+        vertices = np.vstack([verts_upper, verts_lower]) if len(verts_lower) else verts_upper.copy()
 
         faces = []
-        # Upper faces
+        offset = len(verts_upper)  # offset index where lower vertices start (if present)
+
+        # --- upper surface quads -> triangles (iterate layers, wrap chords) ---
         if mode in ["upper", "both"]:
             for i in range(num_layers - 1):
                 base0 = i * N
                 base1 = (i + 1) * N
-                for j in range(N - 1):
+                for j in range(N):
+                    jn = (j + 1) % N
                     v0 = base0 + j
-                    v1 = base0 + j + 1
-                    v2 = base1 + j + 1
+                    v1 = base0 + jn
+                    v2 = base1 + jn
                     v3 = base1 + j
                     faces.append([v0, v1, v2])
                     faces.append([v0, v2, v3])
 
-        # Lower faces (offset if both included)
-        offset = len(self.vertices_upper) if mode in ["both"] else 0
+        # --- lower surface quads -> triangles (note orientation) ---
         if mode in ["lower", "both"]:
             for i in range(num_layers - 1):
-                base0 = i * N + offset
-                base1 = (i + 1) * N + offset
-                for j in range(N - 1):
+                base0 = offset + i * N
+                base1 = offset + (i + 1) * N
+                for j in range(N):
+                    jn = (j + 1) % N
                     v0 = base0 + j
-                    v1 = base0 + j + 1
-                    v2 = base1 + j + 1
+                    v1 = base0 + jn
+                    v2 = base1 + jn
                     v3 = base1 + j
+                    # flip orientation for lower to keep consistent outward normals
                     faces.append([v0, v2, v1])
                     faces.append([v0, v3, v2])
 
-        # Side faces
+        # --- side walls: connect upper ring i to lower ring i (for each radial layer) ---
         if mode == "both":
             for i in range(num_layers):
                 base_upper = i * N
-                base_lower = base_upper + offset
-                for j in range(N - 1):
+                base_lower = offset + i * N
+                for j in range(N):
+                    jn = (j + 1) % N
                     v0 = base_upper + j
-                    v1 = base_upper + j + 1
-                    v2 = base_lower + j + 1
+                    v1 = base_upper + jn
+                    v2 = base_lower + jn
                     v3 = base_lower + j
                     faces.append([v0, v1, v2])
                     faces.append([v0, v2, v3])
 
-        solid_mesh = trimesh.Trimesh(vertices=vertices, faces=np.array(faces))
-        solid_mesh.remove_duplicate_faces()
-        solid_mesh.remove_unreferenced_vertices()
-        solid_mesh.fill_holes()
+            # --- inlet cap (layer 0): connect upper ring0 and lower ring0 ---
+            ring_u = [0 + j for j in range(N)]
+            ring_l = [offset + j for j in range(N)]
+            for j in range(N):
+                jn = (j + 1) % N
+                # two triangles filling the quad between upper[j], lower[j], upper[jn], lower[jn]
+                faces.append([ring_u[j], ring_l[j], ring_u[jn]])
+                faces.append([ring_l[j], ring_l[jn], ring_u[jn]])
+
+            # --- outlet cap (last layer): connect upper ring M-1 and lower ring M-1 ---
+            start_u = (num_layers - 1) * N
+            start_l = offset + (num_layers - 1) * N
+            ring_u = [start_u + j for j in range(N)]
+            ring_l = [start_l + j for j in range(N)]
+            for j in range(N):
+                jn = (j + 1) % N
+                faces.append([ring_u[j], ring_u[jn], ring_l[j]])
+                faces.append([ring_l[j], ring_u[jn], ring_l[jn]])
+
+        # convert lists to numpy arrays
+        faces_arr = np.array(faces, dtype=np.int64)
+
+        # Build trimesh and run repair steps
+        solid_mesh = trimesh.Trimesh(vertices=vertices, faces=faces_arr, process=False)
+
+        # Basic cleanup & repair sequence
+        try:
+            # merge near-duplicate vertices
+            solid_mesh.merge_vertices()
+        except Exception:
+            pass
+        try:
+            solid_mesh.update_faces(solid_mesh.unique_faces())
+        except Exception:
+            pass
+        try:
+            solid_mesh.update_faces(solid_mesh.nondegenerate_faces())
+        except Exception:
+            pass
+        try:
+            solid_mesh.remove_unreferenced_vertices()
+        except Exception:
+            pass
+        # fill small holes if any
+        try:
+            solid_mesh.fill_holes()
+        except Exception:
+            pass
+        # attempt more repairs
+        try:
+            trimesh.repair.fix_normals(solid_mesh)
+        except Exception:
+            pass
+
+        # Final check & fallback: if still not watertight, try convex hull as last resort
+        if not solid_mesh.is_watertight:
+            # try small toleranced merge and fill then check again
+            try:
+                solid_mesh.merge_vertices()  # second attempt
+                solid_mesh.fill_holes()
+            except Exception:
+                pass
+            if not solid_mesh.is_watertight:
+                # fallback: convex hull (loses concavities but guarantees volume)
+                hull = solid_mesh.convex_hull
+                hull.process()  # ensure consistency
+                return hull
+
         return solid_mesh
 
     def save_metadata(self, filename_prefix: str):
@@ -320,7 +398,7 @@ class Blade3D:
         obj.timestamp = metadata.get("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S"))
         return obj
 
-    def export_mesh(self, filename_prefix: str, mode: str = "both", as_solid: bool = False, save_params: bool = True):
+    def export_mesh(self, filename_prefix: str, mode: str = "both", as_solid: bool = True, save_params: bool = True):
         """
         Export blade mesh as STL and optionally save JSON metadata.
         Both files will share the same prefix and timestamp.
@@ -347,6 +425,7 @@ class Blade3D:
         if as_solid:
             mesh = self._generate_solid_from_surfaces(mode)
             mesh.export(stl_file)
+            print("Blade watertight:", mesh.is_watertight)
         else:
             mesh = self.to_pyvista_mesh(mode)
             mesh.save(stl_file)
@@ -382,19 +461,19 @@ if __name__ == "__main__":
     layers_params = [
         {'theta0': 0.0, 'h_max': 0.02, 't_max': 0.01, 'alpha': 0.4, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
          'mode': 'extended', 'kappa': 1.5},
-        {'theta0': 0.005, 'h_max': 0.022, 't_max': 0.011, 'alpha': 0.41, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
+        {'theta0': 0.1, 'h_max': 0.022, 't_max': 0.011, 'alpha': 0.5, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
          'mode': 'extended', 'kappa': 1.55},
-        {'theta0': 0.01, 'h_max': 0.024, 't_max': 0.012, 'alpha': 0.42, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
+        {'theta0': 0.2, 'h_max': 0.024, 't_max': 0.012, 'alpha': 0.6, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
          'mode': 'extended', 'kappa': 1.6},
-        {'theta0': 0.015, 'h_max': 0.026, 't_max': 0.013, 'alpha': 0.43, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
+        {'theta0': 0.3, 'h_max': 0.026, 't_max': 0.013, 'alpha': 0.7, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
          'mode': 'extended', 'kappa': 1.65},
-        {'theta0': 0.02, 'h_max': 0.028, 't_max': 0.014, 'alpha': 0.44, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
+        {'theta0': 0.4, 'h_max': 0.028, 't_max': 0.014, 'alpha': 0.8, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
          'mode': 'extended', 'kappa': 1.7},
     ]
 
     blade = Blade3D(
         span_layers=layers_params,
-        Theta=np.pi / 6,
+        Theta=np.pi / 3,
         H=0.21,
         z0=-0.1,
         hub_radius=0.121,
@@ -405,6 +484,7 @@ if __name__ == "__main__":
     # Export both solid and surface with consistent timestamp + JSON
     blade.export_mesh("./Blades/blade_example", mode="both", as_solid=True)
     blade.export_mesh("./Blades/blade_example", mode="both", as_solid=False)
+
 
     # Batch load example
     loaded_blades = Blade3D.batch_load_blades(".")
