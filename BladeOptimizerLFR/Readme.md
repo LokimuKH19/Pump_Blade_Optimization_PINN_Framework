@@ -1,6 +1,7 @@
-# Project Introduction
+# SymPhONIC
 
-- waiting for next instruction.
+> Symmetric-based Physics Oriented Neural Integral Computation (SymPhONIC)
+> A novel ■■■■■■■■■ framework dedicated to analyzing impellers
 
 ## Update Records 
 ### Sept.12, 2025
