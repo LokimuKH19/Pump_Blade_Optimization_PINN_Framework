@@ -8,6 +8,8 @@ from datetime import datetime
 from BladeGenerator import Blade3D
 import os
 
+nodes = 128  # the quality of meshes (128 is recommended)
+
 
 def assemble_blades_on_cylinder(blade: Blade3D, n_blades: int, radius: float, height: float, z_base: float,
                                 as_solid=True):
@@ -17,7 +19,7 @@ def assemble_blades_on_cylinder(blade: Blade3D, n_blades: int, radius: float, he
 
     def create_watertight_cylinder(radius, height, z_base=0.0):
         # 1. summon a cylinder
-        cyl = trimesh.creation.cylinder(radius=radius, height=height, sections=128, caps=True)
+        cyl = trimesh.creation.cylinder(radius=radius, height=height, sections=nodes, caps=True)
         cyl.apply_translation([0, 0, z_base + height / 2])
 
         # 3. correct, combine
@@ -52,7 +54,7 @@ def assemble_blades_on_cylinder(blade: Blade3D, n_blades: int, radius: float, he
     z_shift = z_base + height / 2 - (blade.z_coords.min() + z_blade_span / 2)
 
     # Place blades around cylinder
-    all_meshes = [rotor_solid]  # 存放所有网格
+    all_meshes = [rotor_solid]  # save all meshes
     for i in range(n_blades):
         angle = 2 * np.pi * i / n_blades
         rot_matrix = trimesh.transformations.rotation_matrix(angle, [0, 0, 1])
@@ -74,7 +76,7 @@ def assemble_blades_on_cylinder(blade: Blade3D, n_blades: int, radius: float, he
 
 # diffuser construction
 def create_paraboloid_solid(radius_base: float, height: float, z_base: float,
-                            position="bottom", top_z=None, n_radial=128, n_angular=128):
+                            position="bottom", top_z=None, n_radial=nodes, n_angular=nodes):
     """
     Create watertight paraboloid solid with base disk at top (bottom diffuser) or bottom (top diffuser).
     """
@@ -124,7 +126,7 @@ def create_paraboloid_solid(radius_base: float, height: float, z_base: float,
     return solid
 
 
-def create_hemisphere_solid(radius: float, z_base: float, position="bottom", top_z=None, n_phi=128, n_theta=64):
+def create_hemisphere_solid(radius: float, z_base: float, position="bottom", top_z=None, n_phi=nodes, n_theta=64):
     """
     Create watertight hemisphere solid with base disk at top (bottom diffuser) or bottom (top diffuser).
     """
@@ -174,8 +176,7 @@ def create_hemisphere_solid(radius: float, z_base: float, position="bottom", top
     return solid
 
 
-def create_diffuser(shape: str, radius_base: float, radius_top: float, height: float, z_base: float,
-                    position: str = "bottom"):
+def create_diffuser(shape: str, radius_base: float, height: float, z_base: float, position: str = "bottom"):
     if shape == "hemisphere":
         return create_hemisphere_solid(radius_base, z_base, position)
     elif shape == "paraboloid":
@@ -219,8 +220,9 @@ def assemble_pump(
     if rotor_height < rotor_span:
         raise ValueError(f"Rotor height {rotor_height} < blade span {rotor_span}")
 
-    # Inlet diffuser
-    inlet = create_diffuser(inlet_shape, hub_radius, hub_radius, hub_radius, z_base=-hub_radius, position='bottom')
+    # Inlet diffuser: the height is set to hub_radius for parabolic situation temporarily,
+    # could include more parameters in the future
+    inlet = create_diffuser(inlet_shape, hub_radius, hub_radius, z_base=-hub_radius, position='bottom')
 
     # Rotor
     rotor = assemble_blades_on_cylinder(
@@ -256,7 +258,7 @@ def assemble_pump(
     # Outlet diffuser
     if outlet_shaft_radius > hub_radius:
         raise ValueError("Outlet shaft radius must not exceed hub radius!")
-    outlet_diffuser = create_diffuser(outlet_shape, hub_radius, outlet_shaft_radius, hub_radius, z_base=current_z, position='top')
+    outlet_diffuser = create_diffuser(outlet_shape, hub_radius, hub_radius, z_base=current_z, position='top')
     shaft = trimesh.creation.cylinder(radius=outlet_shaft_radius, height=outlet_shaft_length, caps=True)
     shaft.apply_translation([0, 0, current_z + outlet_shaft_length / 2.0])
     outlet = trimesh.util.concatenate([outlet_diffuser, shaft])
