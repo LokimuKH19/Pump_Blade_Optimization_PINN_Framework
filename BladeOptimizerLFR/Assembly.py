@@ -184,6 +184,16 @@ def create_diffuser(shape: str, radius_base: float, radius_top: float, height: f
         raise ValueError(f"Unknown diffuser shape {shape}")
 
 
+# fix the domain
+def fix_domain(domain):
+    domain.fix_normals()
+    domain.update_faces(domain.unique_faces())
+    domain.update_faces(domain.nondegenerate_faces())
+    domain.fill_holes()
+    if domain.volume < 0:
+        domain.invert()
+
+
 def assemble_pump(
     rotor_blade_file: str,
     vane_blade_file: str = None,
@@ -253,24 +263,19 @@ def assemble_pump(
 
     # make inlet and outlet correct
     for domain in [inlet, outlet]:
-        domain.fix_normals()
-        domain.update_faces(domain.unique_faces())
-        domain.update_faces(domain.nondegenerate_faces())
-        domain.fill_holes()
-        if domain.volume < 0:
-            domain.invert()
+        fix_domain(domain)
 
     parts = {"inlet": inlet, "rotor": rotor, "outlet": outlet}
-    print("Inlet domain watertight:", inlet.is_watertight)
-    print("Inlet volume:", inlet.volume)
-    print("Rotor domain watertight:", rotor.is_watertight)
-    print("Rotor volume:", rotor.volume)
-    print("Outlet domain watertight:", outlet.is_watertight)
-    print("Outlet volume:", outlet.volume)
+    if not inlet.is_watertight:
+        raise ValueError("Inlet domain is not watertight")
+    if not outlet.is_watertight:
+        raise ValueError("Outlet domain is not watertight")
+    if not rotor.is_watertight:
+        raise ValueError("Rotor domain is not watertight")
     if vane is not None:
         parts["vane"] = vane
-        print("Vane domain watertight:", vane.is_watertight)
-        print("Vane volume:", vane.volume)
+        if not vane.is_watertight:
+            raise ValueError("Vane domain is not watertight")
 
     assembly = trimesh.util.concatenate(parts.values())
     parts["assembly"] = assembly
@@ -364,208 +369,6 @@ def visualize_pump(meshes: dict):
     plotter.show()
 
 
-def create_fluid_domain_vtk(pump_json: str, output_dir: str,
-                            inlet_extra: float = 0.2, outlet_extra: float = 0,
-                            duct_diameter: float = 0.16):
-    """
-    Create fluid domain volumes for a pump and save each segment as a VTK file with
-    surfaces labeled according to inlet/rotor/vane/outlet naming scheme.
-    """
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    # Load pump meshes and metadata
-    meshes, metadata = load_pump(json_file=pump_json)
-    assembly = meshes["assembly"]
-
-    # Overall bounds
-    zmin, zmax = assembly.bounds[0][2], assembly.bounds[1][2]
-    radius = duct_diameter / 2.0
-
-    # Create duct surrounding pump
-    height = (zmax - zmin) + inlet_extra + outlet_extra
-    duct = trimesh.creation.cylinder(radius=radius, height=height, sections=128, caps=True)
-    duct.apply_translation([0, 0, zmin - inlet_extra + height/2])
-
-    # Fluid volume = duct minus pump
-    print("Duct domain watertight:", duct.is_watertight)
-    print("Duct volume:", duct.volume)
-    print("Assembly domain watertight:", assembly.is_watertight)
-    print("Assembly volume:", assembly.volume)
-    fluid_tm = duct.difference(assembly, engine="blender")
-
-    # Determine rotor/vane bounds
-    rotor_zmin, rotor_zmax = meshes["rotor"].bounds[:, 2]
-    vane = meshes.get("vane", None)
-    if vane:
-        vane_zmin, vane_zmax = vane.bounds[:, 2]
-
-    # Helper: create a z-slice of the fluid
-    def slice_fluid(z0, z1):
-        # Extrude infinite planes as large boxes for slicing
-        cutter_bottom = trimesh.creation.box([radius*2, radius*2, 0.01])
-        cutter_bottom.apply_translation([0,0,z0])
-        cutter_top = trimesh.creation.box([radius*2, radius*2, 0.01])
-        cutter_top.apply_translation([0,0,z1])
-        # Cut with difference
-        tmp = fluid_tm.difference(cutter_bottom, engine="blender")
-        tmp = tmp.difference(cutter_top, engine="blender")
-        return tmp
-
-    # Function to convert trimesh volume to pyvista PolyData with cell data marking
-    def trimesh_to_pvvolume(tmesh, labels):
-        """
-        tmesh: trimesh.Trimesh closed volume
-        labels: dict mapping face index to label string
-        """
-        faces = tmesh.faces
-        verts = tmesh.vertices
-        pv_mesh = pv.PolyData(verts, np.hstack((np.full((len(faces),1),3), faces)))
-        # create cell data for labels
-        cell_labels = np.empty(len(faces), dtype=object)
-        for i, f in enumerate(faces):
-            cell_labels[i] = labels.get(i, "wall")  # default to wall
-        pv_mesh.cell_data["surface_label"] = cell_labels
-        return pv_mesh
-
-    # Create four segments
-    segments = {}
-
-    # ------------------ INLET ------------------
-    inlet_tm = slice_fluid(zmin - inlet_extra, rotor_zmin)
-    inlet_labels = {}
-    # Label faces by z/r
-    for i, f in enumerate(inlet_tm.faces):
-        verts = inlet_tm.vertices[f]
-        if np.allclose(verts[:,2], zmin - inlet_extra, atol=1e-5):
-            inlet_labels[i] = "pump_inlet"
-        elif np.allclose(verts[:,2], rotor_zmin, atol=1e-5):
-            inlet_labels[i] = "ir_interface"
-        elif np.allclose(np.linalg.norm(verts[:,:2], axis=1), radius, atol=1e-5):
-            inlet_labels[i] = "inlet_shroud"
-        else:
-            inlet_labels[i] = "inlet_hub"
-
-    pv_inlet = trimesh_to_pvvolume(inlet_tm, inlet_labels)
-    pv_inlet.save(os.path.join(output_dir,"inlet.vtk"))
-    segments["inlet"] = pv_inlet
-
-    # ------------------ ROTOR ------------------
-    rotor_tm = slice_fluid(rotor_zmin, rotor_zmax)
-    rotor_metadata = Blade3D.load_metadata(metadata["rotor_blade_file"])
-    rotor_hub_r = rotor_metadata.hub_radius
-    rotor_labels = {}
-    for i, f in enumerate(rotor_tm.faces):
-        verts = rotor_tm.vertices[f]
-        if np.allclose(verts[:,2], rotor_zmin, atol=1e-5):
-            rotor_labels[i] = "ri_interface"
-        elif np.allclose(verts[:,2], rotor_zmax, atol=1e-5):
-            rotor_labels[i] = "rv_interface"
-        elif np.allclose(np.linalg.norm(verts[:,:2], axis=1), radius, atol=1e-5):
-            rotor_labels[i] = "rotor_shroud"
-        elif np.allclose(np.linalg.norm(verts[:,:2], axis=1), rotor_hub_r, atol=1e-5):
-            rotor_labels[i] = "rotor_hub"
-        else:
-            rotor_labels[i] = "rotor_blade"
-
-    pv_rotor = trimesh_to_pvvolume(rotor_tm, rotor_labels)
-    pv_rotor.save(os.path.join(output_dir,"rotor.vtk"))
-    segments["rotor"] = pv_rotor
-
-    # ------------------ VANE ------------------
-    if vane:
-        vane_tm = slice_fluid(vane_zmin, vane_zmax)
-        vane_metadata = Blade3D.load_metadata(metadata["vane_blade_file"])
-        vane_hub_r = vane_metadata.hub_radius
-        vane_labels = {}
-        for i, f in enumerate(vane_tm.faces):
-            verts = vane_tm.vertices[f]
-            if np.allclose(verts[:,2], vane_zmin, atol=1e-5):
-                vane_labels[i] = "vr_interface"
-            elif np.allclose(verts[:,2], vane_zmax, atol=1e-5):
-                vane_labels[i] = "vo_interface"
-            elif np.allclose(np.linalg.norm(verts[:,:2], axis=1), radius, atol=1e-5):
-                vane_labels[i] = "vane_shroud"
-            elif np.allclose(np.linalg.norm(verts[:,:2], axis=1), vane_hub_r, atol=1e-5):
-                vane_labels[i] = "vane_hub"
-            else:
-                vane_labels[i] = "vane_blade"
-
-        pv_vane = trimesh_to_pvvolume(vane_tm, vane_labels)
-        pv_vane.save(os.path.join(output_dir, "vane.vtk"))
-        segments["vane"] = pv_vane
-
-    # ------------------ OUTLET ------------------
-    outlet_zmin = vane_zmax if vane else rotor_zmax
-    outlet_zmax = zmax + outlet_extra
-    outlet_tm = slice_fluid(outlet_zmin, outlet_zmax)
-    outlet_labels = {}
-    for i, f in enumerate(outlet_tm.faces):
-        verts = outlet_tm.vertices[f]
-        if np.allclose(verts[:,2], outlet_zmin, atol=1e-5):
-            outlet_labels[i] = "ov_interface"
-        elif np.allclose(verts[:,2], outlet_zmax, atol=1e-5):
-            outlet_labels[i] = "pump_outlet"
-        elif np.allclose(np.linalg.norm(verts[:,:2], axis=1), radius, atol=1e-5):
-            outlet_labels[i] = "outlet_shroud"
-        else:
-            outlet_labels[i] = "outlet_hub"
-
-    pv_outlet = trimesh_to_pvvolume(outlet_tm, outlet_labels)
-    pv_outlet.save(os.path.join(output_dir,"outlet.vtk"))
-    segments["outlet"] = pv_outlet
-
-    return segments, metadata
-
-
-def visualize_fluid_domain(segments: dict):
-    """
-    Visualize fluid domain segments with colors and legend according to surface labels.
-
-    Parameters
-    ----------
-    segments : dict
-        Output from create_fluid_domain_vtk, keys: "inlet", "rotor", "vane", "outlet"
-        Each value is a PyVista PolyData with cell_data["surface_label"]
-    """
-    plotter = pv.Plotter()
-    # Define a color map for surface labels
-    color_map = {
-        "pump_inlet": "lightblue",
-        "ir_interface": "blue",
-        "inlet_shroud": "cyan",
-        "inlet_hub": "navy",
-        "ri_interface": "orange",
-        "rv_interface": "red",
-        "rotor_shroud": "gold",
-        "rotor_hub": "brown",
-        "rotor_blade": "darkorange",
-        "vr_interface": "green",
-        "vo_interface": "lime",
-        "vane_shroud": "teal",
-        "vane_hub": "darkgreen",
-        "vane_blade": "forestgreen",
-        "ov_interface": "magenta",
-        "pump_outlet": "purple",
-        "outlet_shroud": "pink",
-        "outlet_hub": "deeppink",
-        "wall": "gray"
-    }
-
-    for seg_name, pv_mesh in segments.items():
-        if pv_mesh is None:
-            continue
-        labels = pv_mesh.cell_data["surface_label"]
-        unique_labels = np.unique(labels)
-        for label in unique_labels:
-            mask = labels == label
-            submesh = pv_mesh.extract_cells(mask)
-            plotter.add_mesh(submesh, color=color_map.get(label, "white"), show_edges=False, opacity=1.0, label=label)
-
-    plotter.add_legend()
-    plotter.show()
-
-
 if __name__ == "__main__":
     rotor_file = "./Blades/blade_example_hub0.121_shroud0.160_Theta1.047_H0.210_20250909_103633.json"
     vane_file = "./Blades/blade_example_hub0.121_shroud0.160_Theta0.524_H0.210_20250826_125315.json"
@@ -594,6 +397,3 @@ if __name__ == "__main__":
     # export_format = vtk, stl, both, json_only
     # export_pump(meshes, directory='./Pump', export_format="json_only", metadata=metadata)
     visualize_pump(meshes)
-    segments, metadata = create_fluid_domain_vtk(pump_json, output_dir="./FluidDomain",
-                                                 inlet_extra=0.2, outlet_extra=0.1, duct_diameter=0.16)
-    visualize_fluid_domain(segments)
