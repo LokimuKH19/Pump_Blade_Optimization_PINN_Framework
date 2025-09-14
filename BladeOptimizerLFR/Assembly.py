@@ -178,11 +178,14 @@ def create_hemisphere_solid(radius: float, z_base: float, position="bottom", top
 
 def create_diffuser(shape: str, radius_base: float, height: float, z_base: float, position: str = "bottom"):
     if shape == "hemisphere":
-        return create_hemisphere_solid(radius_base, z_base, position)
+        result = create_hemisphere_solid(radius_base, z_base, position)
+        fix_domain(result)
     elif shape == "paraboloid":
-        return create_paraboloid_solid(radius_base, height, z_base, position)
+        result = create_paraboloid_solid(radius_base, height, z_base, position)
+        fix_domain(result)
     else:
         raise ValueError(f"Unknown diffuser shape {shape}")
+    return result
 
 
 # fix the domain
@@ -259,10 +262,14 @@ def assemble_pump(
     # Outlet diffuser
     if outlet_shaft_radius > hub_radius:
         raise ValueError("Outlet shaft radius must not exceed hub radius!")
+    # create diffuser
     outlet_diffuser = create_diffuser(outlet_shape, hub_radius, hub_radius, z_base=current_z, position='top')
+    # create shaft
     shaft = trimesh.creation.cylinder(radius=outlet_shaft_radius, height=outlet_shaft_length, caps=True)
     shaft.apply_translation([0, 0, current_z + outlet_shaft_length / 2.0])
-    outlet = trimesh.util.concatenate([outlet_diffuser, shaft])
+    # --- robust union ---
+    # instead of simple concatenate, perform union
+    outlet = outlet_diffuser.union(shaft, engine='manifold')  # ensures interior volume is filled
 
     # make inlet and outlet correct
     for domain in [inlet, outlet]:
