@@ -1,4 +1,4 @@
-# Parametric Impeller Summoner
+# Parametric Impeller Summoner 🏭
 
 > Preprocess of the Symmetric-based Physics Oriented Neural Integral Computation [SymPhONIC](https://github.com/LokimuKH19/SymPhONIC), which is a novel PINN framework dedicated to analyzing impellers
 
@@ -7,7 +7,7 @@
 - `Assembly.py`: to **parametricly** summon a certain turbo machinery
 - `FluidSummoning.py`: to compute the fluid domain of the previous **parametric** turbo machinery
 
-## Update Records 
+## 🖊 Update Records 
 ### Sept.12, 2025
 - Make sure the model could be generated in a watertight, closed volumn and can be directly import to the CAD/3D modeling softwares.
 - All parameters could be transfered by a json file to describe a pump design. You don't have to use the stl/vtk file directly to save spaces.
