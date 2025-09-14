@@ -7,7 +7,7 @@
 - `Assembly.py`: to **parametricly** summon a certain turbo machinery
 - `FluidSummoning.py`: to compute the fluid domain of the previous **parametric** turbo machinery
 
-[See this Pump](./FluidDomain.png)
+![See this Pump](./FluidDomain.png)
 
 ## 🖊 Update Records 
 ### Sept.12, 2025
