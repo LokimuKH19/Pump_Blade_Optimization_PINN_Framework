@@ -218,7 +218,8 @@ def assemble_pump(
     hub_radius = rotor_blade.hub_radius
     rotor_span = rotor_blade.vertices_upper[:, 2].max() - rotor_blade.vertices_lower[:, 2].min()
     if rotor_height < rotor_span:
-        raise ValueError(f"Rotor height {rotor_height} < blade span {rotor_span}")
+        print(f"Rotor height {rotor_height} < blade span {rotor_span}, adjusting...")
+        rotor_height = rotor_span
 
     # Inlet diffuser: the height is set to hub_radius for parabolic situation temporarily,
     # could include more parameters in the future
