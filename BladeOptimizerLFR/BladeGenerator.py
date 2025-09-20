@@ -461,13 +461,13 @@ if __name__ == "__main__":
     layers_params = [
         {'theta0': 0.0, 'h_max': 0.02, 't_max': 0.01, 'alpha': 0.4, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
          'mode': 'extended', 'kappa': 1.5},
-        {'theta0': 0.1, 'h_max': 0.022, 't_max': 0.011, 'alpha': 0.5, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
+        {'theta0': 0.05, 'h_max': 0.021, 't_max': 0.012, 'alpha': 0.45, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
          'mode': 'extended', 'kappa': 1.55},
-        {'theta0': 0.2, 'h_max': 0.024, 't_max': 0.012, 'alpha': 0.6, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
+        {'theta0': 0.10, 'h_max': 0.021, 't_max': 0.012, 'alpha': 0.50, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
          'mode': 'extended', 'kappa': 1.6},
-        {'theta0': 0.3, 'h_max': 0.026, 't_max': 0.013, 'alpha': 0.7, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
+        {'theta0': 0.15, 'h_max': 0.021, 't_max': 0.012, 'alpha': 0.55, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
          'mode': 'extended', 'kappa': 1.65},
-        {'theta0': 0.4, 'h_max': 0.028, 't_max': 0.014, 'alpha': 0.8, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
+        {'theta0': 0.20, 'h_max': 0.02, 't_max': 0.01, 'alpha': 0.65, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
          'mode': 'extended', 'kappa': 1.7},
     ]
 
