@@ -1,0 +1,20 @@
+{
+    "1": "inlet-shroud",
+    "2": "inlet-in",
+    "3": "inlet-out",
+    "4": "inlet-hub",
+    "5": "rotor-in",
+    "6": "rotor-shroud",
+    "7": "rotor-out",
+    "8": "rotor-blade",
+    "9": "rotor-hub",
+    "10": "vane-in",
+    "11": "vane-shroud",
+    "12": "vane-out",
+    "13": "vane-blade",
+    "14": "vane-hub",
+    "15": "outlet-in",
+    "16": "outlet-shroud",
+    "17": "outlet-out",
+    "18": "outlet-hub"
+}

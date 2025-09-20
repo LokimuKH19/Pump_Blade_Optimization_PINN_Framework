@@ -1,0 +1,5 @@
+{
+    "pump_file": "./Pump/test_pump.json",
+    "duct_radius": 0.161,
+    "reserve_z": 0.05
+}
