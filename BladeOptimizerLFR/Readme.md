@@ -23,7 +23,7 @@
 - 2. New module: `FluidSummoning.py`: Provides the ability to generate CFD-ready fluid domains corresponding to pump components.
  
 ### Sept.20 2025
-Sorry for suspending the updates for such a long time. A new function in `FluidSummoning.py` has been proposed which can choose the **filetype**(`vtk/stl/both/json_only`) of the exported fluid domain. Among them the `vtk` mode contains the Naming/Numbering Function of each surfaces with traingle mesh exported to the `FluidDomain` folder, of which a description `json` file starts with "BoundaryID_Map" contrains the description of the correspounding relationship between the number (for the convenience of being identified by Ansys Fluent and similar commercial softwares) and the name of each boundary.
+- Sorry for suspending the updates for such a long time. A new function in `FluidSummoning.py` has been proposed which can choose the **filetype**(`vtk/stl/both/json_only`) of the exported fluid domain. Among them the `vtk` mode contains the Naming/Numbering Function of each surfaces with traingle mesh exported to the `FluidDomain` folder, of which a description `json` file starts with "BoundaryID_Map" contrains the description of the correspounding relationship between the number (for the convenience of being identified by Ansys Fluent and similar commercial softwares) and the name of each boundary.
  
 ## Dependencies Description
 It is recommended to download "Blender" and "OpenSCAD" when using this software, and add them into Path (Environment Variable) for boolean calculation.
