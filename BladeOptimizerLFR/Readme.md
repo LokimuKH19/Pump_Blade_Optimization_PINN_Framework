@@ -31,10 +31,10 @@
 ## Dependencies Description
 It is recommended to download "Blender" and "OpenSCAD" when using this software, and add them into Path (Environment Variable) for boolean calculation.
 
-If you are using later version of the `trimesh` package, the "OpenSCAD" engine will no longer available. Instead, you can download `pymanifold` directly by 
+If you are using later version of the `trimesh` package, the "OpenSCAD" engine will no longer available. Instead, you can download `manifold3d` directly by 
 
 ```cmd
-pip install pymanifold
+pip install manifold3d
 ``` 
 
 in the `cmd` window and added a parameter `engine="manifold"` when conducting a boolean calculation, for example:
