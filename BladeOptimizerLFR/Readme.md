@@ -6,6 +6,8 @@
 - `BladeGenerator.py`: to create a **parametric** 3D-Blade 
 - `Assembly.py`: to **parametricly** summon a certain turbo machinery
 - `FluidSummoning.py`: to compute the fluid domain of the previous **parametric** turbo machinery
+- `BladeUI.py`: to create a Bezier + Spline Blade manually
+- `run.bat`: to start the `BladeUI.py`
 
 ![See this Pump](./FluidDomain.png)
 
@@ -27,6 +29,12 @@
 - An example of the vane region (`./FluidDomain/vane_FluidDomain_20250920_185607.vtk` opened by ParaView):
 
   ![Nomenclature](./nomenclature.png)
+
+### Dec. 23, 2025
+- I'm gald to tell you guys who has been watching this repo for long that I had finished the blade parametric modeling Demo to create a 3D blade in very short time. What you are about to do is to start the `run.py` and design a blade by modifying the values in the inputbox in accordance.
+- Updated `BladeGenerator.py`: Support Bezier-Spline hybrid interpolation for, which follows the mainstream methods to create the blade for later blade optimization in broader applications.
+- Added `BladeUI.py` and the correspounding `run.bat`.
+  ![UI](./UI.png)
   
 ## Dependencies Description
 It is recommended to download "Blender" and "OpenSCAD" when using this software, and add them into Path (Environment Variable) for boolean calculation.
