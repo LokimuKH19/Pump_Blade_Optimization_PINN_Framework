@@ -2,10 +2,58 @@
 import numpy as np
 import pyvista as pv
 import matplotlib.pyplot as plt
+import scipy
 import trimesh
 import json
 import os
 from datetime import datetime
+from scipy.interpolate import CubicSpline, Akima1DInterpolator, PchipInterpolator
+
+
+# ---------- Bezier Curve ---------
+def bezier_curve(x, ctrl):
+    """
+    Bezier camber envelope γ(x)
+    ctrl: list of control point values (len = n+1)
+    """
+    x = np.asarray(x)
+    n = len(ctrl) - 1
+    ctrl = np.asarray(ctrl, dtype=float)
+
+    # Bernstein basis
+    gamma = np.zeros_like(x)
+    for i in range(n + 1):
+        gamma += (
+            scipy.special.comb(n, i)
+            * (x ** i)
+            * ((1 - x) ** (n - i))
+            * ctrl[i]
+        )
+
+    # normalize
+    maxv = gamma.max()
+    if maxv > 1e-12:
+        gamma /= maxv
+    return gamma
+
+
+# ---------- Spline Thickness -------
+def spline_thickness(x, knots_x, knots_t):
+    """
+    Spline-based thickness τ(x)
+    """
+    # supply a point at 0.02
+    cs = CubicSpline(knots_x, knots_t)
+    tau = cs(x)
+
+    # safety
+    tau = np.clip(tau, 0.0, None)
+
+    # normalize
+    maxv = tau.max()
+    if maxv > 1e-12:
+        tau /= maxv
+    return tau
 
 
 # ---------- shape primitives (gamma/tau) ----------
@@ -128,16 +176,19 @@ class Blade3D:
             theta0 = float(prm['theta0'])
             h_max = float(prm['h_max'])
             t_max = float(prm['t_max'])
-            alpha = float(prm['alpha'])
-            a = float(prm['a'])
-            b = float(prm['b'])
-            beta = float(prm['beta'])
+            alpha = float(prm.get('alpha', 0))
+            a = float(prm.get('a', 0))
+            b = float(prm.get('b', 0))
+            beta = float(prm.get('beta', 0))
             mode = prm.get('mode', 'basic')
 
             # choose gamma
             if mode == 'extended':
                 kappa = float(prm.get('kappa', 1.5))
                 gamma = beta_distribution_extended(xi, alpha, kappa)
+            elif mode == 'bezier_camber':
+                ctrl = prm["camber_ctrl"]
+                gamma = bezier_curve(xi, ctrl)
             else:
                 gamma = beta_distribution(xi, alpha)
 
@@ -145,8 +196,21 @@ class Blade3D:
             if mode == 'tapered':
                 taper = float(prm.get('taper', 0.5))
                 tau = tapered_thickness_distribution(xi, a, b, beta, taper)
+            elif mode == "spline_thickness":
+                knots = prm["thickness_knots"]
+                tau = spline_thickness(
+                    xi,
+                    knots["x"],
+                    knots["t"]
+                )
             else:
                 tau = thickness_distribution(xi, a, b, beta)
+
+            # Complete_Mode
+            if mode == "hybrid":
+                gamma = bezier_curve(xi, prm["camber_ctrl"])
+                knots = prm["thickness_knots"]
+                tau = spline_thickness(xi, knots["x"], knots["t"])
 
             theta = theta0 + xi * self.Theta
             z_center = self.z0 + xi * self.H - h_max * gamma
@@ -458,33 +522,91 @@ class Blade3D:
 
 # ------------- example -------------
 if __name__ == "__main__":
+    ### - Old Versions -
+    # layers_params = [
+    #     {'theta0': 0.0, 'h_max': 0.02, 't_max': 0.01, 'alpha': 0.4, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
+    #      'mode': 'extended', 'kappa': 1.5},
+    #     {'theta0': 0.05, 'h_max': 0.021, 't_max': 0.012, 'alpha': 0.45, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
+    #      'mode': 'extended', 'kappa': 1.55},
+    #     {'theta0': 0.10, 'h_max': 0.021, 't_max': 0.012, 'alpha': 0.50, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
+    #      'mode': 'extended', 'kappa': 1.6},
+    #     {'theta0': 0.15, 'h_max': 0.021, 't_max': 0.012, 'alpha': 0.55, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
+    #      'mode': 'extended', 'kappa': 1.65},
+    #     {'theta0': 0.20, 'h_max': 0.02, 't_max': 0.01, 'alpha': 0.65, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
+    #      'mode': 'extended', 'kappa': 1.7},
+    # ]
+
     layers_params = [
-        {'theta0': 0.0, 'h_max': 0.02, 't_max': 0.01, 'alpha': 0.4, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
-         'mode': 'extended', 'kappa': 1.5},
-        {'theta0': 0.05, 'h_max': 0.021, 't_max': 0.012, 'alpha': 0.45, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
-         'mode': 'extended', 'kappa': 1.55},
-        {'theta0': 0.10, 'h_max': 0.021, 't_max': 0.012, 'alpha': 0.50, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
-         'mode': 'extended', 'kappa': 1.6},
-        {'theta0': 0.15, 'h_max': 0.021, 't_max': 0.012, 'alpha': 0.55, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
-         'mode': 'extended', 'kappa': 1.65},
-        {'theta0': 0.20, 'h_max': 0.02, 't_max': 0.01, 'alpha': 0.65, 'a': 0.2, 'b': 0.8, 'beta': 0.3,
-         'mode': 'extended', 'kappa': 1.7},
+        {
+            "mode": "hybrid",
+            "theta0": 0.00,
+            "h_max": 0.018,
+            "t_max": 0.010,
+            "camber_ctrl": [0.0, 0.65, 0.85, 0.0],
+            "thickness_knots": {
+                "x": [0.0, 0.06, 0.30, 0.70, 1.0],
+                "t": [0.0, 1.00, 1.00, 0.45, 0.0]
+            }
+        },
+        {
+            "mode": "hybrid",
+            "theta0": 0.04,
+            "h_max": 0.020,
+            "t_max": 0.011,
+            "camber_ctrl": [0.0, 0.70, 0.90, 0.0],
+            "thickness_knots": {
+                "x": [0.0, 0.06, 0.32, 0.72, 1.0],
+                "t": [0.0, 1.00, 1.00, 0.40, 0.0]
+            }
+        },
+        {
+            "mode": "hybrid",
+            "theta0": 0.08,
+            "h_max": 0.022,
+            "t_max": 0.012,
+            "camber_ctrl": [0.0, 0.75, 0.95, 0.0],
+            "thickness_knots": {
+                "x": [0.0, 0.07, 0.35, 0.75, 1.0],
+                "t": [0.0, 1.00, 1.00, 0.38, 0.0]
+            }
+        },
+        {
+            "mode": "hybrid",
+            "theta0": 0.12,
+            "h_max": 0.020,
+            "t_max": 0.011,
+            "camber_ctrl": [0.0, 0.70, 0.90, 0.0],
+            "thickness_knots": {
+                "x": [0.0, 0.07, 0.34, 0.74, 1.0],
+                "t": [0.0, 1.00, 1.00, 0.42, 0.0]
+            }
+        },
+        {
+            "mode": "hybrid",
+            "theta0": 0.16,
+            "h_max": 0.018,
+            "t_max": 0.010,
+            "camber_ctrl": [0.0, 0.65, 0.85, 0.0],
+            "thickness_knots": {
+                "x": [0.0, 0.06, 0.30, 0.70, 1.0],
+                "t": [0.0, 1.00, 1.00, 0.45, 0.0]
+            }
+        }
     ]
 
     blade = Blade3D(
         span_layers=layers_params,
         Theta=np.pi / 3,
-        H=0.21,
+        H=0.21/2,
         z0=-0.1,
-        hub_radius=0.121,
-        shroud_radius=0.16,
+        hub_radius=0.121/2,
+        shroud_radius=0.16/2,
     )
     blade.generate_surface(points_per_chord=300)
 
     # Export both solid and surface with consistent timestamp + JSON
     blade.export_mesh("./Blades/blade_example", mode="both", as_solid=True)
     blade.export_mesh("./Blades/blade_example", mode="both", as_solid=False)
-
 
     # Batch load example
     loaded_blades = Blade3D.batch_load_blades(".")
