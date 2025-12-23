@@ -34,6 +34,7 @@
 - I'm gald to tell you guys who has been watching this repo for long that I had finished the blade parametric modeling Demo to create a 3D blade in very short time. What you are about to do is to start the `run.py` and design a blade by modifying the values in the inputbox in accordance.
 - Updated `BladeGenerator.py`: Support Bezier-Spline hybrid interpolation for, which follows the mainstream methods to create the blade for later blade optimization in broader applications.
 - Added `BladeUI.py` and the correspounding `run.bat`.
+
   ![UI](./UI.png)
   
 ## Dependencies Description
