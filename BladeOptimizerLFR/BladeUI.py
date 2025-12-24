@@ -5,8 +5,79 @@ import matplotlib.pyplot as plt
 from BladeGenerator import Blade3D, bezier_curve, spline_thickness
 import pyvista as pv
 from tempfile import NamedTemporaryFile
+import streamlit.components.v1 as components
 import base64
 
+
+THEME_CFG = {
+    "dark": {
+        "fig_bg": "#0E1117",
+        "ax_bg": "#0E1117",
+        "fg": "#E0E0E0",
+        "grid": "#444444",
+        "camber": "#4DA3FF",    # 工业风格
+        "thickness": "#FFB000"
+    },
+    "light": {
+        "fig_bg": "white",
+        "ax_bg": "white",
+        "fg": "black",
+        "grid": "#CCCCCC",
+        "camber": "#1F77B4",    # 报告风格
+        "thickness": "#D55E00"
+    }
+}
+
+def styled_axes(theme, figsize=(6, 3)):
+    cfg = THEME_CFG[theme]
+    fig, ax = plt.subplots(figsize=figsize)
+
+    fig.patch.set_facecolor(cfg["fig_bg"])
+    ax.set_facecolor(cfg["ax_bg"])
+
+    ax.tick_params(colors=cfg["fg"])
+    ax.xaxis.label.set_color(cfg["fg"])
+    ax.yaxis.label.set_color(cfg["fg"])
+    ax.title.set_color(cfg["fg"])
+
+    for spine in ax.spines.values():
+        spine.set_color(cfg["fg"])
+
+    ax.grid(True, linestyle="--", linewidth=0.6,
+            color=cfg["grid"], alpha=0.3)
+
+    return fig, ax
+
+
+def get_theme_mode():
+    return st.session_state.theme_mode
+
+
+def set_mpl_theme(theme):
+    if theme == "dark":
+        plt.rcParams.update({
+            "figure.facecolor": "#0E1117",
+            "axes.facecolor": "#0E1117",
+            "axes.edgecolor": "#E0E0E0",
+            "axes.labelcolor": "#E0E0E0",
+            "text.color": "#E0E0E0",
+            "xtick.color": "#E0E0E0",
+            "ytick.color": "#E0E0E0",
+            "grid.color": "#444444",
+            "grid.alpha": 0.3,
+        })
+    else:
+        plt.rcParams.update({
+            "figure.facecolor": "white",
+            "axes.facecolor": "white",
+            "axes.edgecolor": "black",
+            "axes.labelcolor": "black",
+            "text.color": "black",
+            "xtick.color": "black",
+            "ytick.color": "black",
+            "grid.color": "#cccccc",
+            "grid.alpha": 0.3,
+        })
 
 
 st.set_page_config(page_title="Parametric Blade Generator", layout="wide")
@@ -14,7 +85,15 @@ st.title("🌀 Parametric Blade Generator (Realtime, Bezier + Spline)")
 st.markdown("Interactive blade design with **layer-wise control** and **real-time 3D preview**.")
 
 # ------------------ Global Blade Params ------------------
+
 st.sidebar.header("Global Parameters")
+with st.sidebar:
+    theme = st.radio(
+        "UI Theme",
+        ["dark", "light"],
+        index=0 if st.session_state.get("theme_mode", "dark") == "dark" else 1,
+        key="theme_mode"
+    )
 
 
 def number_input_with_label(label, min_val, max_val, default_val, step=None, key=None):
@@ -140,12 +219,15 @@ for i, tab in enumerate(layer_tabs):
 
             # Camber plot
             gamma = bezier_curve(xi, prm["camber_ctrl"])
-            fig, ax = plt.subplots(figsize=(6, 3))
-            ax.plot(xi, gamma, lw=2)
+            theme = st.session_state.theme_mode
+            cfg = THEME_CFG[theme]
+
+            fig, ax = styled_axes(theme)
+            ax.plot(xi, gamma, lw=2.2, color=cfg["camber"])
             ax.set_xlabel("x")
             ax.set_ylabel("γ(x)")
             ax.set_title(f"Layer {i + 1} Camber Profile")
-            ax.grid(True, alpha=0.3)
+
             st.pyplot(fig, use_container_width=True)
 
         # --- Right Column: Thickness Control ---
@@ -205,12 +287,15 @@ for i, tab in enumerate(layer_tabs):
             prm["thickness_knots"]["t"] = [0.0, t1, t2, t3, 0.0]
             # Thickness plot
             tau = spline_thickness(xi, prm["thickness_knots"]["x"], prm["thickness_knots"]["t"])
-            fig, ax = plt.subplots(figsize=(6, 3))
-            ax.plot(xi, tau, lw=2, color="orange")
+            theme = st.session_state.theme_mode
+            cfg = THEME_CFG[theme]
+
+            fig, ax = styled_axes(theme)
+            ax.plot(xi, tau, lw=2.2, color=cfg["thickness"])
             ax.set_xlabel("x")
             ax.set_ylabel("τ(x)")
             ax.set_title(f"Layer {i + 1} Thickness Profile")
-            ax.grid(True, alpha=0.3)
+
             st.pyplot(fig, use_container_width=True)
 
         # --- Scalar Parameters (Compact Row) ---
@@ -317,6 +402,20 @@ for i, tab in enumerate(layer_tabs):
 st.markdown("---")
 st.header("🔍 3D Blade Preview (Interactive)")
 
+
+# ================== Theme-adaptive colors ==================
+if theme == "dark":
+    pv_bg_color = "#0E1117"      # Streamlit dark background
+    blade_color = "#FFB000"      # bright orange
+    edge_color = "#333333"
+    text_color = "white"
+else:
+    pv_bg_color = "white"
+    blade_color = "#D55E00"      # deep orange
+    edge_color = "#666666"
+    text_color = "black"
+
+
 # Generate blade
 blade = Blade3D(
     span_layers=layers,
@@ -328,93 +427,111 @@ blade = Blade3D(
 )
 blade.generate_surface(points_per_chord=points_per_chord)
 
-# 创建PyVista plotter
-plotter = pv.Plotter(window_size=[800, 600])
+# ================== PyVista Plotter ==================
+plotter = pv.Plotter(
+    window_size=[800, 600],
+    off_screen=True
+)
+plotter.set_background(pv_bg_color)
 
-# 获取网格
 try:
+    # 获取网格
     mesh = blade.to_pyvista_mesh()
 
-    # 添加网格到plotter
+    # 添加网格
     plotter.add_mesh(
         mesh,
-        color='lightblue',
+        color=blade_color,
         show_edges=True,
-        opacity=0.9,
+        edge_color=edge_color,
+        opacity=0.95,
         smooth_shading=True
     )
 
-    # 设置相机视角
+    # 相机设置
     plotter.camera_position = 'xz'
     plotter.camera.zoom(1.5)
 
-    # 添加坐标轴
-    plotter.add_axes()
+    # 坐标轴
+    plotter.add_axes(
+        color=text_color,
+        line_width=2,
+        labels_off=False
+    )
 
-    # 添加标题
-    plotter.add_title("3D Blade Preview", font_size=20)
+    # 标题
+    plotter.add_title(
+        "3D Blade Preview",
+        font_size=18,
+        color=text_color
+    )
 
-    # 方法1: 导出为HTML并嵌入
+    # ================== Export to HTML ==================
     st.markdown("### Interactive 3D Viewer")
 
-    # 创建临时HTML文件
-    with NamedTemporaryFile(suffix='.html', delete=False) as tmp_file:
+    with NamedTemporaryFile(suffix=".html", delete=False) as tmp_file:
         html_file = tmp_file.name
 
-    # 导出场景为HTML
     plotter.export_html(html_file)
 
-    # 读取HTML内容
-    with open(html_file, 'r', encoding='utf-8') as f:
+    with open(html_file, "r", encoding="utf-8") as f:
         html_content = f.read()
 
-    # 嵌入HTML到Streamlit
-    st.components.v1.html(html_content, height=600, scrolling=False)
+    st.components.v1.html(
+        html_content,
+        height=600,
+        scrolling=False
+    )
 
-    # 添加一些交互控制
+    # ================== Controls ==================
     with st.expander("3D View Controls"):
         st.markdown("""
-        **Mouse Controls:**
-        - **Left-click + drag**: Rotate view
-        - **Right-click + drag**: Pan view  
-        - **Scroll wheel**: Zoom in/out
-        - **Middle-click + drag**: Change field of view
+        **Mouse Controls**
+        - Left-click + drag: Rotate  
+        - Right-click + drag: Pan  
+        - Scroll wheel: Zoom  
 
-        **Keyboard Shortcuts:**
-        - **r**: Reset camera
-        - **c**: Toggle axes visibility
-        - **s**: Save screenshot
+        **Keyboard**
+        - r: Reset camera  
+        - s: Save screenshot  
         """)
 
-        # 添加一些视图预设按钮
         col1, col2, col3, col4 = st.columns(4)
+
         with col1:
             if st.button("Front View"):
                 plotter.camera_position = 'xy'
+
         with col2:
             if st.button("Side View"):
                 plotter.camera_position = 'yz'
+
         with col3:
             if st.button("Top View"):
                 plotter.camera_position = 'xz'
+
         with col4:
             if st.button("Isometric"):
                 plotter.camera_position = 'iso'
 
 except Exception as e:
-    st.error(f"Failed to generate 3D preview: {str(e)}")
-    st.info("Make sure PyVista is installed: `pip install pyvista`")
+    st.error(f"Failed to generate 3D preview: {e}")
 
-    # 回退方案：静态图像
+    # ---------- Fallback: static screenshot ----------
     try:
-        screenshot = mesh.plot(off_screen=True, screenshot=True,
-                               window_size=[800, 600], show_edges=True)
+        screenshot = mesh.plot(
+            off_screen=True,
+            screenshot=True,
+            window_size=[800, 600],
+            show_edges=True,
+            background=pv_bg_color
+        )
         st.image(screenshot, caption="Static 3D Preview")
-    except:
+    except Exception:
         st.warning("Could not generate any 3D visualization.")
 
-# 关闭plotter
-plotter.close()
+finally:
+    plotter.close()
 
 # ------------------ Export ------------------
 st.markdown("---")
