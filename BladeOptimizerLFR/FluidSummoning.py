@@ -281,7 +281,8 @@ def export_fluid_domain(fluid_domain: dict, export_path: str = './FluidDomain', 
 
     if export_mode in {"stl", "both"}:
         for name, mesh in fluid_domain.items():
-            mesh.export(f"{export_path}/{name}_FluidDomain_{timestamp}.stl")
+            if mesh:
+                mesh.export(f"{export_path}/{name}_FluidDomain_{timestamp}.stl")
 
     if export_mode in {"vtk", "both"}:
         export_fluid_vtk(fluid_domain, export_path, metadata["duct_radius"], hub_radius, timestamp)
@@ -363,3 +364,4 @@ if __name__ == '__main__':
     export_fluid_domain(FLUID, "./FluidDomain", export_mode="vtk", metadata=METADATA)
     # Visualize
     visualize_part_pump_style(FLUID)
+
