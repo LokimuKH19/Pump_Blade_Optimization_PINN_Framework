@@ -72,6 +72,8 @@ def impeller_region(reference: trimesh.Trimesh, duct_radius: float = 0.16):
         impeller_domain: trimesh.Trimesh
             Watertight flow domain around the reference solid, suitable for CFD meshing.
     """
+    if not reference:
+        return
     # --- compute reference bounds ---
     z0 = reference.bounds[0][2]  # bottom of rotor/vane
     z1 = reference.bounds[1][2]  # top of rotor/vane
@@ -155,7 +157,7 @@ def classify_face(center, r, z0, z1, part_name, duct_radius, hub_radius=0.05):
 
 
 # --Export Fluid Domain--
-def export_fluid_vtk(fluid_dict, folder="./FluidVTK", duct_radius=0.18, hub_radius=0.05, timestamp: str = None):
+def export_fluid_vtk(fluid_dict, folder="./FluidVTK", duct_radius=0.161, hub_radius=0.05, timestamp: str = None):
     """
     Export each fluid part as a separate VTK file with boundary naming.
 
@@ -177,6 +179,8 @@ def export_fluid_vtk(fluid_dict, folder="./FluidVTK", duct_radius=0.18, hub_radi
     boundary_id_map = {}
 
     for part_name, mesh in fluid_dict.items():
+        if not mesh:
+            continue
         # Convert trimesh to PyVista PolyData
         poly = pv.PolyData(
             mesh.vertices,
@@ -229,15 +233,16 @@ def combination_fluid_domain(pump_file: str, duct_radius: float = 0.18, reserve_
         reference=pump_model["rotor"],  # use inlet part as reference
         duct_radius=duct_radius,
     )
-    vane_segment = impeller_region(
-        reference=pump_model["vane"],  # use inlet part as reference
-        duct_radius=duct_radius,
-    )
+
     outlet_segment = impeller_region(
         reference=pump_model["outlet"],  # use inlet part as reference
         duct_radius=duct_radius,
     )
-    fluid_domain_dict = {"inlet": inlet_segment, "rotor": rotor_segment, "vane": vane_segment, "outlet": outlet_segment}
+    vane_segment = impeller_region(
+        reference=pump_model.get("vane", None),  # use inlet part as reference
+        duct_radius=duct_radius,
+    )
+    fluid_domain_dict = {"inlet": inlet_segment, "rotor": rotor_segment, "outlet": outlet_segment, "vane": vane_segment}
     new_metadata = {
         "pump_file": pump_file,
         "duct_radius": duct_radius,
@@ -317,6 +322,8 @@ def visualize_part_pump_style(meshes: dict, opacity: float = 0.3):
     }
 
     for name, mesh in meshes.items():
+        if not mesh:
+            continue
         if name == "assembly":
             continue
         color = colors.get(name, "white")
@@ -343,15 +350,15 @@ def visualize_part_pump_style(meshes: dict, opacity: float = 0.3):
 
 # testing codes
 if __name__ == '__main__':
-    DUCT_RADIUS = 0.161  # Tip clearance should be reserved for summoning reasonable cases
+    DUCT_RADIUS = 0.161  # Tip clearance should be reserved for summoning reasonable cases, δ(4mm)/H = 1.5%
     RESERVE_Z = 0.05
-    pump_json = "./Pump/test_pump.json"
+    pump_json = "./Pump/pump_20251223_190532.json"
 
     Fluid_json = "./FluidDomain/Test_Fluid.json"
 
-    # FLUID, METADATA = combination_fluid_domain(pump_json, DUCT_RADIUS, RESERVE_Z)
+    FLUID, METADATA = combination_fluid_domain(pump_json, DUCT_RADIUS, RESERVE_Z)
     export_modes = {"json_only", "stl", "vtk", "both"}
-    FLUID, METADATA = load_fluid_domain(Fluid_json)
+    # FLUID, METADATA = load_fluid_domain(Fluid_json)
 
     export_fluid_domain(FLUID, "./FluidDomain", export_mode="vtk", metadata=METADATA)
     # Visualize
