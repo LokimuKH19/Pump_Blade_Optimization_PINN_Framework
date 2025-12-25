@@ -39,6 +39,9 @@
 - Updated `BladeUI.py`. Improved the readibility (contrast effect) of the UI.
 
   ![UI](./UI.png)
+
+### Dec. 25, 2025
+- Updated `FluidSummoning.py`. Fixed the crash when trying to summon a fluid domain without vane zone
   
 ## Dependencies Description
 It is recommended to download "Blender" and "OpenSCAD" when using this software, and add them into Path (Environment Variable) for boolean calculation.
