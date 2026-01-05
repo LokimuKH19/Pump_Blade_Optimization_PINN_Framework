@@ -42,12 +42,12 @@
 
 ### Dec. 25, 2025
 - Updated `FluidSummoning.py`. Fixed the crash when trying to summon a fluid domain without vane zone
-  
-## Dependencies Description
-It is recommended to download "Blender" and "OpenSCAD" when using this software, and add them into Path (Environment Variable) for boolean calculation.
 
 ### Jan. 5, 2026
 - New programm `BladeGeneratorCAD.py` is released. Now the parametric modeling of the blade in the axial fluid machinery can export the `.step` file with OpenCasCade engine (need conda environment), in which the format of the 3D model is CFD-meshing-friendly **B-rep**. So far the upper and lower bound of the blade is Polygon, and I'm going to upgrade this to NURB/Spline Surface later.
+  
+## Dependencies Description
+It is recommended to download "Blender" and "OpenSCAD" when using this software, and add them into Path (Environment Variable) for boolean calculation.
 
 If you are using later version of the `trimesh` package, the "OpenSCAD" engine will no longer available. Instead, you can download `manifold3d` directly by 
 
