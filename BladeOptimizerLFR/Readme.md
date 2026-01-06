@@ -45,6 +45,11 @@
 
 ### Jan. 5, 2026
 - New programm `BladeGeneratorCAD.py` is released. Now the parametric modeling of the blade in the axial fluid machinery can export the `.step` file with OpenCasCade engine (need conda environment), in which the format of the 3D model is CFD-meshing-friendly **B-rep**. So far the upper and lower bound of the blade is Polygon, and I'm going to upgrade this to NURB/Spline Surface later.
+
+### Jan. 6, 2026
+- Updated `BladeGenereratorCAD.py`: Now the shape of the Blades has been turned into the NURB surface. Running the script would create several files in the `./CQ` filefolder, where the `annular_passage.step` refers to the Flow Passage, while the `blade_complete_boolean.step` is the Blade Solid domain.
+- Known issue: I manage to summon the Fluid Domain by using OpenCASCade's Difference Set api. However, the generated `fluid_domain_complete.step` has topology problems, where an enexpected extra plane is not removed at root of the blade. Still you can generate geometrically reasonable fluid domain by using the Difference Set tools in Spaceclaim, which would create the correct model with better stability.
+
   
 ## Dependencies Description
 It is recommended to download "Blender" and "OpenSCAD" when using this software, and add them into Path (Environment Variable) for boolean calculation.
