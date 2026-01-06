@@ -42,3 +42,10 @@ Our contribution?
 
 
 In short: we make pump optimization faster, smarter, and slightly more magical. ✨
+
+# Configuration
+```cmd
+conda env create -f environment.yml
+conda activate blade-geometry
+```
+
