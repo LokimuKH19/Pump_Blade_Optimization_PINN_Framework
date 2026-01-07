@@ -1,0 +1,2289 @@
+# encoding: utf-8
+# 2020 R2
+SetScriptVersion(Version="20.2.221")
+fileType1 = GetFileType(Name="GeometryFileType")
+ImportFile(
+    FilePath="D:/Ansys/Blade参数化建模工具/BladeOptimizerLFR/CQ/Nurbs泵流体域.scdoc",
+    FileType=fileType1)
+template1 = GetTemplate(TemplateName="Mesh")
+system1 = GetSystem(Name="Geometry")
+system2 = template1.CreateSystem(
+    Position="Right",
+    RelativeTo=system1)
+geometryComponent1 = system2.GetComponent(Name="Geometry")
+geometryComponent2 = system1.GetComponent(Name="Geometry")
+geometryComponent1.ReplaceWithShare(
+    TargetSystem=system2,
+    ComponentToShare=geometryComponent2,
+    SourceSystem=system1)
+meshComponent1 = system2.GetComponent(Name="Mesh")
+meshComponent1.Refresh()
+mesh1 = system2.GetContainer(ComponentName="Mesh")
+mesh1.Edit()
+mesh1.Exit()
+template2 = GetTemplate(TemplateName="CFX")
+system3 = template2.CreateSystem(
+    Position="Right",
+    RelativeTo=system2)
+setupComponent1 = system3.GetComponent(Name="Setup")
+meshComponent1.TransferData(TargetComponent=setupComponent1)
+setup1 = system3.GetContainer(ComponentName="Setup")
+setup1.Edit()
+setupComponent1.Refresh()
+setup1.Exit()
+setupComponent1.Update(AllDependencies=True)
+setup1.Edit()
+setup1.SendCommand(Command="""VIEW:View 1
+  Camera Mode = User Specified
+  CAMERA:
+    Option = Pivot Point and Quaternion
+    Pivot Point = 3.27418e-11, 0, 6.25e-05
+    Scale = 7361.36
+    Pan = 0, 0
+    Rotation Quaternion = -0.208747, -0.168364, -0.315537, 0.910227
+    
+  END
+
+END
+
+> update
+FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 1
+      Boundary Type = INLET
+      Interface Boundary = Off
+      Location = inlet
+      BOUNDARY CONDITIONS: 
+        FLOW DIRECTION: 
+          Option = Normal to Boundary Condition
+        END # FLOW DIRECTION:
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Option = Total Pressure
+          Relative Pressure = 0 [Pa]
+        END # MASS AND MOMENTUM:
+        TURBULENCE: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 1
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 1
+      Boundary Type = INLET
+      Interface Boundary = Off
+      Location = inlet
+      BOUNDARY CONDITIONS: 
+        FLOW DIRECTION: 
+          Option = Normal to Boundary Condition
+        END # FLOW DIRECTION:
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Option = Total Pressure
+          Relative Pressure = 0 [Pa]
+        END # MASS AND MOMENTUM:
+        TURBULENCE: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 1
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 2
+      Boundary Type = INLET
+      Interface Boundary = Off
+      Location = outlet
+      BOUNDARY CONDITIONS: 
+        FLOW DIRECTION: 
+          Option = Normal to Boundary Condition
+        END # FLOW DIRECTION:
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+        TURBULENCE: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 2
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 2
+      Boundary Type = OUTLET
+      Interface Boundary = Off
+      Location = outlet
+      BOUNDARY CONDITIONS: 
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 2
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 2
+      Boundary Type = OUTLET
+      Interface Boundary = Off
+      Location = outlet
+      BOUNDARY CONDITIONS: 
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 2
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 3
+      Boundary Type = WALL
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = shroud
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 3
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 3
+      Boundary Type = WALL
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = shroud
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 3
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 4
+      Boundary Type = WALL
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = Impeller
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          WALL VELOCITY: 
+            Angular Velocity = 70.65 [radian s^-1]
+            Option = Rotating Wall
+            AXIS DEFINITION: 
+              Option = Coordinate Axis
+              Rotation Axis = Coord 0.3
+            END # AXIS DEFINITION:
+          END # WALL VELOCITY:
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 4
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 4
+      Boundary Type = WALL
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = Impeller
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          WALL VELOCITY: 
+            Angular Velocity = 70.65 [radian s^-1]
+            Option = Rotating Wall
+            AXIS DEFINITION: 
+              Option = Coordinate Axis
+              Rotation Axis = Coord 0.3
+            END # AXIS DEFINITION:
+          END # WALL VELOCITY:
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 4
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""LIBRARY: 
+&replace   MATERIAL: LBE
+    Material Group = User
+    Object Origin = User
+    Option = Pure Substance
+    PROPERTIES: 
+      Option = General Material
+      DYNAMIC VISCOSITY: 
+        Dynamic Viscosity = 0.0016 [Pa s]
+        Option = Value
+      END # DYNAMIC VISCOSITY:
+      EQUATION OF STATE: 
+        Density = 10650 [kg m^-3]
+        Molar Mass = 1.0 [kg kmol^-1]
+        Option = Value
+      END # EQUATION OF STATE:
+    END # PROPERTIES:
+  END # MATERIAL:LBE
+END # LIBRARY:
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""LIBRARY: 
+&replace   MATERIAL: LBE
+    Material Group = User
+    Object Origin = User
+    Option = Pure Substance
+    PROPERTIES: 
+      Option = General Material
+      DYNAMIC VISCOSITY: 
+        Dynamic Viscosity = 0.0016 [Pa s]
+        Option = Value
+      END # DYNAMIC VISCOSITY:
+      EQUATION OF STATE: 
+        Density = 10650 [kg m^-3]
+        Molar Mass = 1.0 [kg kmol^-1]
+        Option = Value
+      END # EQUATION OF STATE:
+    END # PROPERTIES:
+  END # MATERIAL:LBE
+END # LIBRARY:
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""LIBRARY: 
+&replace   MATERIAL: LBE
+    Material Group = User
+    Object Origin = User
+    Option = Pure Substance
+    PROPERTIES: 
+      Option = General Material
+      DYNAMIC VISCOSITY: 
+        Dynamic Viscosity = 0.0016 [Pa s]
+        Option = Value
+      END # DYNAMIC VISCOSITY:
+      EQUATION OF STATE: 
+        Density = 10650 [kg m^-3]
+        Molar Mass = 1.0 [kg kmol^-1]
+        Option = Value
+      END # EQUATION OF STATE:
+    END # PROPERTIES:
+  END # MATERIAL:LBE
+END # LIBRARY:
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""LIBRARY: 
+&replace   MATERIAL: LBE
+    Material Group = User
+    Object Origin = User
+    Option = Pure Substance
+    PROPERTIES: 
+      Option = General Material
+      DYNAMIC VISCOSITY: 
+        Dynamic Viscosity = 0.0016 [Pa s]
+        Option = Value
+      END # DYNAMIC VISCOSITY:
+      EQUATION OF STATE: 
+        Density = 10650 [kg m^-3]
+        Molar Mass = 1 [kg kmol^-1]
+        Option = Value
+      END # EQUATION OF STATE:
+    END # PROPERTIES:
+  END # MATERIAL:LBE
+END # LIBRARY:
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""LIBRARY: 
+&replace   MATERIAL: LBE
+    Material Group = User
+    Object Origin = User
+    Option = Pure Substance
+    PROPERTIES: 
+      Option = General Material
+      DYNAMIC VISCOSITY: 
+        Dynamic Viscosity = 0.0016 [Pa s]
+        Option = Value
+      END # DYNAMIC VISCOSITY:
+      EQUATION OF STATE: 
+        Density = 10650 [kg m^-3]
+        Molar Mass = 1 [kg kmol^-1]
+        Option = Value
+      END # EQUATION OF STATE:
+    END # PROPERTIES:
+  END # MATERIAL:LBE
+END # LIBRARY:
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command=">delete /LIBRARY/MATERIAL:Air Ideal Gas,/LIBRARY/MATERIAL:Air at 25 C,/LIBRARY/MATERIAL:Aluminium,/LIBRARY/MATERIAL:Copper,/LIBRARY/MATERIAL:Soot,/LIBRARY/MATERIAL:Steel,/LIBRARY/MATERIAL:Water,/LIBRARY/MATERIAL:Water Ideal Gas")
+setup1.SendCommand(Command="> undo")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+&replace   DOMAIN: Default Domain
+    Coord Frame = Coord 0
+    Domain Type = Fluid
+    Location = B4
+    BOUNDARY: Boundary 1
+      Boundary Type = INLET
+      Interface Boundary = Off
+      Location = inlet
+      BOUNDARY CONDITIONS: 
+        FLOW DIRECTION: 
+          Option = Normal to Boundary Condition
+        END # FLOW DIRECTION:
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Option = Total Pressure
+          Relative Pressure = 0 [Pa]
+        END # MASS AND MOMENTUM:
+        TURBULENCE: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 1
+    BOUNDARY: Boundary 2
+      Boundary Type = OUTLET
+      Interface Boundary = Off
+      Location = outlet
+      BOUNDARY CONDITIONS: 
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 2
+    BOUNDARY: Boundary 3
+      Boundary Type = WALL
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = shroud
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 3
+    BOUNDARY: Boundary 4
+      Boundary Type = WALL
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = Impeller
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          WALL VELOCITY: 
+            Angular Velocity = 70.65 [radian s^-1]
+            Option = Rotating Wall
+            AXIS DEFINITION: 
+              Option = Coordinate Axis
+              Rotation Axis = Coord 0.3
+            END # AXIS DEFINITION:
+          END # WALL VELOCITY:
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 4
+    DOMAIN MODELS: 
+      BUOYANCY MODEL: 
+        Option = Non Buoyant
+      END # BUOYANCY MODEL:
+      DOMAIN MOTION: 
+        Option = Stationary
+      END # DOMAIN MOTION:
+      MESH DEFORMATION: 
+        Option = None
+      END # MESH DEFORMATION:
+      REFERENCE PRESSURE: 
+        Reference Pressure = 1 [atm]
+      END # REFERENCE PRESSURE:
+    END # DOMAIN MODELS:
+    FLUID DEFINITION: Fluid 1
+      Material = LBE
+      Option = Material Library
+      MORPHOLOGY: 
+        Option = Continuous Fluid
+      END # MORPHOLOGY:
+    END # FLUID DEFINITION:Fluid 1
+    FLUID MODELS: 
+      COMBUSTION MODEL: 
+        Option = None
+      END # COMBUSTION MODEL:
+      HEAT TRANSFER MODEL: 
+        Fluid Temperature = 25 [C]
+        Option = Isothermal
+      END # HEAT TRANSFER MODEL:
+      THERMAL RADIATION MODEL: 
+        Option = None
+      END # THERMAL RADIATION MODEL:
+      TURBULENCE MODEL: 
+        Option = k epsilon
+      END # TURBULENCE MODEL:
+      TURBULENT WALL FUNCTIONS: 
+        Option = Scalable
+      END # TURBULENT WALL FUNCTIONS:
+    END # FLUID MODELS:
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+&replace   DOMAIN: Default Domain
+    Coord Frame = Coord 0
+    Domain Type = Fluid
+    Location = B4
+    BOUNDARY: Boundary 1
+      Boundary Type = INLET
+      Interface Boundary = Off
+      Location = inlet
+      BOUNDARY CONDITIONS: 
+        FLOW DIRECTION: 
+          Option = Normal to Boundary Condition
+        END # FLOW DIRECTION:
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Option = Total Pressure
+          Relative Pressure = 0 [Pa]
+        END # MASS AND MOMENTUM:
+        TURBULENCE: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 1
+    BOUNDARY: Boundary 2
+      Boundary Type = OUTLET
+      Interface Boundary = Off
+      Location = outlet
+      BOUNDARY CONDITIONS: 
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 2
+    BOUNDARY: Boundary 3
+      Boundary Type = WALL
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = shroud
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 3
+    BOUNDARY: Boundary 4
+      Boundary Type = WALL
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = Impeller
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          WALL VELOCITY: 
+            Angular Velocity = 70.65 [radian s^-1]
+            Option = Rotating Wall
+            AXIS DEFINITION: 
+              Option = Coordinate Axis
+              Rotation Axis = Coord 0.3
+            END # AXIS DEFINITION:
+          END # WALL VELOCITY:
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 4
+    DOMAIN MODELS: 
+      BUOYANCY MODEL: 
+        Option = Non Buoyant
+      END # BUOYANCY MODEL:
+      DOMAIN MOTION: 
+        Option = Stationary
+      END # DOMAIN MOTION:
+      MESH DEFORMATION: 
+        Option = None
+      END # MESH DEFORMATION:
+      REFERENCE PRESSURE: 
+        Reference Pressure = 1 [atm]
+      END # REFERENCE PRESSURE:
+    END # DOMAIN MODELS:
+    FLUID DEFINITION: Fluid 1
+      Material = LBE
+      Option = Material Library
+      MORPHOLOGY: 
+        Option = Continuous Fluid
+      END # MORPHOLOGY:
+    END # FLUID DEFINITION:Fluid 1
+    FLUID MODELS: 
+      COMBUSTION MODEL: 
+        Option = None
+      END # COMBUSTION MODEL:
+      HEAT TRANSFER MODEL: 
+        Fluid Temperature = 25 [C]
+        Option = Isothermal
+      END # HEAT TRANSFER MODEL:
+      THERMAL RADIATION MODEL: 
+        Option = None
+      END # THERMAL RADIATION MODEL:
+      TURBULENCE MODEL: 
+        Option = k epsilon
+      END # TURBULENCE MODEL:
+      TURBULENT WALL FUNCTIONS: 
+        Option = Scalable
+      END # TURBULENT WALL FUNCTIONS:
+    END # FLUID MODELS:
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+&replace   DOMAIN: Default Domain
+    Coord Frame = Coord 0
+    Domain Type = Fluid
+    Location = B4
+    BOUNDARY: Boundary 1
+      Boundary Type = INLET
+      Interface Boundary = Off
+      Location = inlet
+      BOUNDARY CONDITIONS: 
+        FLOW DIRECTION: 
+          Option = Normal to Boundary Condition
+        END # FLOW DIRECTION:
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Option = Total Pressure
+          Relative Pressure = 0 [Pa]
+        END # MASS AND MOMENTUM:
+        TURBULENCE: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 1
+    BOUNDARY: Boundary 2
+      Boundary Type = OUTLET
+      Interface Boundary = Off
+      Location = outlet
+      BOUNDARY CONDITIONS: 
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 2
+    BOUNDARY: Boundary 3
+      Boundary Type = WALL
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = shroud
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 3
+    BOUNDARY: Boundary 4
+      Boundary Type = WALL
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = Impeller
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          WALL VELOCITY: 
+            Angular Velocity = 70.65 [radian s^-1]
+            Option = Rotating Wall
+            AXIS DEFINITION: 
+              Option = Coordinate Axis
+              Rotation Axis = Coord 0.3
+            END # AXIS DEFINITION:
+          END # WALL VELOCITY:
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 4
+    DOMAIN MODELS: 
+      BUOYANCY MODEL: 
+        Option = Non Buoyant
+      END # BUOYANCY MODEL:
+      DOMAIN MOTION: 
+        Option = Stationary
+      END # DOMAIN MOTION:
+      MESH DEFORMATION: 
+        Option = None
+      END # MESH DEFORMATION:
+      REFERENCE PRESSURE: 
+        Reference Pressure = 1 [atm]
+      END # REFERENCE PRESSURE:
+    END # DOMAIN MODELS:
+    FLUID DEFINITION: Fluid 1
+      Material = LBE
+      Option = Material Library
+      MORPHOLOGY: 
+        Option = Continuous Fluid
+      END # MORPHOLOGY:
+    END # FLUID DEFINITION:Fluid 1
+    FLUID MODELS: 
+      COMBUSTION MODEL: 
+        Option = None
+      END # COMBUSTION MODEL:
+      HEAT TRANSFER MODEL: 
+        Fluid Temperature = 650 [C]
+        Option = Isothermal
+      END # HEAT TRANSFER MODEL:
+      THERMAL RADIATION MODEL: 
+        Option = None
+      END # THERMAL RADIATION MODEL:
+      TURBULENCE MODEL: 
+        Option = SST
+      END # TURBULENCE MODEL:
+      TURBULENT WALL FUNCTIONS: 
+        Option = Automatic
+      END # TURBULENT WALL FUNCTIONS:
+    END # FLUID MODELS:
+    INITIALISATION: 
+      Option = Automatic
+      INITIAL CONDITIONS: 
+        Velocity Type = Cartesian
+        CARTESIAN VELOCITY COMPONENTS: 
+          Option = Automatic
+        END # CARTESIAN VELOCITY COMPONENTS:
+        STATIC PRESSURE: 
+          Option = Automatic
+        END # STATIC PRESSURE:
+        TURBULENCE INITIAL CONDITIONS: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE INITIAL CONDITIONS:
+      END # INITIAL CONDITIONS:
+    END # INITIALISATION:
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+&replace   DOMAIN: Default Domain
+    Coord Frame = Coord 0
+    Domain Type = Fluid
+    Location = B4
+    BOUNDARY: Boundary 1
+      Boundary Type = INLET
+      Interface Boundary = Off
+      Location = inlet
+      BOUNDARY CONDITIONS: 
+        FLOW DIRECTION: 
+          Option = Normal to Boundary Condition
+        END # FLOW DIRECTION:
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Option = Total Pressure
+          Relative Pressure = 0 [Pa]
+        END # MASS AND MOMENTUM:
+        TURBULENCE: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 1
+    BOUNDARY: Boundary 2
+      Boundary Type = OUTLET
+      Interface Boundary = Off
+      Location = outlet
+      BOUNDARY CONDITIONS: 
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 2
+    BOUNDARY: Boundary 3
+      Boundary Type = WALL
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = shroud
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 3
+    BOUNDARY: Boundary 4
+      Boundary Type = WALL
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = Impeller
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          WALL VELOCITY: 
+            Angular Velocity = 70.65 [radian s^-1]
+            Option = Rotating Wall
+            AXIS DEFINITION: 
+              Option = Coordinate Axis
+              Rotation Axis = Coord 0.3
+            END # AXIS DEFINITION:
+          END # WALL VELOCITY:
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 4
+    DOMAIN MODELS: 
+      BUOYANCY MODEL: 
+        Option = Non Buoyant
+      END # BUOYANCY MODEL:
+      DOMAIN MOTION: 
+        Option = Stationary
+      END # DOMAIN MOTION:
+      MESH DEFORMATION: 
+        Option = None
+      END # MESH DEFORMATION:
+      REFERENCE PRESSURE: 
+        Reference Pressure = 1 [atm]
+      END # REFERENCE PRESSURE:
+    END # DOMAIN MODELS:
+    FLUID DEFINITION: Fluid 1
+      Material = LBE
+      Option = Material Library
+      MORPHOLOGY: 
+        Option = Continuous Fluid
+      END # MORPHOLOGY:
+    END # FLUID DEFINITION:Fluid 1
+    FLUID MODELS: 
+      COMBUSTION MODEL: 
+        Option = None
+      END # COMBUSTION MODEL:
+      HEAT TRANSFER MODEL: 
+        Fluid Temperature = 650 [C]
+        Option = Isothermal
+      END # HEAT TRANSFER MODEL:
+      THERMAL RADIATION MODEL: 
+        Option = None
+      END # THERMAL RADIATION MODEL:
+      TURBULENCE MODEL: 
+        Option = SST
+      END # TURBULENCE MODEL:
+      TURBULENT WALL FUNCTIONS: 
+        Option = Automatic
+      END # TURBULENT WALL FUNCTIONS:
+    END # FLUID MODELS:
+    INITIALISATION: 
+      Option = Automatic
+      INITIAL CONDITIONS: 
+        Velocity Type = Cartesian
+        CARTESIAN VELOCITY COMPONENTS: 
+          Option = Automatic
+        END # CARTESIAN VELOCITY COMPONENTS:
+        STATIC PRESSURE: 
+          Option = Automatic
+        END # STATIC PRESSURE:
+        TURBULENCE INITIAL CONDITIONS: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE INITIAL CONDITIONS:
+      END # INITIAL CONDITIONS:
+    END # INITIALISATION:
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""LIBRARY: 
+&replace   MATERIAL: LBE
+    Material Group = User
+    Object Origin = User
+    Option = Pure Substance
+    PROPERTIES: 
+      Option = General Material
+      DYNAMIC VISCOSITY: 
+        Dynamic Viscosity = 0.0016 [Pa s]
+        Option = Value
+      END # DYNAMIC VISCOSITY:
+      EQUATION OF STATE: 
+        Density = 10650 [kg m^-3]
+        Molar Mass = 1 [kg kmol^-1]
+        Option = Value
+      END # EQUATION OF STATE:
+      SPECIFIC HEAT CAPACITY: 
+        Option = Value
+        Specific Heat Capacity = 1 [J kg^-1 K^-1]
+        Specific Heat Type = Constant Pressure
+      END # SPECIFIC HEAT CAPACITY:
+    END # PROPERTIES:
+  END # MATERIAL:LBE
+END # LIBRARY:
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""LIBRARY: 
+&replace   MATERIAL: LBE
+    Material Group = User
+    Object Origin = User
+    Option = Pure Substance
+    PROPERTIES: 
+      Option = General Material
+      DYNAMIC VISCOSITY: 
+        Dynamic Viscosity = 0.0016 [Pa s]
+        Option = Value
+      END # DYNAMIC VISCOSITY:
+      EQUATION OF STATE: 
+        Density = 10650 [kg m^-3]
+        Molar Mass = 1 [kg kmol^-1]
+        Option = Value
+      END # EQUATION OF STATE:
+      SPECIFIC HEAT CAPACITY: 
+        Option = Value
+        Specific Heat Capacity = 1 [J kg^-1 K^-1]
+        Specific Heat Type = Constant Pressure
+      END # SPECIFIC HEAT CAPACITY:
+    END # PROPERTIES:
+  END # MATERIAL:LBE
+END # LIBRARY:
+
+
+PARAMETERIZATION:
+END""")
+setup1.Exit()
+solution1 = system3.GetContainer(ComponentName="Solution")
+solution1.SetExecutionControl(CCL=r"""&replace SIMULATION CONTROL:
+  EXECUTION CONTROL:
+    EXECUTABLE SELECTION:
+      Double Precision = On
+      Large Problem = Off
+    END
+    INTERPOLATOR STEP CONTROL:
+      Runtime Priority = Standard
+      MEMORY CONTROL:
+        Memory Allocation Factor = 1.0
+      END
+    END
+    PARTITIONER STEP CONTROL:
+      Multidomain Option = Automatic
+      Runtime Priority = Standard
+      MEMORY CONTROL:
+        Memory Allocation Factor = 1.0
+      END
+      PARTITION SMOOTHING:
+        Maximum Partition Smoothing Sweeps = 100
+        Option = Smooth
+      END
+      PARTITIONING TYPE:
+        MeTiS Type = k-way
+        Option = MeTiS
+        Partition Size Rule = Automatic
+      END
+    END
+    RUN DEFINITION:
+      Run Mode = Full
+      Solver Input File = C:\Users\Administrator\AppData\Local\Temp\WB_WIN-PB27LEBSLRJ_Administrator_34188_2\unsaved_project_files\dp0\CFX\CFX\CFX.def
+    END
+    SOLVER STEP CONTROL:
+      Runtime Priority = Standard
+      MEMORY CONTROL:
+        Memory Allocation Factor = 1.0
+      END
+      PARALLEL ENVIRONMENT:
+        Number of Processes = 1
+        Start Method = Serial
+      END
+    END
+  END
+END
+""")
+solutionComponent1 = system3.GetComponent(Name="Solution")
+solutionComponent1.Update(Force=True)
+setup1.Edit()
+setup1.SendCommand(Command="""VIEW:View 1
+  Camera Mode = User Specified
+  CAMERA:
+    Option = Pivot Point and Quaternion
+    Pivot Point = -3.82133e-08, 7.6423e-08, 6.25e-05
+    Scale = 6612.34
+    Pan = 0, 0
+    Rotation Quaternion = -0.208747, -0.168364, -0.315537, 0.910227
+    
+  END
+
+END
+
+VIEW:View 1
+  Light Angle = 50, 110
+END
+
+> update
+FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 4
+      Boundary Type = WALL
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = Impeller
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          WALL VELOCITY: 
+            Angular Velocity = 70.65 [radian s^-1]
+            Option = Rotating Wall
+            AXIS DEFINITION: 
+              Option = Coordinate Axis
+              Rotation Axis = Coord 0.3
+            END # AXIS DEFINITION:
+          END # WALL VELOCITY:
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 4
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 4
+      Boundary Type = WALL
+      Coord Frame = Coord 0
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = Impeller
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          WALL VELOCITY: 
+            Angular Velocity = 70.65 [radian s^-1]
+            Option = Rotating Wall
+            AXIS DEFINITION: 
+              Option = Two Points
+              Rotation Axis From = 0.0[m],0.0[m],0.0[m]
+              Rotation Axis To = 0 [m], 0 [m], 1 [m]
+            END # AXIS DEFINITION:
+          END # WALL VELOCITY:
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 4
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+mesh1.Edit()
+setup1.Exit()
+mesh1.Exit()
+solution1.Exit()
+setup1.Edit()
+setup1.Exit()
+setupComponent1.Update(AllDependencies=True)
+solution1.SetExecutionControl(CCL=r"""&replace SIMULATION CONTROL:
+  EXECUTION CONTROL:
+    EXECUTABLE SELECTION:
+      Double Precision = On
+      Large Problem = On
+    END
+    INTERPOLATOR STEP CONTROL:
+      Runtime Priority = Standard
+      MEMORY CONTROL:
+        Memory Allocation Factor = 1.0
+      END
+    END
+    PARTITIONER STEP CONTROL:
+      Multidomain Option = Automatic
+      Runtime Priority = Standard
+      MEMORY CONTROL:
+        Memory Allocation Factor = 1.0
+      END
+      PARTITION SMOOTHING:
+        Maximum Partition Smoothing Sweeps = 100
+        Option = Smooth
+      END
+      PARTITIONING TYPE:
+        MeTiS Type = k-way
+        Option = MeTiS
+        Partition Size Rule = Automatic
+      END
+    END
+    RUN DEFINITION:
+      Run Mode = Full
+      Solver Input File = C:\Users\Administrator\AppData\Local\Temp\WB_WIN-PB27LEBSLRJ_Administrator_34188_2\unsaved_project_files\dp0\CFX\CFX\CFX.def
+    END
+    SOLVER STEP CONTROL:
+      Runtime Priority = Standard
+      MEMORY CONTROL:
+        Memory Allocation Factor = 1.0
+      END
+      PARALLEL ENVIRONMENT:
+        Number of Processes = 1
+        Start Method = Serial
+      END
+    END
+  END
+END
+""")
+solutionComponent1.Update(Force=True)
+solution1.SetExecutionControl(CCL=r"""&replace SIMULATION CONTROL:
+  EXECUTION CONTROL:
+    EXECUTABLE SELECTION:
+      Double Precision = On
+      Large Problem = Off
+    END
+    INTERPOLATOR STEP CONTROL:
+      Runtime Priority = Standard
+      MEMORY CONTROL:
+        Memory Allocation Factor = 1.0
+      END
+    END
+    PARTITIONER STEP CONTROL:
+      Multidomain Option = Automatic
+      Runtime Priority = Standard
+      MEMORY CONTROL:
+        Memory Allocation Factor = 1.0
+      END
+      PARTITION SMOOTHING:
+        Maximum Partition Smoothing Sweeps = 100
+        Option = Smooth
+      END
+      PARTITIONING TYPE:
+        MeTiS Type = k-way
+        Option = MeTiS
+        Partition Size Rule = Automatic
+      END
+    END
+    RUN DEFINITION:
+      Run Mode = Full
+      Solver Input File = C:\Users\Administrator\AppData\Local\Temp\WB_WIN-PB27LEBSLRJ_Administrator_34188_2\unsaved_project_files\dp0\CFX\CFX\CFX.def
+    END
+    SOLVER STEP CONTROL:
+      Runtime Priority = Standard
+      MEMORY CONTROL:
+        Memory Allocation Factor = 1.0
+      END
+      PARALLEL ENVIRONMENT:
+        Number of Processes = 1
+        Start Method = Serial
+      END
+    END
+  END
+END
+""")
+solutionComponent1.Update(Force=True)
+setup1.Edit()
+setup1.SendCommand(Command="""VIEW:View 1
+  Camera Mode = User Specified
+  CAMERA:
+    Option = Pivot Point and Quaternion
+    Pivot Point = -3.63798e-12, -1.75081e-07, 6.25e-05
+    Scale = 6611.83
+    Pan = 0, 0
+    Rotation Quaternion = -0.208747, -0.168364, -0.315537, 0.910227
+    
+  END
+
+END
+
+> update
+FLOW: Flow Analysis 1
+&replace   DOMAIN: Default Domain
+    Coord Frame = Coord 0
+    Domain Type = Fluid
+    Location = B4
+    BOUNDARY: Boundary 1
+      Boundary Type = INLET
+      Interface Boundary = Off
+      Location = inlet
+      BOUNDARY CONDITIONS: 
+        FLOW DIRECTION: 
+          Option = Normal to Boundary Condition
+        END # FLOW DIRECTION:
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Option = Total Pressure
+          Relative Pressure = 0 [Pa]
+        END # MASS AND MOMENTUM:
+        TURBULENCE: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 1
+    BOUNDARY: Boundary 2
+      Boundary Type = OUTLET
+      Interface Boundary = Off
+      Location = outlet
+      BOUNDARY CONDITIONS: 
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 2
+    BOUNDARY: Boundary 3
+      Boundary Type = WALL
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = shroud
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 3
+    BOUNDARY: Boundary 4
+      Boundary Type = WALL
+      Coord Frame = Coord 0
+      Create Other Side = Off
+      Interface Boundary = Off
+      Location = Impeller
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          WALL VELOCITY: 
+            Angular Velocity = 70.65 [radian s^-1]
+            Option = Rotating Wall
+            AXIS DEFINITION: 
+              Option = Two Points
+              Rotation Axis From = 0.0[m],0.0[m],0.0[m]
+              Rotation Axis To = 0 [m], 0 [m], 1 [m]
+            END # AXIS DEFINITION:
+          END # WALL VELOCITY:
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 4
+    DOMAIN MODELS: 
+      BUOYANCY MODEL: 
+        Option = Non Buoyant
+      END # BUOYANCY MODEL:
+      DOMAIN MOTION: 
+        Angular Velocity = -675 [rev min^-1]
+        Option = Rotating
+        AXIS DEFINITION: 
+          Option = Coordinate Axis
+          Rotation Axis = Coord 0.3
+        END # AXIS DEFINITION:
+      END # DOMAIN MOTION:
+      MESH DEFORMATION: 
+        Displacement Relative To = Previous Mesh
+        Option = Regions of Motion Specified
+        MESH MOTION MODEL: 
+          Option = Displacement Diffusion
+          MESH STIFFNESS: 
+            Option = Increase near Small Volumes
+            Stiffness Model Exponent = 2.0
+            REFERENCE VOLUME: 
+              Option = Mean Control Volume
+            END # REFERENCE VOLUME:
+          END # MESH STIFFNESS:
+        END # MESH MOTION MODEL:
+      END # MESH DEFORMATION:
+      REFERENCE PRESSURE: 
+        Reference Pressure = 1 [atm]
+      END # REFERENCE PRESSURE:
+    END # DOMAIN MODELS:
+    FLUID DEFINITION: Fluid 1
+      Material = LBE
+      Option = Material Library
+      MORPHOLOGY: 
+        Option = Continuous Fluid
+      END # MORPHOLOGY:
+    END # FLUID DEFINITION:Fluid 1
+    FLUID MODELS: 
+      COMBUSTION MODEL: 
+        Option = None
+      END # COMBUSTION MODEL:
+      HEAT TRANSFER MODEL: 
+        Fluid Temperature = 650 [C]
+        Option = Isothermal
+      END # HEAT TRANSFER MODEL:
+      THERMAL RADIATION MODEL: 
+        Option = None
+      END # THERMAL RADIATION MODEL:
+      TURBULENCE MODEL: 
+        Option = SST
+      END # TURBULENCE MODEL:
+      TURBULENT WALL FUNCTIONS: 
+        Option = Automatic
+      END # TURBULENT WALL FUNCTIONS:
+    END # FLUID MODELS:
+    INITIALISATION: 
+      Frame Type = Stationary
+      Option = Automatic
+      INITIAL CONDITIONS: 
+        Velocity Type = Cartesian
+        CARTESIAN VELOCITY COMPONENTS: 
+          Option = Automatic
+        END # CARTESIAN VELOCITY COMPONENTS:
+        STATIC PRESSURE: 
+          Option = Automatic
+        END # STATIC PRESSURE:
+        TURBULENCE INITIAL CONDITIONS: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE INITIAL CONDITIONS:
+      END # INITIAL CONDITIONS:
+    END # INITIALISATION:
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+&replace   DOMAIN: Default Domain
+    Coord Frame = Coord 0
+    Domain Type = Fluid
+    Location = B4
+    BOUNDARY: Boundary 1
+      Boundary Type = INLET
+      Interface Boundary = Off
+      Location = inlet
+      BOUNDARY CONDITIONS: 
+        FLOW DIRECTION: 
+          Option = Normal to Boundary Condition
+        END # FLOW DIRECTION:
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Option = Total Pressure
+          Relative Pressure = 0 [Pa]
+        END # MASS AND MOMENTUM:
+        TURBULENCE: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 1
+    BOUNDARY: Boundary 2
+      Boundary Type = OUTLET
+      Interface Boundary = Off
+      Location = outlet
+      BOUNDARY CONDITIONS: 
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 2
+    BOUNDARY: Boundary 3
+      Boundary Type = WALL
+      Create Other Side = Off
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = shroud
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          Wall Velocity Relative To = Mesh Motion
+        END # MASS AND MOMENTUM:
+        MESH MOTION: 
+          Option = Stationary
+        END # MESH MOTION:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 3
+    BOUNDARY: Boundary 4
+      Boundary Type = WALL
+      Coord Frame = Coord 0
+      Create Other Side = Off
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = Impeller
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          Wall Velocity Relative To = Mesh Motion
+          WALL VELOCITY: 
+            Angular Velocity = 70.65 [radian s^-1]
+            Option = Rotating Wall
+            AXIS DEFINITION: 
+              Option = Two Points
+              Rotation Axis From = 0.0[m],0.0[m],0.0[m]
+              Rotation Axis To = 0 [m], 0 [m], 1 [m]
+            END # AXIS DEFINITION:
+          END # WALL VELOCITY:
+        END # MASS AND MOMENTUM:
+        MESH MOTION: 
+          Option = Stationary
+        END # MESH MOTION:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 4
+    DOMAIN MODELS: 
+      BUOYANCY MODEL: 
+        Option = Non Buoyant
+      END # BUOYANCY MODEL:
+      DOMAIN MOTION: 
+        Angular Velocity = -675 [rev min^-1]
+        Option = Rotating
+        AXIS DEFINITION: 
+          Option = Coordinate Axis
+          Rotation Axis = Coord 0.3
+        END # AXIS DEFINITION:
+      END # DOMAIN MOTION:
+      MESH DEFORMATION: 
+        Option = None
+      END # MESH DEFORMATION:
+      REFERENCE PRESSURE: 
+        Reference Pressure = 1 [atm]
+      END # REFERENCE PRESSURE:
+    END # DOMAIN MODELS:
+    FLUID DEFINITION: Fluid 1
+      Material = LBE
+      Option = Material Library
+      MORPHOLOGY: 
+        Option = Continuous Fluid
+      END # MORPHOLOGY:
+    END # FLUID DEFINITION:Fluid 1
+    FLUID MODELS: 
+      COMBUSTION MODEL: 
+        Option = None
+      END # COMBUSTION MODEL:
+      HEAT TRANSFER MODEL: 
+        Fluid Temperature = 650 [C]
+        Option = Isothermal
+      END # HEAT TRANSFER MODEL:
+      THERMAL RADIATION MODEL: 
+        Option = None
+      END # THERMAL RADIATION MODEL:
+      TURBULENCE MODEL: 
+        Option = SST
+      END # TURBULENCE MODEL:
+      TURBULENT WALL FUNCTIONS: 
+        Option = Automatic
+      END # TURBULENT WALL FUNCTIONS:
+    END # FLUID MODELS:
+    INITIALISATION: 
+      Frame Type = Stationary
+      Option = Automatic
+      INITIAL CONDITIONS: 
+        Velocity Type = Cartesian
+        CARTESIAN VELOCITY COMPONENTS: 
+          Option = Automatic
+        END # CARTESIAN VELOCITY COMPONENTS:
+        STATIC PRESSURE: 
+          Option = Automatic
+        END # STATIC PRESSURE:
+        TURBULENCE INITIAL CONDITIONS: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE INITIAL CONDITIONS:
+      END # INITIAL CONDITIONS:
+    END # INITIALISATION:
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 4
+      Boundary Type = WALL
+      Coord Frame = Coord 0
+      Create Other Side = Off
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = Impeller
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 4
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 4
+      Boundary Type = WALL
+      Coord Frame = Coord 0
+      Create Other Side = Off
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = Impeller
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 4
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 3
+      Boundary Type = WALL
+      Create Other Side = Off
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = shroud
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          WALL VELOCITY: 
+            Option = Counter Rotating Wall
+          END # WALL VELOCITY:
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 3
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 3
+      Boundary Type = WALL
+      Create Other Side = Off
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = shroud
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          WALL VELOCITY: 
+            Option = Counter Rotating Wall
+          END # WALL VELOCITY:
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 3
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 1
+      Boundary Type = INLET
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = inlet
+      BOUNDARY CONDITIONS: 
+        FLOW DIRECTION: 
+          Option = Normal to Boundary Condition
+        END # FLOW DIRECTION:
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+        TURBULENCE: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 1
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 1
+      Boundary Type = INLET
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = inlet
+      BOUNDARY CONDITIONS: 
+        FLOW DIRECTION: 
+          Option = Normal to Boundary Condition
+        END # FLOW DIRECTION:
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+        TURBULENCE: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 1
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 2
+      Boundary Type = OUTLET
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = outlet
+      BOUNDARY CONDITIONS: 
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 2
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+  DOMAIN: Default Domain
+&replace     BOUNDARY: Boundary 2
+      Boundary Type = OUTLET
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = outlet
+      BOUNDARY CONDITIONS: 
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 2
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""VIEW:View 1
+  Camera Mode = User Specified
+  CAMERA:
+    Option = Pivot Point and Quaternion
+    Pivot Point = -3.63798e-12, -1.75081e-07, 6.25e-05
+    Scale = 6611.83
+    Pan = 0, 0
+    Rotation Quaternion = -0.478525, -0.251532, -0.504381, 0.673307
+    
+  END
+
+END
+
+> update
+FLOW: Flow Analysis 1
+&replace   DOMAIN: Default Domain
+    Coord Frame = Coord 0
+    Domain Type = Fluid
+    Location = B4
+    BOUNDARY: Boundary 1
+      Boundary Type = INLET
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = inlet
+      BOUNDARY CONDITIONS: 
+        FLOW DIRECTION: 
+          Option = Normal to Boundary Condition
+        END # FLOW DIRECTION:
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+        TURBULENCE: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 1
+    BOUNDARY: Boundary 2
+      Boundary Type = OUTLET
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = outlet
+      BOUNDARY CONDITIONS: 
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 2
+    BOUNDARY: Boundary 3
+      Boundary Type = WALL
+      Create Other Side = Off
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = shroud
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          WALL VELOCITY: 
+            Option = Counter Rotating Wall
+          END # WALL VELOCITY:
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 3
+    BOUNDARY: Boundary 4
+      Boundary Type = WALL
+      Coord Frame = Coord 0
+      Create Other Side = Off
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = Impeller
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 4
+    DOMAIN MODELS: 
+      BUOYANCY MODEL: 
+        Option = Non Buoyant
+      END # BUOYANCY MODEL:
+      DOMAIN MOTION: 
+        Angular Velocity = -675 [rev min^-1]
+        Option = Rotating
+        AXIS DEFINITION: 
+          Option = Coordinate Axis
+          Rotation Axis = Coord 0.3
+        END # AXIS DEFINITION:
+      END # DOMAIN MOTION:
+      MESH DEFORMATION: 
+        Option = None
+      END # MESH DEFORMATION:
+      REFERENCE PRESSURE: 
+        Reference Pressure = 1 [atm]
+      END # REFERENCE PRESSURE:
+    END # DOMAIN MODELS:
+    FLUID DEFINITION: Fluid 1
+      Material = LBE
+      Option = Material Library
+      MORPHOLOGY: 
+        Option = Continuous Fluid
+      END # MORPHOLOGY:
+    END # FLUID DEFINITION:Fluid 1
+    FLUID MODELS: 
+      COMBUSTION MODEL: 
+        Option = None
+      END # COMBUSTION MODEL:
+      HEAT TRANSFER MODEL: 
+        Fluid Temperature = 650 [C]
+        Option = Isothermal
+      END # HEAT TRANSFER MODEL:
+      THERMAL RADIATION MODEL: 
+        Option = None
+      END # THERMAL RADIATION MODEL:
+      TURBULENCE MODEL: 
+        Option = SST
+      END # TURBULENCE MODEL:
+      TURBULENT WALL FUNCTIONS: 
+        Option = Automatic
+      END # TURBULENT WALL FUNCTIONS:
+    END # FLUID MODELS:
+    INITIALISATION: 
+      Frame Type = Stationary
+      Option = Automatic
+      INITIAL CONDITIONS: 
+        Velocity Type = Cartesian
+        CARTESIAN VELOCITY COMPONENTS: 
+          Option = Automatic
+        END # CARTESIAN VELOCITY COMPONENTS:
+        STATIC PRESSURE: 
+          Option = Automatic
+        END # STATIC PRESSURE:
+        TURBULENCE INITIAL CONDITIONS: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE INITIAL CONDITIONS:
+      END # INITIAL CONDITIONS:
+    END # INITIALISATION:
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.SendCommand(Command="""FLOW: Flow Analysis 1
+&replace   DOMAIN: Default Domain
+    Coord Frame = Coord 0
+    Domain Type = Fluid
+    Location = B4
+    BOUNDARY: Boundary 1
+      Boundary Type = INLET
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = inlet
+      BOUNDARY CONDITIONS: 
+        FLOW DIRECTION: 
+          Option = Normal to Boundary Condition
+        END # FLOW DIRECTION:
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+        TURBULENCE: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 1
+    BOUNDARY: Boundary 2
+      Boundary Type = OUTLET
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = outlet
+      BOUNDARY CONDITIONS: 
+        FLOW REGIME: 
+          Option = Subsonic
+        END # FLOW REGIME:
+        MASS AND MOMENTUM: 
+          Mass Flow Rate = 0.24 [kg s^-1]
+          Mass Flow Rate Area = As Specified
+          Option = Mass Flow Rate
+        END # MASS AND MOMENTUM:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 2
+    BOUNDARY: Boundary 3
+      Boundary Type = WALL
+      Create Other Side = Off
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = shroud
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+          WALL VELOCITY: 
+            Option = Counter Rotating Wall
+          END # WALL VELOCITY:
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 3
+    BOUNDARY: Boundary 4
+      Boundary Type = WALL
+      Coord Frame = Coord 0
+      Create Other Side = Off
+      Frame Type = Rotating
+      Interface Boundary = Off
+      Location = Impeller
+      BOUNDARY CONDITIONS: 
+        MASS AND MOMENTUM: 
+          Option = No Slip Wall
+        END # MASS AND MOMENTUM:
+        WALL ROUGHNESS: 
+          Option = Smooth Wall
+        END # WALL ROUGHNESS:
+      END # BOUNDARY CONDITIONS:
+    END # BOUNDARY:Boundary 4
+    DOMAIN MODELS: 
+      BUOYANCY MODEL: 
+        Option = Non Buoyant
+      END # BUOYANCY MODEL:
+      DOMAIN MOTION: 
+        Angular Velocity = -675 [rev min^-1]
+        Option = Rotating
+        AXIS DEFINITION: 
+          Option = Coordinate Axis
+          Rotation Axis = Coord 0.3
+        END # AXIS DEFINITION:
+      END # DOMAIN MOTION:
+      MESH DEFORMATION: 
+        Option = None
+      END # MESH DEFORMATION:
+      REFERENCE PRESSURE: 
+        Reference Pressure = 1 [atm]
+      END # REFERENCE PRESSURE:
+    END # DOMAIN MODELS:
+    FLUID DEFINITION: Fluid 1
+      Material = LBE
+      Option = Material Library
+      MORPHOLOGY: 
+        Option = Continuous Fluid
+      END # MORPHOLOGY:
+    END # FLUID DEFINITION:Fluid 1
+    FLUID MODELS: 
+      COMBUSTION MODEL: 
+        Option = None
+      END # COMBUSTION MODEL:
+      HEAT TRANSFER MODEL: 
+        Fluid Temperature = 650 [C]
+        Option = Isothermal
+      END # HEAT TRANSFER MODEL:
+      THERMAL RADIATION MODEL: 
+        Option = None
+      END # THERMAL RADIATION MODEL:
+      TURBULENCE MODEL: 
+        Option = SST
+      END # TURBULENCE MODEL:
+      TURBULENT WALL FUNCTIONS: 
+        Option = Automatic
+      END # TURBULENT WALL FUNCTIONS:
+    END # FLUID MODELS:
+    INITIALISATION: 
+      Frame Type = Stationary
+      Option = Automatic
+      INITIAL CONDITIONS: 
+        Velocity Type = Cartesian
+        CARTESIAN VELOCITY COMPONENTS: 
+          Option = Automatic
+        END # CARTESIAN VELOCITY COMPONENTS:
+        STATIC PRESSURE: 
+          Option = Automatic
+        END # STATIC PRESSURE:
+        TURBULENCE INITIAL CONDITIONS: 
+          Option = Medium Intensity and Eddy Viscosity Ratio
+        END # TURBULENCE INITIAL CONDITIONS:
+      END # INITIAL CONDITIONS:
+    END # INITIALISATION:
+  END # DOMAIN:Default Domain
+END # FLOW:Flow Analysis 1
+
+
+PARAMETERIZATION:
+END""")
+setup1.Exit()
+solution1.SetExecutionControl(CCL=r"""&replace SIMULATION CONTROL:
+  EXECUTION CONTROL:
+    EXECUTABLE SELECTION:
+      Double Precision = On
+      Large Problem = Off
+    END
+    INTERPOLATOR STEP CONTROL:
+      Runtime Priority = Standard
+      MEMORY CONTROL:
+        Memory Allocation Factor = 1.0
+      END
+    END
+    PARTITIONER STEP CONTROL:
+      Multidomain Option = Automatic
+      Runtime Priority = Standard
+      MEMORY CONTROL:
+        Memory Allocation Factor = 1.0
+      END
+      PARTITION SMOOTHING:
+        Maximum Partition Smoothing Sweeps = 100
+        Option = Smooth
+      END
+      PARTITIONING TYPE:
+        MeTiS Type = k-way
+        Option = MeTiS
+        Partition Size Rule = Automatic
+      END
+    END
+    RUN DEFINITION:
+      Run Mode = Full
+      Solver Input File = C:\Users\Administrator\AppData\Local\Temp\WB_WIN-PB27LEBSLRJ_Administrator_34188_2\unsaved_project_files\dp0\CFX\CFX\CFX.def
+    END
+    SOLVER STEP CONTROL:
+      Runtime Priority = Standard
+      MEMORY CONTROL:
+        Memory Allocation Factor = 1.0
+      END
+      PARALLEL ENVIRONMENT:
+        Number of Processes = 1
+        Start Method = Serial
+      END
+    END
+  END
+END
+""")
+solutionComponent1.Update(Force=True)
+results1 = system3.GetContainer(ComponentName="Results")
+results1.Edit()
+results1.SendCommand(Command="""VIEW:View 1
+  Camera Mode = User Specified
+  CAMERA:
+    Option = Pivot Point and Quaternion
+    Pivot Point = 0, 0, 6.25e-05
+    Scale = 7361.35
+    Pan = 0, 0
+    Rotation Quaternion = 0.279848, -0.364705, -0.115917, 0.880476
+    
+  END
+
+END
+
+> update
+# Sending visibility action from ViewUtilities
+>show /DATA READER/CASE:Case CFX/BOUNDARY:Boundary 3, view=/VIEW:View 1""")
+results1.SendCommand(Command="""# Sending visibility action from ViewUtilities
+>hide /DATA READER/CASE:Case CFX/BOUNDARY:Boundary 3, view=/VIEW:View 1""")
+results1.SendCommand(Command="""# Sending visibility action from ViewUtilities
+>show /DATA READER/CASE:Case CFX/BOUNDARY:Boundary 2, view=/VIEW:View 1""")
+results1.SendCommand(Command="""# Sending visibility action from ViewUtilities
+>hide /DATA READER/CASE:Case CFX/BOUNDARY:Boundary 2, view=/VIEW:View 1""")
+results1.SendCommand(Command="""# Sending visibility action from ViewUtilities
+>show /DATA READER/CASE:Case CFX/BOUNDARY:Boundary 4, view=/VIEW:View 1""")
+results1.SendCommand(Command="""VIEW:View 1
+  Camera Mode = User Specified
+  CAMERA:
+    Option = Pivot Point and Quaternion
+    Pivot Point = 0, 0, 6.25e-05
+    Scale = 7361.35
+    Pan = 0, 0
+    Rotation Quaternion = -0.0790187, 0.074945, -0.11998, 0.986784
+    
+  END
+
+END
+
+> update
+> report showItem=/REPORT/SOLUTION SUMMARY OPTIONS""")
+results1.SendCommand(Command="""VIEW:Turbo Initialisation View
+ Object Visibility List = /WIREFRAME:Wireframe, /COMPHIGHLIGHT:Default Domain
+ Is A Figure = false
+END""")
+results1.SendCommand(Command="""# Setting Single View: /VIEW:Turbo Initialisation View
+VIEWPORT MANAGER:
+  Viewport Layout = No Split
+  Maximized Viewport = -1
+END
+>setViewportView cmd=set, view=/VIEW:Turbo Initialisation View, viewport=1""")
+results1.SendCommand(Command="""VIEW:Turbo Initialisation View
+ Object Visibility List = /WIREFRAME:Wireframe, /COMPHIGHLIGHT:Default Domain
+ Is A Figure = false
+END""")
+results1.SendCommand(Command="""# Setting Single View: /VIEW:Turbo Initialisation View
+VIEWPORT MANAGER:
+  Viewport Layout = No Split
+  Maximized Viewport = -1
+END
+>setViewportView cmd=set, view=/VIEW:Turbo Initialisation View, viewport=1""")
+results1.SendCommand(Command="""VIEWPORT MANAGER:
+  Synchronize Visibility = false
+END""")
+results1.SendCommand(Command="""VIEWPORT MANAGER:
+  Maximized Viewport = -1
+  Synchronize Camera = false
+  Synchronize Visibility = true
+  View Length Units = m
+  Viewer Camera Z = -5
+  Viewer Eye Point = Normal
+  Viewer Eye Separation = 5
+  Viewport 1 View = View 1
+  Viewport 2 View = View 2
+  Viewport 3 View = View 3
+  Viewport 4 View = View 4
+  Viewport Layout = No Split
+  X Split = 0.5
+  Y Split = 0.5
+END""")
+results1.SendCommand(Command="""VIEW:Turbo Initialisation View
+ Object Visibility List = /WIREFRAME:Wireframe, /COMPHIGHLIGHT:Default Domain
+ Is A Figure = false
+END""")
+results1.SendCommand(Command="""# Setting Single View: /VIEW:Turbo Initialisation View
+VIEWPORT MANAGER:
+  Viewport Layout = No Split
+  Maximized Viewport = -1
+END
+>setViewportView cmd=set, view=/VIEW:Turbo Initialisation View, viewport=1""")
+results1.SendCommand(Command="""VIEWPORT MANAGER:
+  Synchronize Visibility = false
+END""")
+results1.SendCommand(Command="""VIEWPORT MANAGER:
+  Maximized Viewport = -1
+  Synchronize Camera = false
+  Synchronize Visibility = true
+  View Length Units = m
+  Viewer Camera Z = -5
+  Viewer Eye Point = Normal
+  Viewer Eye Separation = 5
+  Viewport 1 View = View 1
+  Viewport 2 View = View 2
+  Viewport 3 View = View 3
+  Viewport 4 View = View 4
+  Viewport Layout = No Split
+  X Split = 0.5
+  Y Split = 0.5
+END""")
+results1.SendCommand(Command="""VIEW:Turbo Initialisation View
+ Object Visibility List = /WIREFRAME:Wireframe, /COMPHIGHLIGHT:Default Domain
+ Is A Figure = false
+END""")
+results1.SendCommand(Command="""# Setting Single View: /VIEW:Turbo Initialisation View
+VIEWPORT MANAGER:
+  Viewport Layout = No Split
+  Maximized Viewport = -1
+END
+>setViewportView cmd=set, view=/VIEW:Turbo Initialisation View, viewport=1""")
+results1.SendCommand(Command="""VIEWPORT MANAGER:
+  Synchronize Visibility = false
+END""")
+results1.SendCommand(Command="""VIEW:Turbo Initialisation View
+  Camera Mode = User Specified
+  CAMERA:
+    Option = Pivot Point and Quaternion
+    Pivot Point = 0, 0, 6.25e-05
+    Scale = 7361.35
+    Pan = 0, 0
+    Rotation Quaternion = -0.260134, -0.248109, -0.339036, -0.86938
+    
+  END
+
+END
+
+> update
+
+VIEWPORT MANAGER:
+  Maximized Viewport = -1
+  Synchronize Camera = false
+  Synchronize Visibility = true
+  View Length Units = m
+  Viewer Camera Z = -5
+  Viewer Eye Point = Normal
+  Viewer Eye Separation = 5
+  Viewport 1 View = View 1
+  Viewport 2 View = View 2
+  Viewport 3 View = View 3
+  Viewport 4 View = View 4
+  Viewport Layout = No Split
+  X Split = 0.5
+  Y Split = 0.5
+END""")
+results1.Edit()
+Save(Overwrite=True)
+results1.Exit()
+Save(Overwrite=True)
+results1.Edit()
+results1.SendCommand(Command="""VIEW:View 1
+  Light Angle = 50, 110
+END
+
+VIEW:View 2
+  Light Angle = 50, 110
+END
+
+VIEW:View 3
+  Light Angle = 50, 110
+END
+
+VIEW:View 4
+  Light Angle = 50, 110
+END
+
+> update
+> report showItem=/REPORT/SOLUTION SUMMARY OPTIONS""")
+results1.SendCommand(Command="""VIEW:Turbo Initialisation View
+ Object Visibility List = /WIREFRAME:Wireframe
+ Is A Figure = false
+END""")
+results1.SendCommand(Command="""# Setting Single View: /VIEW:Turbo Initialisation View
+VIEWPORT MANAGER:
+  Viewport Layout = No Split
+  Maximized Viewport = -1
+END
+>setViewportView cmd=set, view=/VIEW:Turbo Initialisation View, viewport=1""")
+results1.SendCommand(Command="""VIEWPORT MANAGER:
+  Synchronize Visibility = false
+END""")
+results1.SendCommand(Command="""VIEWPORT MANAGER:
+  Maximized Viewport = -1
+  Synchronize Camera = false
+  Synchronize Visibility = true
+  View Length Units = m
+  Viewer Camera Z = -5
+  Viewer Eye Point = Normal
+  Viewer Eye Separation = 5
+  Viewport 1 View = View 1
+  Viewport 2 View = View 2
+  Viewport 3 View = View 3
+  Viewport 4 View = View 4
+  Viewport Layout = No Split
+  X Split = 0.5
+  Y Split = 0.5
+END""")
+results1.Exit()
+solution1.Exit()
+mesh1.Edit()
+mesh1.Exit()
+Save(Overwrite=True)
