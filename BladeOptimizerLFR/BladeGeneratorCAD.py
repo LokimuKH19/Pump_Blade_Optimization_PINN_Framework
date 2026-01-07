@@ -16,9 +16,12 @@ from OCC.Core.BRepCheck import BRepCheck_Analyzer
 from OCC.Extend.DataExchange import write_step_file
 from OCC.Core.TopAbs import TopAbs_FACE
 from OCC.Core.TopExp import TopExp_Explorer
-from OCC.Core.TopoDS import TopoDS_Shape
-from OCC.Core.BRepOffsetAPI import BRepOffsetAPI_MakeThickSolid
-from OCC.Core.TopTools import TopTools_ListOfShape
+from OCC.Core.BRepOffsetAPI import BRepOffsetAPI_ThruSections
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire
+from OCC.Core.GeomAbs import GeomAbs_C2
+from OCC.Core.TColgp import TColgp_HArray1OfPnt
+from OCC.Core.GeomAPI import GeomAPI_PointsToBSpline
+import os
 
 
 # ---------------- 流道 -----------------
@@ -110,6 +113,7 @@ def spline_thickness(x, knots_x, knots_t):
         tau /= maxv
     return tau
 
+
 # ---------------- BladeVoid -----------------
 class BladeVoid:
     def __init__(self, span_layers, Theta, H, z0, hub_radius, shroud_radius, theta_offset=0.0):
@@ -197,6 +201,7 @@ class BladeVoid:
         self.vertices_upper = verts_upper
         self.vertices_lower = verts_lower
 
+    # 预览功能
     def visualize(self, passage_grid=None):
         if self.vertices_upper is None:
             self.generate_surface()
@@ -225,45 +230,200 @@ class BladeVoid:
             x = r*np.cos(theta)
             y = r*np.sin(theta)
             z_root_array = np.full_like(theta, z_root)
-            z_tip_array  = np.full_like(theta, z_tip)
+            z_tip_array = np.full_like(theta, z_tip)
             p.add_mesh(np.column_stack([x,y,z_root_array]), color="blue", point_size=5, render_points_as_spheres=True)
             p.add_mesh(np.column_stack([x,y,z_tip_array]), color="green", point_size=5, render_points_as_spheres=True)
 
         p.add_axes()
         p.show()
 
-    # ---------------- OCCT Solid -----------------
+    # 兼容UI的预览功能
+    def visualize_streamlit(self, passage_grid=None):
+        if self.vertices_upper is None:
+            self.generate_surface()
+        up_pts = self.vertices_upper.reshape(-1, 3)
+        low_pts = self.vertices_lower.reshape(-1, 3)
+        span_pts, chord_pts, _ = self.vertices_upper.shape
+
+        surf_upper = pv.StructuredGrid()
+        surf_upper.points = up_pts
+        surf_upper.dimensions = (chord_pts, span_pts, 1)
+        surf_lower = pv.StructuredGrid()
+        surf_lower.points = low_pts
+        surf_lower.dimensions = (chord_pts, span_pts, 1)
+
+        p = pv.Plotter(off_screen=True, window_size=(800, 600))
+        # optional passage grid
+        if passage_grid is not None:
+            p.add_mesh(passage_grid, color="lightgray", opacity=0.3, show_edges=True)
+        # blade surfaces
+        p.add_mesh(surf_upper, color="tomato", show_edges=True)
+        p.add_mesh(surf_lower, color="tomato", show_edges=True)
+
+        # hub/shroud points
+        z_root = self.vertices_upper[0, 0, 2]
+        z_tip = self.vertices_upper[-1, 0, 2]
+        for r in [self.hub_radius, self.shroud_radius]:
+            theta = np.linspace(0, 2 * np.pi, 100)
+            x = r * np.cos(theta)
+            y = r * np.sin(theta)
+            z_root_array = np.full_like(theta, z_root)
+            z_tip_array = np.full_like(theta, z_tip)
+            p.add_mesh(np.column_stack([x, y, z_root_array]), color="blue", point_size=5, render_points_as_spheres=True)
+            p.add_mesh(np.column_stack([x, y, z_tip_array]), color="green", point_size=5, render_points_as_spheres=True)
+
+        p.add_axes()
+        return p
+
+    # ---------------- OCCT Solid (平滑版本) -----------------
     def to_occt_solid_loft(self):
+        """
+        生成叶片上下型面的 NURBS 壳体（不封前后缘，不生成实体）
+        - 上表面：LE -> TE 开曲线 loft
+        - 下表面：LE -> TE 开曲线 loft
+        - 返回 TopoDS_Shell
+        """
+
         if self.vertices_upper is None:
             self.generate_surface()
 
         span_pts, chord_pts, _ = self.vertices_upper.shape
-        loft = BRepOffsetAPI_ThruSections(True, True, 1e-6)
+        # =========================
+        # 1. 上表面 loft（开曲线）
+        # =========================
+        loft_upper = BRepOffsetAPI_ThruSections(
+            False,  # isSolid
+            True,  # ruled = True（更稳定）
+            1e-6
+        )
+        loft_upper.SetSmoothing(True)
 
         for i in range(span_pts):
-            polygon_builder = BRepBuilderAPI_MakePolygon()
+            # LE -> TE
+            point_array = TColgp_HArray1OfPnt(1, chord_pts)
             for j in range(chord_pts):
                 x, y, z = self.vertices_upper[i, j]
-                polygon_builder.Add(gp_Pnt(x, y, z))
-            for j in range(chord_pts - 1, -1, -1):
+                point_array.SetValue(j + 1, gp_Pnt(x, y, z))
+
+            spline = GeomAPI_PointsToBSpline(
+                point_array,
+                3,  # degree
+                8,  # max segments
+                GeomAbs_C2,
+                1e-6
+            ).Curve()
+
+            edge = BRepBuilderAPI_MakeEdge(spline).Edge()
+            wire = BRepBuilderAPI_MakeWire(edge).Wire()
+            loft_upper.AddWire(wire)
+
+        loft_upper.Build()
+        if not loft_upper.IsDone():
+            raise RuntimeError("Upper surface loft failed")
+
+        upper_face = loft_upper.Shape()
+
+        # =========================
+        # 2. 下表面 loft（开曲线）
+        # =========================
+        loft_lower = BRepOffsetAPI_ThruSections(
+            False,
+            True,
+            1e-6
+        )
+        loft_lower.SetSmoothing(True)
+
+        for i in range(span_pts):
+            # LE -> TE（注意方向必须与上表面一致）
+            point_array = TColgp_HArray1OfPnt(1, chord_pts)
+            for j in range(chord_pts):
                 x, y, z = self.vertices_lower[i, j]
-                polygon_builder.Add(gp_Pnt(x, y, z))
-            # 闭合多边形
-            x_first, y_first, z_first = self.vertices_upper[i, 0]
-            polygon_builder.Add(gp_Pnt(x_first, y_first, z_first))
+                point_array.SetValue(j + 1, gp_Pnt(x, y, z))
 
-            if polygon_builder.IsDone():
-                wire = polygon_builder.Wire()
-                loft.AddWire(wire)
+            spline = GeomAPI_PointsToBSpline(
+                point_array,
+                3,
+                8,
+                GeomAbs_C2,
+                1e-6
+            ).Curve()
+
+            edge = BRepBuilderAPI_MakeEdge(spline).Edge()
+            wire = BRepBuilderAPI_MakeWire(edge).Wire()
+            loft_lower.AddWire(wire)
+
+        loft_lower.Build()
+        if not loft_lower.IsDone():
+            raise RuntimeError("Lower surface loft failed")
+
+        lower_face = loft_lower.Shape()
+        # =========================
+        # 3. 输出上下型面
+        # =========================
+        return upper_face, lower_face
+
+    # 封前后缘
+    def build_le_te_faces(self):
+        if self.vertices_upper is None:
+            self.generate_surface()
+
+        span_pts, chord_pts, _ = self.vertices_upper.shape
+
+        # =========================
+        # 使用多边形方法创建前缘面
+        # =========================
+        polygon_builder_le = BRepBuilderAPI_MakePolygon()
+
+        # 添加上表面的前缘点
+        for i in range(span_pts):
+            x, y, z = self.vertices_upper[i, 0]
+            polygon_builder_le.Add(gp_Pnt(x, y, z))
+
+        # 添加下表面的前缘点（反向）
+        for i in range(span_pts - 1, -1, -1):
+            x, y, z = self.vertices_lower[i, 0]
+            polygon_builder_le.Add(gp_Pnt(x, y, z))
+
+        # 闭合多边形
+        if polygon_builder_le.IsDone():
+            wire_le = polygon_builder_le.Wire()
+            face_builder_le = BRepBuilderAPI_MakeFace(wire_le)
+            if face_builder_le.IsDone():
+                le_face = face_builder_le.Face()
             else:
-                print(f"Warning: Failed to create polygon for span layer {i}")
+                raise RuntimeError("Failed to create LE face from wire")
+        else:
+            raise RuntimeError("Failed to create LE polygon")
 
-        loft.Build()
-        if not loft.IsDone():
-            raise RuntimeError("Loft failed to build solid")
-        return loft.Shape()
+        # =========================
+        # 使用多边形方法创建后缘面
+        # =========================
+        polygon_builder_te = BRepBuilderAPI_MakePolygon()
 
-    # ---------------- BladeVoid 类中的新方法，等主程序调通启用 ----------------
+        # 添加上表面的后缘点
+        for i in range(span_pts):
+            x, y, z = self.vertices_upper[i, -1]
+            polygon_builder_te.Add(gp_Pnt(x, y, z))
+
+        # 添加下表面的后缘点（反向）
+        for i in range(span_pts - 1, -1, -1):
+            x, y, z = self.vertices_lower[i, -1]
+            polygon_builder_te.Add(gp_Pnt(x, y, z))
+
+        # 闭合多边形
+        if polygon_builder_te.IsDone():
+            wire_te = polygon_builder_te.Wire()
+            face_builder_te = BRepBuilderAPI_MakeFace(wire_te)
+            if face_builder_te.IsDone():
+                te_face = face_builder_te.Face()
+            else:
+                raise RuntimeError("Failed to create TE face from wire")
+        else:
+            raise RuntimeError("Failed to create TE polygon")
+
+        return le_face, te_face
+
+    # 辅助函数：用于构建shroud封面
     def _summon_hyp_loft(self, rate=1.5):
         # 创建假想叶片实体：半径从shroud_radius向外延伸，由于左侧的稳定特性和右侧的奇异特性的必要举措
         # 我们创建一个虚拟的span层，半径大于shroud_radius
@@ -338,10 +498,42 @@ class BladeVoid:
                 print(f"Warning: Failed to create polygon for hypothetical blade layer {i}")
         return hyp_loft
 
+    # 辅助函数：用于构建hub封面
+    def _summon_inner_hyposis_loft(self):
+        if self.vertices_upper is None:
+            self.generate_surface()
+
+        span_pts, chord_pts, _ = self.vertices_upper.shape
+        loft = BRepOffsetAPI_ThruSections(True, True, 1e-6)
+
+        for i in range(span_pts):
+            polygon_builder = BRepBuilderAPI_MakePolygon()
+            for j in range(chord_pts):
+                x, y, z = self.vertices_upper[i, j]
+                polygon_builder.Add(gp_Pnt(x, y, z))
+            for j in range(chord_pts - 1, -1, -1):
+                x, y, z = self.vertices_lower[i, j]
+                polygon_builder.Add(gp_Pnt(x, y, z))
+            # 闭合多边形
+            x_first, y_first, z_first = self.vertices_upper[i, 0]
+            polygon_builder.Add(gp_Pnt(x_first, y_first, z_first))
+
+            if polygon_builder.IsDone():
+                wire = polygon_builder.Wire()
+                loft.AddWire(wire)
+            else:
+                print(f"Warning: Failed to create polygon for span layer {i}")
+
+        loft.Build()
+        if not loft.IsDone():
+            raise RuntimeError("Loft failed to build solid")
+        return loft.Shape()
+
+    # 用于构建r_hub和r_shroud处封面的函数
     def to_cap(self):
         """生成 hub/shroud 圆柱曲面封盖 - 直接使用布尔运算技术"""
         # 1. 生成叶片侧面实体
-        blade_loft = self.to_occt_solid_loft()
+        blade_loft = self._summon_inner_hyposis_loft()
 
         # 2. 计算叶片的轴向范围
         span_pts, chord_pts, _ = self.vertices_upper.shape
@@ -405,29 +597,41 @@ class BladeVoid:
         return hub_cap, shroud_cap
 
 
-if __name__ == "__main__":
-    with open("./param.json", "r", encoding="utf-8") as f:
-        config = json.load(f)
+# 整体封装成函数
+def generate_blade_and_fluid_domain(
+    param_data,
+    hub_radius,
+    shroud_radius,
+    N,
+    H1,
+    H,
+    z0,
+    Theta,
+    output_dir="./CQ"
+):
+    """
+    生成叶片实体和环形流道实体，并保存为 STEP 文件
 
-    hub_radius = 0.121 / 2
-    shroud_radius = 0.16 / 2
-    N = 6
-    H1 = (0.21 + 0.04) / 2
-    H = 0.21 / 2
-    z0 = 0
-    Theta = np.pi / 3.5
+    Args:
+        param_data (dict): param.json 读取的内容
+        hub_radius (float): hub 半径
+        shroud_radius (float): shroud 半径
+        N (int): 扇区数
+        H1 (float): 流道高度
+        H (float): 叶片高度
+        z0 (float): 起始轴向位置
+        Theta (float): 叶片弦向角度（rad）
+        output_dir (str): STEP 文件保存目录
+    """
+    os.makedirs(output_dir, exist_ok=True)
 
-    # =======================
-    # Passage
-    # =======================
+    # ---------------- 流道 -----------------
     passage = AnnularSectorPassage(hub_radius, shroud_radius, z0, H1, N)
     passage_grid, passage_zrange, passage_theta_range = passage.generate_surface()
 
-    # =======================
-    # Blade
-    # =======================
+    # ---------------- 叶片 -----------------
     blade = BladeVoid(
-        config["layers_params"],
+        param_data["layers_params"],
         Theta,
         H,
         z0,
@@ -435,93 +639,85 @@ if __name__ == "__main__":
         shroud_radius,
         theta_offset=0.0
     )
+    blade.generate_surface(passage_z=passage_zrange, passage_theta=passage_theta_range, align="left")
 
-    blade.generate_surface(
-        passage_z=passage_zrange,
-        passage_theta=passage_theta_range,
-        align="left"
-    )
+    # 可视化（可选）
+    # blade.visualize(passage_grid=passage_grid)
 
-    blade.visualize(passage_grid=passage_grid)
+    # ---------------- 环形扇柱 -----------------
+    angle = 2 * np.pi / N
+    annular_passage = make_annular_sector_prism_simple(hub_radius, shroud_radius, H1, angle)
+    print("Annular passage valid:", BRepCheck_Analyzer(annular_passage).IsValid())
+    write_step_file(annular_passage, os.path.join(output_dir, "annular_passage.step"))
 
-    print("\n=== Generating blade surfaces ===")
-    blade_loft = blade.to_occt_solid_loft()
-    write_step_file(blade_loft, "./CQ/blade_loft.step")
+    # ---------------- 叶片上下表面 -----------------
+    upper_nurb, lower_nurb = blade.to_occt_solid_loft()
+    print(f"Upper surface generated: {not upper_nurb.IsNull()}")
+    print(f"Lower surface generated: {not lower_nurb.IsNull()}")
+    write_step_file(upper_nurb, os.path.join(output_dir, "upper_surface.step"))
+    write_step_file(lower_nurb, os.path.join(output_dir, "lower_surface.step"))
 
-    print("Blade loft null:", blade_loft.IsNull())
+    # ---------------- 前后缘 -----------------
+    le_face, te_face = blade.build_le_te_faces()
 
-    # =======================
-    # End caps
-    # =======================
-    print("\n=== Generating hub / shroud caps ===")
+    # ---------------- 端盖 -----------------
     hub_cap, shroud_cap = blade.to_cap()
+    write_step_file(hub_cap, os.path.join(output_dir, "hub_cap_boolean.step"))
+    write_step_file(shroud_cap, os.path.join(output_dir, "shroud_cap_boolean.step"))
 
-    write_step_file(hub_cap, "./CQ/hub_cap_boolean.step")
-    write_step_file(shroud_cap, "./CQ/shroud_cap_boolean.step")
-
-    # =======================
-    # Sewing → Solid
-    # =======================
-    print("\n=== Sewing blade ===")
-    sewing = BRepBuilderAPI_Sewing(1e-5)
-    sewing.Add(blade_loft)
+    # ---------------- 缝合成完整叶片 -----------------
+    sewing = BRepBuilderAPI_Sewing(1e-4)
+    sewing.Add(upper_nurb)
+    sewing.Add(lower_nurb)
+    sewing.Add(le_face)
+    sewing.Add(te_face)
     sewing.Add(hub_cap)
     sewing.Add(shroud_cap)
     sewing.Perform()
-
     closed_shell = sewing.SewedShape()
-    print("Closed shell null:", closed_shell.IsNull())
+    write_step_file(closed_shell, os.path.join(output_dir, "BladeShell.step"))
 
+    # ---------------- 生成实体 -----------------
     solid_maker = BRepBuilderAPI_MakeSolid(closed_shell)
     if not solid_maker.IsDone():
-        raise RuntimeError("MakeSolid failed")
-
+        raise RuntimeError("Failed to make solid from closed shell")
     complete_blade = solid_maker.Shape()
-    write_step_file(complete_blade, "./CQ/blade_complete_boolean.step")
+    print(f"Complete blade solid created: {not complete_blade.IsNull()}")
+    print(f"Blade solid valid: {BRepCheck_Analyzer(complete_blade).IsValid()}")
+    write_step_file(complete_blade, os.path.join(output_dir, "blade_complete_boolean.step"))
 
-    print("Blade solid valid:",
-          BRepCheck_Analyzer(complete_blade).IsValid())
-
-    # =======================
-    # Passage solid
-    # =======================
-    angle = 2 * np.pi / N
-    annular_passage = make_annular_sector_prism_simple(
-        hub_radius,
-        shroud_radius,
-        H1,
-        angle
-    )
-
-    write_step_file(annular_passage, "./CQ/annular_passage.step")
-    # =======================
-    # Boolean COMMON check
-    # =======================
-    print("\n=== Boolean COMMON check ===")
-    common = BRepAlgoAPI_Common(annular_passage, complete_blade)
-    common.Build()
-
-    print("COMMON done:", common.IsDone())
-    print("COMMON null:", common.Shape().IsNull())
-
-    if not common.Shape().IsNull():
-        write_step_file(common.Shape(), "./CQ/debug_common.step")
-
-    # =======================
-    # Boolean CUT
-    # =======================
-    print("\n=== Boolean CUT (fluid domain) ===")
+    # ---------------- 流体域 -----------------
     fluid_cut = BRepAlgoAPI_Cut(annular_passage, complete_blade)
-    fluid_cut.Build()
-
-    print("CUT done:", fluid_cut.IsDone())
     fluid_solid = fluid_cut.Shape()
-    print("Fluid solid null:", fluid_solid.IsNull())
-    print("Fluid solid valid:",
-          BRepCheck_Analyzer(fluid_solid).IsValid())
+    print("Fluid domain valid:", BRepCheck_Analyzer(fluid_solid).IsValid())
+    write_step_file(fluid_solid, os.path.join(output_dir, "fluid_domain_complete.step"))
 
-    write_step_file(fluid_solid, "./CQ/fluid_domain_complete.step")
+    return {
+        "passage": annular_passage,
+        "blade_solid": complete_blade,
+        "fluid_solid": fluid_solid,
+        "upper_surface": upper_nurb,
+        "lower_surface": lower_nurb,
+        "hub_cap": hub_cap,
+        "shroud_cap": shroud_cap,
+        "le_face": le_face,
+        "te_face": te_face,
+        "closed_shell": closed_shell
+    }
 
-    print("\n=== DONE ===")
 
+if __name__ == '__main__':
+    with open("./param.json", "r", encoding="utf-8") as f:
+        param_data = json.load(f)
 
+    results = generate_blade_and_fluid_domain(
+        param_data=param_data,
+        hub_radius=0.121 / 2,
+        shroud_radius=0.16 / 2,
+        N=6,
+        H1=(0.21 + 0.04) / 2,
+        H=0.21 / 2,
+        z0=0,
+        Theta=np.pi / 3.5,
+        output_dir="./CQ"
+    )
