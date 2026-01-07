@@ -22,6 +22,7 @@ from OCC.Core.GeomAbs import GeomAbs_C2
 from OCC.Core.TColgp import TColgp_HArray1OfPnt
 from OCC.Core.GeomAPI import GeomAPI_PointsToBSpline
 import os
+from datetime import datetime
 
 
 # ---------------- 流道 -----------------
@@ -238,9 +239,10 @@ class BladeVoid:
         p.show()
 
     # 兼容UI的预览功能
-    def visualize_streamlit(self, passage_grid=None):
+    def visualize_streamlit(self, passage_grid=None, theme="dark"):
         if self.vertices_upper is None:
             self.generate_surface()
+
         up_pts = self.vertices_upper.reshape(-1, 3)
         low_pts = self.vertices_lower.reshape(-1, 3)
         span_pts, chord_pts, _ = self.vertices_upper.shape
@@ -248,31 +250,37 @@ class BladeVoid:
         surf_upper = pv.StructuredGrid()
         surf_upper.points = up_pts
         surf_upper.dimensions = (chord_pts, span_pts, 1)
+
         surf_lower = pv.StructuredGrid()
         surf_lower.points = low_pts
         surf_lower.dimensions = (chord_pts, span_pts, 1)
 
-        p = pv.Plotter(off_screen=True, window_size=(800, 600))
-        # optional passage grid
+        bg = "#0E1117" if theme == "dark" else "white"
+        blade_color = "#FFB000" if theme == "dark" else "#D55E00"
+
+        p = pv.Plotter(off_screen=True, window_size=(900, 650))
+        p.set_background(bg)
+
         if passage_grid is not None:
             p.add_mesh(passage_grid, color="lightgray", opacity=0.3, show_edges=True)
-        # blade surfaces
-        p.add_mesh(surf_upper, color="tomato", show_edges=True)
-        p.add_mesh(surf_lower, color="tomato", show_edges=True)
 
-        # hub/shroud points
+        p.add_mesh(surf_upper, color=blade_color, show_edges=False)
+        p.add_mesh(surf_lower, color=blade_color, show_edges=False)
+
+        # hub / shroud rings
         z_root = self.vertices_upper[0, 0, 2]
         z_tip = self.vertices_upper[-1, 0, 2]
+        theta = np.linspace(0, 2 * np.pi, 200)
+
         for r in [self.hub_radius, self.shroud_radius]:
-            theta = np.linspace(0, 2 * np.pi, 100)
             x = r * np.cos(theta)
             y = r * np.sin(theta)
-            z_root_array = np.full_like(theta, z_root)
-            z_tip_array = np.full_like(theta, z_tip)
-            p.add_mesh(np.column_stack([x, y, z_root_array]), color="blue", point_size=5, render_points_as_spheres=True)
-            p.add_mesh(np.column_stack([x, y, z_tip_array]), color="green", point_size=5, render_points_as_spheres=True)
+            p.add_lines(np.column_stack([x, y, np.full_like(x, z_root)]), color="steelblue", width=2)
+            p.add_lines(np.column_stack([x, y, np.full_like(x, z_tip)]), color="seagreen", width=2)
 
         p.add_axes()
+        p.camera.zoom(1.2)
+
         return p
 
     # ---------------- OCCT Solid (平滑版本) -----------------
@@ -607,7 +615,8 @@ def generate_blade_and_fluid_domain(
     H,
     z0,
     Theta,
-    output_dir="./CQ"
+    output_dir="./CQ",
+    preview=False,
 ):
     """
     生成叶片实体和环形流道实体，并保存为 STEP 文件
@@ -641,8 +650,8 @@ def generate_blade_and_fluid_domain(
     )
     blade.generate_surface(passage_z=passage_zrange, passage_theta=passage_theta_range, align="left")
 
-    # 可视化（可选）
-    # blade.visualize(passage_grid=passage_grid)
+    if preview:
+        blade.visualize(passage_grid=passage_grid)
 
     # ---------------- 环形扇柱 -----------------
     angle = 2 * np.pi / N
@@ -692,6 +701,30 @@ def generate_blade_and_fluid_domain(
     print("Fluid domain valid:", BRepCheck_Analyzer(fluid_solid).IsValid())
     write_step_file(fluid_solid, os.path.join(output_dir, "fluid_domain_complete.step"))
 
+    # ---------------- 参数导出 -----------------
+    params_export = {
+        "global_parameters": {
+            "hub_radius": hub_radius,
+            "shroud_radius": shroud_radius,
+            "blade_count_N": N,
+            "passage_height_H1": H1,
+            "blade_height_H": H,
+            "z0": z0,
+            "Theta": Theta,
+            "sector_angle_rad": 2 * np.pi / N,
+        },
+        "blade_layers": param_data["layers_params"],
+        "generation_info": {
+            "align": "left",
+            "preview": preview,
+            "timestamp": datetime.now().isoformat(timespec="seconds")
+        }
+    }
+    json_path = os.path.join(output_dir, "blade_params.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(params_export, f, indent=2)
+    print(f"Blade parameters saved to: {json_path}")
+
     return {
         "passage": annular_passage,
         "blade_solid": complete_blade,
@@ -719,5 +752,6 @@ if __name__ == '__main__':
         H=0.21 / 2,
         z0=0,
         Theta=np.pi / 3.5,
-        output_dir="./CQ"
+        output_dir="./CQ",
+        preview=True
     )

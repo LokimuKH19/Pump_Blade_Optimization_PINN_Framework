@@ -2,12 +2,16 @@
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
-from BladeGenerator import Blade3D, bezier_curve, spline_thickness
+from BladeGeneratorCAD import BladeVoid, bezier_curve, spline_thickness, AnnularSectorPassage, generate_blade_and_fluid_domain
 import pyvista as pv
 from tempfile import NamedTemporaryFile
 import streamlit.components.v1 as components
 import base64
+import os
+from datetime import datetime
 
+pv.global_theme.smooth_shading = False
+pv.global_theme.multi_samples = 0
 
 THEME_CFG = {
     "dark": {
@@ -27,6 +31,7 @@ THEME_CFG = {
         "thickness": "#D55E00"
     }
 }
+
 
 def styled_axes(theme, figsize=(6, 3)):
     cfg = THEME_CFG[theme]
@@ -116,13 +121,35 @@ def number_input_with_label(label, min_val, max_val, default_val, step=None, key
 st.sidebar.subheader("Blade Geometry")
 col1, col2 = st.sidebar.columns(2)
 with col1:
-    Theta = number_input_with_label("Theta (rad)", 0.0, np.pi, 0.52, 0.01, "Theta")
-    H = number_input_with_label("Height H (m)", 0.05, 0.5, 0.21, 0.01, "H")
-    z0 = number_input_with_label("Z Offset (m)", -0.5, 0.5, -0.10, 0.01, "z0")
+    Theta = number_input_with_label("Theta (rad)", 0.0, np.pi, np.pi / 3.5, 0.01, "Theta")
+    H = number_input_with_label("Height H (m)", 0.05, 0.5, 0.21/2, 0.01, "H")
+    z0 = number_input_with_label("Z Offset (m)", -0.5, 0.5, 0.0, 0.01, "z0")
 with col2:
-    hub_radius = number_input_with_label("Hub Radius (m)", 0.01, 0.5, 0.121, 0.001, "hub")
-    shroud_radius = number_input_with_label("Shroud Radius (m)", 0.01, 0.6, 0.16, 0.001, "shroud")
-    points_per_chord = number_input_with_label("Chord Res", 100, 600, 300, 10, "pts")
+    hub_radius = number_input_with_label("Hub Radius (m)", 0.01, 0.5, 0.121/2, 0.001, "hub")
+    shroud_radius = number_input_with_label("Shroud Radius (m)", 0.01, 0.6, 0.16/2, 0.001, "shroud")
+    points_per_chord = number_input_with_label("Chord Res", 40, 600, 80, 10, "pts")
+
+st.sidebar.subheader("Passage Geometry")
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    N_blades = number_input_with_label(
+        "Blade Count N",
+        min_val=1,
+        max_val=200,
+        default_val=6,
+        step=1,
+        key="N_blades"
+    )
+
+with col2:
+    H1 = number_input_with_label(
+        "Passage Height H1 (m)",
+        min_val=0.01,
+        max_val=1.0,
+        default_val=(0.21 + 0.04) / 2,   # 通常和叶高一致，工程上合理
+        step=0.01,
+        key="H1"
+    )
 
 # ------------------ Layer Storage ------------------
 if "layers" not in st.session_state:
@@ -130,42 +157,57 @@ if "layers" not in st.session_state:
         {
             "mode": "hybrid",
             "theta0": 0.00,
-            "h_max": 0.022,
-            "t_max": 0.013,
-            "camber_ctrl": [0.0, 0.60, 0.85, 0.0],
-            "thickness_knots": {"x": [0.0, 0.05, 0.30, 0.75, 1.0], "t": [0.0, 1.0, 1.0, 0.40, 0.0]}
+            "h_max": 0.015,
+            "t_max": 0.008,
+            "camber_ctrl": [0.0, 0.45, 0.60, 0.0],
+            "thickness_knots": {
+                "x": [0.0, 0.05, 0.35, 0.65, 1.0],
+                "t": [0.0, 0.7, 0.7, 0.3, 0.0]
+            }
         },
         {
             "mode": "hybrid",
-            "theta0": 0.04,
-            "h_max": 0.024,
-            "t_max": 0.014,
-            "camber_ctrl": [0.0, 0.62, 0.88, 0.0],
-            "thickness_knots": {"x": [0.0, 0.05, 0.32, 0.75, 1.0], "t": [0.0, 1.0, 1.0, 0.38, 0.0]}
+            "theta0": 0.03,
+            "h_max": 0.016,
+            "t_max": 0.0085,
+            "camber_ctrl": [0.0, 0.48, 0.63, 0.0],
+            "thickness_knots": {
+                "x": [0.0, 0.05, 0.36, 0.66, 1.0],
+                "t": [0.0, 0.7, 0.7, 0.3, 0.0]
+            }
         },
         {
             "mode": "hybrid",
-            "theta0": 0.08,
-            "h_max": 0.026,
-            "t_max": 0.015,
-            "camber_ctrl": [0.0, 0.65, 0.92, 0.0],
-            "thickness_knots": {"x": [0.0, 0.06, 0.35, 0.78, 1.0], "t": [0.0, 1.0, 1.0, 0.35, 0.0]}
+            "theta0": 0.06,
+            "h_max": 0.017,
+            "t_max": 0.009,
+            "camber_ctrl": [0.0, 0.50, 0.65, 0.0],
+            "thickness_knots": {
+                "x": [0.0, 0.06, 0.37, 0.67, 1.0],
+                "t": [0.0, 0.7, 0.7, 0.3, 0.0]
+            }
+        },
+        {
+            "mode": "hybrid",
+            "theta0": 0.09,
+            "h_max": 0.016,
+            "t_max": 0.0085,
+            "camber_ctrl": [0.0, 0.48, 0.63, 0.0],
+            "thickness_knots": {
+                "x": [0.0, 0.05, 0.36, 0.66, 1.0],
+                "t": [0.0, 0.7, 0.7, 0.3, 0.0]
+            }
         },
         {
             "mode": "hybrid",
             "theta0": 0.12,
-            "h_max": 0.022,
-            "t_max": 0.013,
-            "camber_ctrl": [0.0, 0.60, 0.88, 0.0],
-            "thickness_knots": {"x": [0.0, 0.06, 0.32, 0.75, 1.0], "t": [0.0, 1.0, 1.0, 0.32, 0.0]}
-        },
-        {
-            "mode": "hybrid",
-            "theta0": 0.16,
-            "h_max": 0.018,
-            "t_max": 0.011,
-            "camber_ctrl": [0.0, 0.55, 0.80, 0.0],
-            "thickness_knots": {"x": [0.0, 0.05, 0.28, 0.70, 1.0], "t": [0.0, 1.0, 1.0, 0.30, 0.0]}
+            "h_max": 0.015,
+            "t_max": 0.008,
+            "camber_ctrl": [0.0, 0.45, 0.60, 0.0],
+            "thickness_knots": {
+                "x": [0.0, 0.05, 0.35, 0.65, 1.0],
+                "t": [0.0, 0.7, 0.7, 0.3, 0.0]
+            }
         }
     ]
 
@@ -228,7 +270,7 @@ for i, tab in enumerate(layer_tabs):
             ax.set_ylabel("γ(x)")
             ax.set_title(f"Layer {i + 1} Camber Profile")
 
-            st.pyplot(fig, use_container_width=True)
+            st.pyplot(fig, width="stretch")
 
         # --- Right Column: Thickness Control ---
         with col2:
@@ -296,7 +338,7 @@ for i, tab in enumerate(layer_tabs):
             ax.set_ylabel("τ(x)")
             ax.set_title(f"Layer {i + 1} Thickness Profile")
 
-            st.pyplot(fig, use_container_width=True)
+            st.pyplot(fig, width="stretch")
 
         # --- Scalar Parameters (Compact Row) ---
         st.markdown("---")
@@ -401,6 +443,7 @@ for i, tab in enumerate(layer_tabs):
 # ------------------ Blade Preview ------------------
 st.markdown("---")
 st.header("🔍 3D Blade Preview (Interactive)")
+st.markdown("### Interactive 3D Viewer")
 
 
 # ================== Theme-adaptive colors ==================
@@ -416,146 +459,50 @@ else:
     text_color = "black"
 
 
+# Generate Passage
+passage = AnnularSectorPassage(
+    hub_radius=hub_radius,
+    shroud_radius=shroud_radius,
+    z0=z0,
+    H1=H1,
+    N=N_blades,
+    nr=40,
+    ntheta=40,
+    nz=60
+)
+passage_grid, z_lim, theta_lim = passage.generate_surface()
+
 # Generate blade
-blade = Blade3D(
+blade = BladeVoid(
     span_layers=layers,
     Theta=Theta,
     H=H,
     z0=z0,
     hub_radius=hub_radius,
     shroud_radius=shroud_radius,
+    theta_offset=0.0
 )
-blade.generate_surface(points_per_chord=points_per_chord)
+blade.generate_surface(passage_z=z_lim, passage_theta=theta_lim, align="left")
 
-# ================== PyVista Plotter ==================
-plotter = pv.Plotter(
-    window_size=[800, 600],
-    off_screen=True
+plotter = blade.visualize_streamlit(
+    passage_grid=passage_grid,
+    theme=theme
 )
-plotter.set_background(pv_bg_color)
 
-try:
-    # 获取网格
-    mesh = blade.to_pyvista_mesh()
 
-    # 添加网格
-    plotter.add_mesh(
-        mesh,
-        color=blade_color,
-        show_edges=True,
-        edge_color=edge_color,
-        opacity=0.95,
-        smooth_shading=True
-    )
+# ✅ 正确的 PyVista → Streamlit 嵌入方式
+html = plotter.export_html(None)
 
-    # 相机设置
-    plotter.camera_position = 'xz'
-    plotter.camera.zoom(1.5)
+with NamedTemporaryFile(delete=False, suffix=".html") as f:
+    plotter.export_html(f.name)
+    f.seek(0)
+    html = f.read().decode("utf-8")
 
-    # 坐标轴
-    plotter.add_axes(
-        color=text_color,
-        line_width=2,
-        labels_off=False
-    )
-
-    # 标题
-    plotter.add_title(
-        "3D Blade Preview",
-        font_size=18,
-        color=text_color
-    )
-
-    # ================== Export to HTML ==================
-    st.markdown("### Interactive 3D Viewer")
-
-    with NamedTemporaryFile(suffix=".html", delete=False) as tmp_file:
-        html_file = tmp_file.name
-
-    plotter.export_html(html_file)
-
-    with open(html_file, "r", encoding="utf-8") as f:
-        html_content = f.read()
-
-    st.components.v1.html(
-        html_content,
-        height=600,
-        scrolling=False
-    )
-
-    # ================== Controls ==================
-    with st.expander("3D View Controls"):
-        st.markdown("""
-        **Mouse Controls**
-        - Left-click + drag: Rotate  
-        - Right-click + drag: Pan  
-        - Scroll wheel: Zoom  
-
-        **Keyboard**
-        - r: Reset camera  
-        - s: Save screenshot  
-        """)
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        with col1:
-            if st.button("Front View"):
-                plotter.camera_position = 'xy'
-
-        with col2:
-            if st.button("Side View"):
-                plotter.camera_position = 'yz'
-
-        with col3:
-            if st.button("Top View"):
-                plotter.camera_position = 'xz'
-
-        with col4:
-            if st.button("Isometric"):
-                plotter.camera_position = 'iso'
-
-except Exception as e:
-    st.error(f"Failed to generate 3D preview: {e}")
-
-    # ---------- Fallback: static screenshot ----------
-    try:
-        screenshot = mesh.plot(
-            off_screen=True,
-            screenshot=True,
-            window_size=[800, 600],
-            show_edges=True,
-            background=pv_bg_color
-        )
-        st.image(screenshot, caption="Static 3D Preview")
-    except Exception:
-        st.warning("Could not generate any 3D visualization.")
-
-finally:
-    plotter.close()
+components.html(html, height=650, scrolling=False)
 
 # ------------------ Export ------------------
 st.markdown("---")
 st.header("💾 Export Settings")
-
-export_cols = st.columns(3)
-with export_cols[0]:
-    filename = st.text_input("Export Filename", value="blade_ui_realtime")
-with export_cols[1]:
-    export_format = st.selectbox("Export Format", ["STL", "JSON", "Both"])
-with export_cols[2]:
-    as_solid = st.checkbox("Export as Solid", value=True)
-
-if st.button("⬇️ Export Blade Model", type="primary"):
-    try:
-        blade.export_mesh(
-            f"./Blades/{filename}",
-            mode=export_format.lower(),
-            as_solid=as_solid,
-            save_params=True,
-        )
-        st.success(f"✅ Export completed: {filename}.stl & {filename}.json")
-    except Exception as e:
-        st.error(f"Export failed: {str(e)}")
 
 # ------------------ Current Parameters Summary ------------------
 with st.expander("📋 Current Parameters Summary"):
@@ -574,3 +521,55 @@ with st.expander("📋 Current Parameters Summary"):
         for i, layer in enumerate(layers):
             st.write(
                 f"**Layer {i + 1}**: θ₀={layer['theta0']:.3f}, h_max={layer['h_max']:.4f}, t_max={layer['t_max']:.4f}")
+
+export_cols = st.columns(2)
+
+with export_cols[0]:
+    export_dir = st.text_input(
+        "Export Dir",
+        value="CQ",
+        help="Directory name (ASCII only)"
+    )
+
+with export_cols[1]:
+    add_timestamp = st.checkbox(
+        "Append timestamp",
+        value=True,
+        help="Append time suffix like _20260108_143210"
+    )
+
+
+if st.button("⬇️ Export Blade Model", type="primary"):
+    try:
+        # --------- 生成输出目录名 ---------
+        if add_timestamp:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = f"./{export_dir}_{ts}"
+        else:
+            output_dir = f"./{export_dir}"
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # --------- 组织参数数据 ---------
+        param_data = {
+            "layers_params": layers
+        }
+
+        # --------- 调用主生成函数 ---------
+        generate_blade_and_fluid_domain(
+            param_data=param_data,
+            hub_radius=hub_radius,
+            shroud_radius=shroud_radius,
+            N=N_blades,
+            H1=H1,
+            H=H,
+            z0=z0,
+            Theta=Theta,
+            output_dir=output_dir,
+            preview=False,   # UI 下不建议开 OCC 预览
+        )
+
+        st.success(f"✅ Export completed\n\nOutput directory:\n`{output_dir}`")
+
+    except Exception as e:
+        st.error(f"Export failed: {str(e)}")
