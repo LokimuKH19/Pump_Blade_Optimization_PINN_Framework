@@ -49,3 +49,6 @@ conda env create -f environment.yml
 conda activate blade-geometry
 ```
 
+## Note
+
+> The model's default unit is "mm" but still noted as "m". Users can enlarge the output models via SpaceClaim by using `Pull` tool. This is a tricky compromise with the `Sewing` function in OCC for smaller models appear to be easier to generate under current configurations.
