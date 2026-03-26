@@ -4,10 +4,8 @@ import math
 from scipy.interpolate import PchipInterpolator, CubicSpline
 import scipy.special
 import pyvista as pv
-from OCC.Core.BRepBuilderAPI import (BRepBuilderAPI_MakePolygon, BRepBuilderAPI_MakeWire,
-                                     BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeEdge,
-                                     BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid)
-from OCC.Core.BRepOffsetAPI import BRepOffsetAPI_ThruSections
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakePolygon, BRepBuilderAPI_MakeFace, BRepBuilderAPI_Sewing
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeSolid
 from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakePrism, BRepPrimAPI_MakeCylinder
 from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Common
 from OCC.Core.gp import gp_Ax2, gp_Dir, gp_Vec, gp_Pnt, gp_Circ
@@ -17,7 +15,6 @@ from OCC.Extend.DataExchange import write_step_file
 from OCC.Core.TopAbs import TopAbs_FACE
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.BRepOffsetAPI import BRepOffsetAPI_ThruSections
-from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire
 from OCC.Core.GeomAbs import GeomAbs_C2
 from OCC.Core.TColgp import TColgp_HArray1OfPnt
 from OCC.Core.GeomAPI import GeomAPI_PointsToBSpline
@@ -73,13 +70,13 @@ def make_sector_prism(radius, height, angle):
 
 
 # 或者更简单的版本 - 直接使用扇柱减去内圆柱
-def make_annular_sector_prism_simple(r_inner, r_outer, height, angle):
+def make_annular_sector_prism_simple(r_inner, r_outer, height, angle, gap=0.):
     """
     简化的方法：创建一个完整的外扇柱，减去一个完整的内扇柱
     更可靠，确保是闭合实体
     """
     # 创建外扇柱
-    outer_sector = make_sector_prism(r_outer, height, angle)
+    outer_sector = make_sector_prism(r_outer+gap, height, angle)
 
     # 创建内扇柱
     inner_sector = make_sector_prism(r_inner, height, angle)
@@ -617,6 +614,7 @@ def generate_blade_and_fluid_domain(
     Theta,
     output_dir="./CQ",
     preview=False,
+    gap=0,
 ):
     """
     生成叶片实体和环形流道实体，并保存为 STEP 文件
@@ -655,7 +653,7 @@ def generate_blade_and_fluid_domain(
 
     # ---------------- 环形扇柱 -----------------
     angle = 2 * np.pi / N
-    annular_passage = make_annular_sector_prism_simple(hub_radius, shroud_radius, H1, angle)
+    annular_passage = make_annular_sector_prism_simple(hub_radius, shroud_radius, H1, angle, gap=gap)
     print("Annular passage valid:", BRepCheck_Analyzer(annular_passage).IsValid())
     write_step_file(annular_passage, os.path.join(output_dir, "annular_passage.step"))
 
@@ -746,7 +744,7 @@ if __name__ == '__main__':
     results = generate_blade_and_fluid_domain(
         param_data=param_data,
         hub_radius=0.121 / 2,
-        shroud_radius=0.16 / 2,
+        shroud_radius=0.16 / 2,   # =0.08, 0.1-0.08=0.092
         N=6,
         H1=(0.21 + 0.04) / 2,
         H=0.21 / 2,

@@ -127,6 +127,7 @@ with col1:
 with col2:
     hub_radius = number_input_with_label("Hub Radius (m)", 0.01, 0.5, 0.121/2, 0.001, "hub")
     shroud_radius = number_input_with_label("Shroud Radius (m)", 0.01, 0.6, 0.16/2, 0.001, "shroud")
+    gap_radius = number_input_with_label("Gap Radius (m)", 0.0, 10., 0., 0.001, "gap")
     points_per_chord = number_input_with_label("Chord Res", 40, 600, 80, 10, "pts")
 
 st.sidebar.subheader("Passage Geometry")
@@ -514,6 +515,7 @@ with st.expander("📋 Current Parameters Summary"):
         st.write(f"- Z Offset: {z0:.3f} m")
         st.write(f"- Hub Radius: {hub_radius:.3f} m")
         st.write(f"- Shroud Radius: {shroud_radius:.3f} m")
+        st.write(f"- Gap Radius: {gap_radius:.3f} m")
         st.write(f"- Chord Resolution: {points_per_chord}")
 
     with summary_cols[1]:
@@ -567,6 +569,7 @@ if st.button("⬇️ Export Blade Model", type="primary"):
             Theta=Theta,
             output_dir=output_dir,
             preview=False,   # UI 下不建议开 OCC 预览
+            gap=gap_radius,
         )
 
         st.success(f"✅ Export completed\n\nOutput directory:\n`{output_dir}`")
