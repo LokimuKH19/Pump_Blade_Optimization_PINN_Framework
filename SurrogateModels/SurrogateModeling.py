@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pyvista as pv
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +15,19 @@ from torch.utils.data import DataLoader, Dataset
 
 import NeuralOperators
 from BladeImport import PassageGeometry, build_blade_boundary
+from SurrogateModelingUtils import (
+    case_summary,
+    d1_periodic_with_overlap,
+    d2_periodic_with_overlap,
+    expand_scalar,
+    field_stats,
+    interpolate_field_periodic,
+    line_quadrature_weight,
+    make_pyvista_blade_surface_meshes,
+    make_pyvista_passage_grid,
+    neighbor_minus,
+    neighbor_plus,
+)
 
 
 # 这个文件负责把“叶片场 -> 流场”的代理建模流程接起来。
@@ -313,6 +327,7 @@ class BladeFlowDataset(Dataset):
         else:
             raise ValueError("input_mode must be 'mask', 'phi', or 'both'")
 
+        # 把几何因素和工况参数也塞进去
         channels.extend(
             [
                 geometry["r_hat"],
@@ -439,7 +454,7 @@ class SliceWiseFNOFlowModel(nn.Module):
         super().__init__()
         self.z_padding = int(max(z_padding, 0))
         # todo 在这里替换网络类型
-        self.core = NeuralOperators.CNO2d_small(
+        self.core = NeuralOperators.FNO2d_small(
             modes=modes,
             # cheb_modes=(modes, modes),
             width=width,
@@ -529,91 +544,6 @@ class BladeFlowPhysicsLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
-    @staticmethod
-    def _expand_scalar(x: torch.Tensor) -> torch.Tensor:
-        return x.view(-1, 1, 1, 1)
-
-    @staticmethod
-    def _line_quadrature_weight(length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        # 当前 R / Theta 网格都包含首尾端点，因此做积分时采用梯形权重。
-        weight = torch.ones(length, device=device, dtype=dtype)
-        if length > 1:
-            weight[0] = 0.5
-            weight[-1] = 0.5
-        return weight
-
-    @staticmethod
-    def _neighbor_plus(x: torch.Tensor, dim: int, periodic: bool) -> torch.Tensor:
-        if periodic:
-            return torch.roll(x, shifts=-1, dims=dim)
-        out = torch.roll(x, shifts=-1, dims=dim)
-        index = [slice(None)] * x.ndim
-        index[dim] = -1
-        out[tuple(index)] = x[tuple(index)]
-        return out
-
-    @staticmethod
-    def _neighbor_minus(x: torch.Tensor, dim: int, periodic: bool) -> torch.Tensor:
-        if periodic:
-            return torch.roll(x, shifts=1, dims=dim)
-        out = torch.roll(x, shifts=1, dims=dim)
-        index = [slice(None)] * x.ndim
-        index[dim] = 0
-        out[tuple(index)] = x[tuple(index)]
-        return out
-
-    @staticmethod
-    def _d1_periodic_with_overlap(
-        x: torch.Tensor,
-        dim: int,
-        spacing: torch.Tensor,
-    ) -> torch.Tensor:
-        # Theta 方向使用“首尾重合网格”。
-        # 因此在 seam 点求导时，左邻点应该取倒数第二个点，而不是最后一个重合点。
-        x_perm = torch.movedim(x, dim, -1)
-        out = torch.zeros_like(x_perm)
-        n = x_perm.shape[-1]
-
-        if n <= 1:
-            return torch.movedim(out, -1, dim)
-
-        if n == 2:
-            seam = (x_perm[..., 1] - x_perm[..., 0]) / torch.clamp(spacing, min=1e-12)
-            out[..., 0] = seam
-            out[..., 1] = seam
-            return torch.movedim(out, -1, dim)
-
-        out[..., 1:-1] = (x_perm[..., 2:] - x_perm[..., :-2]) / (2.0 * spacing)
-        seam = (x_perm[..., 1] - x_perm[..., -2]) / (2.0 * spacing)
-        out[..., 0] = seam
-        out[..., -1] = seam
-        return torch.movedim(out, -1, dim)
-
-    @staticmethod
-    def _d2_periodic_with_overlap(
-        x: torch.Tensor,
-        dim: int,
-        spacing: torch.Tensor,
-    ) -> torch.Tensor:
-        x_perm = torch.movedim(x, dim, -1)
-        out = torch.zeros_like(x_perm)
-        n = x_perm.shape[-1]
-
-        if n <= 1:
-            return torch.movedim(out, -1, dim)
-
-        if n == 2:
-            seam = (x_perm[..., 1] - 2.0 * x_perm[..., 0] + x_perm[..., 1]) / (spacing ** 2)
-            out[..., 0] = seam
-            out[..., 1] = seam
-            return torch.movedim(out, -1, dim)
-
-        out[..., 1:-1] = (x_perm[..., 2:] - 2.0 * x_perm[..., 1:-1] + x_perm[..., :-2]) / (spacing ** 2)
-        seam = (x_perm[..., 1] - 2.0 * x_perm[..., 0] + x_perm[..., -2]) / (spacing ** 2)
-        out[..., 0] = seam
-        out[..., -1] = seam
-        return torch.movedim(out, -1, dim)
-
     def d1(
         self,
         x: torch.Tensor,
@@ -623,9 +553,9 @@ class BladeFlowPhysicsLoss(nn.Module):
         duplicate_endpoint: bool = False,
     ) -> torch.Tensor:
         if periodic and duplicate_endpoint:
-            return self._d1_periodic_with_overlap(x, dim, spacing)
-        xp = self._neighbor_plus(x, dim, periodic)
-        xm = self._neighbor_minus(x, dim, periodic)
+            return d1_periodic_with_overlap(x, dim, spacing)
+        xp = neighbor_plus(x, dim, periodic)
+        xm = neighbor_minus(x, dim, periodic)
         return (xp - xm) / (2.0 * spacing)
 
     def d2(
@@ -637,9 +567,9 @@ class BladeFlowPhysicsLoss(nn.Module):
         duplicate_endpoint: bool = False,
     ) -> torch.Tensor:
         if periodic and duplicate_endpoint:
-            return self._d2_periodic_with_overlap(x, dim, spacing)
-        xp = self._neighbor_plus(x, dim, periodic)
-        xm = self._neighbor_minus(x, dim, periodic)
+            return d2_periodic_with_overlap(x, dim, spacing)
+        xp = neighbor_plus(x, dim, periodic)
+        xm = neighbor_minus(x, dim, periodic)
         return (xp - 2.0 * x + xm) / (spacing ** 2)
 
     def weighted_mse(self, residual: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -656,7 +586,7 @@ class BladeFlowPhysicsLoss(nn.Module):
         mask[:, :, :, 0] = 0.0
         mask[:, :, :, -1] = 0.0
 
-        theta_weight = self._line_quadrature_weight(mask.shape[2], mask.device, mask.dtype)
+        theta_weight = line_quadrature_weight(mask.shape[2], mask.device, mask.dtype)
         mask = mask * theta_weight.view(1, 1, -1, 1)
         return mask
 
@@ -669,10 +599,10 @@ class BladeFlowPhysicsLoss(nn.Module):
         # dRR + (1/r_hat)dR + K_theta^2 dThetaTheta + Lambda^2 dZZ
         r_hat = batch["r_hat"]
         k_theta = batch["K_theta"]
-        dR = self._expand_scalar(batch["dR"])
-        dTheta = self._expand_scalar(batch["dTheta"])
-        dZ = self._expand_scalar(batch["dZ"])
-        Lambda = self._expand_scalar(batch["Lambda"])
+        dR = expand_scalar(batch["dR"])
+        dTheta = expand_scalar(batch["dTheta"])
+        dZ = expand_scalar(batch["dZ"])
+        Lambda = expand_scalar(batch["Lambda"])
 
         dR_1 = self.d1(field, dim=1, spacing=dR, periodic=False)
         dR_2 = self.d2(field, dim=1, spacing=dR, periodic=False)
@@ -692,8 +622,8 @@ class BladeFlowPhysicsLoss(nn.Module):
         dR = batch["dR"].view(-1, 1, 1)
         dTheta = batch["dTheta"].view(-1, 1, 1)
 
-        r_weight = self._line_quadrature_weight(uz.shape[1], uz.device, uz.dtype)
-        theta_weight = self._line_quadrature_weight(uz.shape[2], uz.device, uz.dtype)
+        r_weight = line_quadrature_weight(uz.shape[1], uz.device, uz.dtype)
+        theta_weight = line_quadrature_weight(uz.shape[2], uz.device, uz.dtype)
         quad_weight = r_weight.view(1, -1, 1) * theta_weight.view(1, 1, -1)
 
         outlet_weight = phi[:, :, :, -1] * r_hat[:, :, :, -1] * quad_weight * dR * dTheta
@@ -738,17 +668,17 @@ class BladeFlowPhysicsLoss(nn.Module):
         k_theta = batch["K_theta"]
         pde_mask = self.build_pde_mask(phi)
 
-        dR = self._expand_scalar(batch["dR"])
-        dTheta = self._expand_scalar(batch["dTheta"])
-        dZ = self._expand_scalar(batch["dZ"])
-        Eu = self._expand_scalar(batch["Eu_omega"])
-        Re = self._expand_scalar(batch["Re_omega"])
-        Lambda = self._expand_scalar(batch["Lambda"])
-        Ku = self._expand_scalar(batch["Ku"])
-        delta = self._expand_scalar(batch["delta"])
-        sgn_omega = self._expand_scalar(batch["sgn_omega"])
-        g_star = self._expand_scalar(batch["g_star"])
-        absolute_frame = self._expand_scalar(batch["absolute_frame"])
+        dR = expand_scalar(batch["dR"])
+        dTheta = expand_scalar(batch["dTheta"])
+        dZ = expand_scalar(batch["dZ"])
+        Eu = expand_scalar(batch["Eu_omega"])
+        Re = expand_scalar(batch["Re_omega"])
+        Lambda = expand_scalar(batch["Lambda"])
+        Ku = expand_scalar(batch["Ku"])
+        delta = expand_scalar(batch["delta"])
+        sgn_omega = expand_scalar(batch["sgn_omega"])
+        g_star = expand_scalar(batch["g_star"])
+        absolute_frame = expand_scalar(batch["absolute_frame"])
 
         # 所有 Theta 导数都必须使用“首尾重合网格”的专用差分。
         dR_ur = self.d1(ur, dim=1, spacing=dR, periodic=False)
@@ -916,6 +846,24 @@ class SurrogateModeling:
             depth=depth,
             z_padding=z_padding,
         ).to(self.device)
+        self.model_config = {
+            "input_channels": input_channels,
+            "modes": modes,
+            "width": width,
+            "depth": depth,
+            "z_padding": z_padding,
+            "output_channels": 4,
+        }
+        self.trainer_config = {
+            "input_mode": input_mode,
+            "batch_size": batch_size,
+            "lr": lr,
+            "data_weight": data_weight,
+            "physics_weight": physics_weight,
+            "warmup_epochs": warmup_epochs,
+            "ramp_epochs": ramp_epochs,
+        }
+        self.checkpoint_metadata: dict[str, Any] | None = None
 
         self.physics_loss = BladeFlowPhysicsLoss().to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
@@ -970,16 +918,294 @@ class SurrogateModeling:
             print(f"blade_params          : {case['blade_params']}")
         print("===============================================\n")
 
-    @staticmethod
-    def _field_stats(field: torch.Tensor, mask: torch.Tensor) -> tuple[float, float, float]:
-        values = field[mask]
-        if values.numel() == 0:
-            return float("nan"), float("nan"), float("nan")
-        return (
-            float(values.mean().item()),
-            float(values.min().item()),
-            float(values.max().item()),
+    def _resolve_case_sample(
+        self,
+        *,
+        case_index: int = 0,
+        case: Mapping[str, Any] | None = None,
+    ) -> tuple[Mapping[str, Any], dict[str, torch.Tensor]]:
+        # 训练集中的样本和部署阶段的外部样本都统一走这个入口。
+        if case is None:
+            return self.train_dataset.cases[case_index], self.train_dataset[case_index]
+
+        dataset = BladeFlowDataset([case], input_mode=self.train_dataset.input_mode)
+        return case, dataset[0]
+
+    def _build_boundary_for_case(
+        self,
+        case: Mapping[str, Any],
+    ):
+        # 三维转子图优先直接使用 blade_params 重建几何。
+        blade_params = _pick(case, "blade_params")
+        if blade_params is None:
+            return None
+
+        config = FlowCaseConfig.from_mapping(case)
+        return build_blade_boundary(blade_params, config.make_passage_geometry())
+
+    @torch.no_grad()
+    def _predict_case_bundle(
+        self,
+        *,
+        case_index: int = 0,
+        case: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        # 统一构造部署所需的整套对象，避免 post 阶段重复 build dataset / 重复 forward。
+        case_data, sample = self._resolve_case_sample(case_index=case_index, case=case)
+        batch = {key: value.unsqueeze(0).to(self.device) for key, value in sample.items()}
+
+        self.model.eval()
+        pred = self.model(batch["x"], batch["phi"], batch["solid_ut"])
+        pred_dim = {key: value[0].detach().cpu() for key, value in pred.items()}
+
+        u_omega = float(batch["u_omega"][0].cpu().item())
+        u_zo = float(batch["u_zo"][0].cpu().item())
+        p0 = float(batch["P0"][0].cpu().item())
+        pred_phy = {
+            "UR": pred_dim["UR"] * u_omega,
+            "UT": pred_dim["UT"] * u_omega,
+            "UZ": pred_dim["UZ"] * u_zo,
+            "P": pred_dim["P"] * p0,
+        }
+
+        boundary = self._build_boundary_for_case(case_data)
+        return {
+            "case": case_data,
+            "sample": sample,
+            "batch": batch,
+            "pred_dim": pred_dim,
+            "pred_phy": pred_phy,
+            "boundary": boundary,
+        }
+
+    def _trace_streamline_cylindrical(
+        self,
+        *,
+        fields_phy: Mapping[str, np.ndarray],
+        phi_field: np.ndarray,
+        config: FlowCaseConfig,
+        seed_r: float,
+        seed_theta: float,
+        seed_z: float,
+        max_steps: int = 500,
+        step_scale: float = 0.75,
+        phi_stop: float = 0.25,
+    ) -> np.ndarray:
+        # 在圆柱坐标下积分流线，然后再映射到三维笛卡尔坐标中画图。
+        # 暂时先确保稳定、可读、易调试，而不是特别高阶的积分精度。
+        dr_cell = config.delta_r / max(config.n - 1, 1)
+        dz_cell = config.h / max(config.n - 1, 1)
+        dtheta_cell = config.rh * config.theta0 / max(config.n - 1, 1)
+        step_length = step_scale * min(dr_cell, dz_cell, dtheta_cell)
+
+        def eval_state(r_value: float, theta_value: float, z_value: float):
+            r_norm = (r_value - config.rh) / config.delta_r
+            theta_norm = (theta_value % config.theta0) / config.theta0
+            z_norm = (z_value - config.z0) / config.h
+
+            phi_value = interpolate_field_periodic(phi_field, r_norm, theta_norm, z_norm)
+            if not np.isfinite(phi_value) or phi_value < phi_stop:
+                return None
+
+            ur = interpolate_field_periodic(fields_phy["UR"], r_norm, theta_norm, z_norm)
+            ut = interpolate_field_periodic(fields_phy["UT"], r_norm, theta_norm, z_norm)
+            uz = interpolate_field_periodic(fields_phy["UZ"], r_norm, theta_norm, z_norm)
+            if not np.isfinite(ur + ut + uz):
+                return None
+
+            speed = float(np.sqrt(ur ** 2 + ut ** 2 + uz ** 2))
+            if speed < 1e-10:
+                return None
+
+            rhs = np.array([ur, ut / max(r_value, 1e-10), uz], dtype=float)
+            return rhs, speed
+
+        state = np.array([seed_r, seed_theta, seed_z], dtype=float)
+        points: list[np.ndarray] = []
+
+        for _ in range(max_steps):
+            if state[0] < config.rh or state[0] > config.rs:
+                break
+            if state[2] < config.z0 or state[2] > config.z0 + config.h:
+                break
+
+            result = eval_state(float(state[0]), float(state[1]), float(state[2]))
+            if result is None:
+                break
+
+            rhs_1, speed_1 = result
+            dt = step_length / max(speed_1, 1e-10)
+            mid_state = state + 0.5 * dt * rhs_1
+
+            result_mid = eval_state(float(mid_state[0]), float(mid_state[1]), float(mid_state[2]))
+            if result_mid is None:
+                break
+
+            rhs_2, _ = result_mid
+            state = state + dt * rhs_2
+
+            x_value = state[0] * np.cos(state[1])
+            y_value = state[0] * np.sin(state[1])
+            points.append(np.array([x_value, y_value, state[2]], dtype=float))
+
+        if len(points) < 2:
+            return np.zeros((0, 3), dtype=float)
+        return np.vstack(points)
+
+    def plot_3d_streamlines(
+        self,
+        *,
+        case_index: int = 0,
+        case: Mapping[str, Any] | None = None,
+        show: bool = True,
+        save_path: str | Path | None = None,
+        seed_r_count: int = 10,
+        seed_theta_count: int = 10,
+        passages_to_plot: int | None = None,
+        max_streamline_steps: int = 1000,
+        streamline_step_scale: float = 0.9,
+        theme: str = "dark",
+    ) -> dict[str, Any]:
+        # 三维后处理改为 PyVista 风格，组织方式参考 BladeGeneratorCAD.py 里的可视化：
+        # 1. 透明环形流道网格
+        # 2. 转子上下表面实体
+        # 3. hub / shroud 环线
+        # 4. 三维流线
+        bundle = self._predict_case_bundle(case_index=case_index, case=case)
+        case_data = bundle["case"]
+        sample = bundle["sample"]
+        pred_phy = bundle["pred_phy"]
+        boundary = bundle["boundary"]
+        config = FlowCaseConfig.from_mapping(case_data)
+
+        train_n = int(self.train_dataset[0]["x"].shape[-1])
+        deploy_n = int(sample["x"].shape[-1])
+        bg = "#0E1117" if theme == "dark" else "white"
+        blade_color = "#FFB000" if theme == "dark" else "#D55E00"
+        passage_color = "lightgray"
+        plotter = pv.Plotter(off_screen=not show, window_size=(1400, 950))
+        plotter.set_background(bg)
+
+        passage_grid = make_pyvista_passage_grid(config)
+        plotter.add_mesh(
+            passage_grid,
+            color=passage_color,
+            opacity=0.22,
+            show_edges=True,
+            line_width=0.6,
         )
+
+        if boundary is not None:
+            for blade_mesh in make_pyvista_blade_surface_meshes(boundary, config):
+                plotter.add_mesh(
+                    blade_mesh,
+                    color=blade_color,
+                    show_edges=False,
+                    smooth_shading=True,
+                    ambient=0.20,
+                    diffuse=0.85,
+                    specular=0.18,
+                )
+
+        # hub / shroud 环线沿用参考程序的组织方式，帮助观察叶片上下边界。
+        theta_ring = np.linspace(0.0, 2.0 * np.pi, 240, dtype=float)
+        z_root = config.z0
+        z_tip = config.z0 + config.h
+        for radius in [config.rh, config.rs]:
+            x_ring = radius * np.cos(theta_ring)
+            y_ring = radius * np.sin(theta_ring)
+            root_line = np.column_stack([x_ring, y_ring, np.full_like(x_ring, z_root)])
+            tip_line = np.column_stack([x_ring, y_ring, np.full_like(x_ring, z_tip)])
+            plotter.add_lines(root_line, color="steelblue", width=2)
+            plotter.add_lines(tip_line, color="seagreen", width=2)
+
+        # 入口种子点默认取 z 的第二层，避开边界本身。
+        phi_inlet = sample["phi"][:, :, 1 if sample["phi"].shape[2] > 1 else 0].detach().cpu().numpy()
+        r_coords = sample["R"][:, 0, 0].detach().cpu().numpy()
+        theta_coords = sample["Theta"][0, :, 0].detach().cpu().numpy()
+        z_seed = config.z0 + config.h * float(sample["Z"][0, 0, 1 if sample["Z"].shape[2] > 1 else 0].item())
+
+        r_index_candidates = np.linspace(1, max(len(r_coords) - 2, 1), num=max(seed_r_count, 1), dtype=int)
+        theta_index_candidates = np.linspace(1, max(len(theta_coords) - 2, 1), num=max(seed_theta_count, 1), dtype=int)
+
+        base_seeds: list[tuple[float, float, float]] = []
+        for i_index in r_index_candidates:
+            for j_index in theta_index_candidates:
+                if phi_inlet[i_index, j_index] > 0.75:
+                    seed_r = config.rh + float(r_coords[i_index]) * config.delta_r
+                    seed_theta = float(theta_coords[j_index]) * config.theta0
+                    base_seeds.append((seed_r, seed_theta, z_seed))
+
+        if not base_seeds:
+            fluid_indices = np.argwhere(phi_inlet > 0.75)
+            for i_index, j_index in fluid_indices[:: max(1, len(fluid_indices) // 12)]:
+                seed_r = config.rh + float(r_coords[i_index]) * config.delta_r
+                seed_theta = float(theta_coords[j_index]) * config.theta0
+                base_seeds.append((seed_r, seed_theta, z_seed))
+
+        if passages_to_plot is None:
+            passages_to_plot = config.n_blade
+        passages_to_plot = max(1, min(passages_to_plot, config.n_blade))
+
+        colors = plt.cm.viridis(np.linspace(0.12, 0.95, max(len(base_seeds), 1)))[:, :3]
+        phi_field = sample["phi"].detach().cpu().numpy()
+        fields_phy_np = {name: tensor.detach().cpu().numpy() for name, tensor in pred_phy.items()}
+        tube_radius = 0.0075 * config.delta_r
+
+        streamline_count = 0
+        for blade_id in range(passages_to_plot):
+            theta_shift = blade_id * config.theta0
+            for color, (seed_r, seed_theta, seed_z) in zip(colors, base_seeds):
+                streamline = self._trace_streamline_cylindrical(
+                    fields_phy=fields_phy_np,
+                    phi_field=phi_field,
+                    config=config,
+                    seed_r=seed_r,
+                    seed_theta=seed_theta + theta_shift,
+                    seed_z=seed_z,
+                    max_steps=max_streamline_steps,
+                    step_scale=streamline_step_scale,
+                )
+                if streamline.shape[0] >= 2:
+                    spline = pv.Spline(streamline, max(streamline.shape[0], 2))
+                    streamline_mesh = spline.tube(radius=tube_radius)
+                    plotter.add_mesh(
+                        streamline_mesh,
+                        color=tuple(float(c) for c in color),
+                        smooth_shading=True,
+                        opacity=0.92,
+                    )
+                    streamline_count += 1
+
+        # 在画面左下角保留一点文字信息，直接体现“粗网格训练、细网格部署”的部署特征。
+        plotter.add_text(
+            f"Rotor Streamlines | train_n={train_n} | deploy_n={deploy_n} | blades={config.n_blade}",
+            position="upper_left",
+            font_size=10,
+            color="white" if theme == "dark" else "black",
+        )
+        plotter.add_axes()
+        plotter.camera_position = "iso"
+        plotter.camera.zoom(1.18)
+
+        if show and save_path is not None:
+            plotter.show(screenshot=str(save_path))
+            print(f"三维流线图已保存到: {save_path}")
+        elif show:
+            plotter.show()
+        else:
+            if save_path is not None:
+                plotter.screenshot(str(save_path))
+                print(f"三维流线图已保存到: {save_path}")
+            plotter.close()
+
+        return {
+            "streamline_count": streamline_count,
+            "train_n": train_n,
+            "deploy_n": deploy_n,
+            "boundary_available": boundary is not None,
+            "renderer": "pyvista",
+        }
 
     def plot_blade_spans(
         self,
@@ -1038,7 +1264,7 @@ class SurrogateModeling:
         h: float | None = None,
         mu: float = 0.006,
         rho: float = 10650.0,
-        omega: float = -420.0 * np.pi / 60.0,
+        omega: float = -210.0 * 2 * np.pi / 60.0,
         qv: float = 0.16,
         n_blade: int | None = None,
         z0: float | None = None,
@@ -1200,8 +1426,85 @@ class SurrogateModeling:
 
         return history
 
+    def plot_training_history(
+        self,
+        history: Sequence[Mapping[str, float]],
+        *,
+        show: bool = True,
+        save_path: str | Path | None = None,
+    ) -> None:
+        # 训练损失曲线统一用对数纵轴来画。
+        # 默认关心五条线：
+        # 1. Data 损失
+        # 2. 连续方程残差
+        # 3. 径向动量残差
+        # 4. 周向动量残差
+        # 5. 轴向动量残差
+        #
+        # 如果当前数据集没有监督标签，就自动跳过 Data 曲线。
+        if len(history) == 0:
+            return
+
+        has_supervised_target = any(sample["has_target"].item() > 0.5 for sample in self.train_dataset.samples)
+        epochs = np.arange(1, len(history) + 1, dtype=float)
+
+        curve_specs: list[tuple[str, str]] = []
+        if has_supervised_target:
+            curve_specs.append(("loss_data", "Data"))
+        curve_specs.extend(
+            [
+                ("loss_c", "R_c"),
+                ("loss_r", "R_r"),
+                ("loss_theta", "R_theta"),
+                ("loss_z", "R_z"),
+            ]
+        )
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5), squeeze=False)
+        panel_specs = [
+            ("train_", "Training Loss History"),
+            ("val_", "Validation Loss History"),
+        ]
+
+        for ax, (prefix, title) in zip(axes[0], panel_specs):
+            plotted = False
+            for key, label in curve_specs:
+                full_key = f"{prefix}{key}"
+                if full_key not in history[0]:
+                    continue
+
+                values = np.array([float(item.get(full_key, np.nan)) for item in history], dtype=float)
+                if not np.any(np.isfinite(values)):
+                    continue
+
+                # 对数坐标不能直接画 0，这里只在绘图时做极小截断。
+                values = np.where(np.isfinite(values), np.maximum(values, 1e-30), np.nan)
+                ax.plot(epochs, values, linewidth=1.6, label=label)
+                plotted = True
+
+            ax.set_title(title)
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Loss")
+            ax.set_yscale("log")
+            ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.4)
+            if plotted:
+                ax.legend()
+            else:
+                ax.text(0.5, 0.5, "No curves", transform=ax.transAxes, ha="center", va="center")
+
+        fig.tight_layout()
+        if save_path is not None:
+            save_path = Path(save_path)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(str(save_path), dpi=180, bbox_inches="tight")
+            print(f"训练损失对数曲线已保存到: {save_path}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
     def smoke_test(self, do_backward: bool = True) -> dict[str, float]:
-        # 最小化检查一遍：
+        # 最小化检查，debug模式
         # 1. DataLoader 是否正常
         # 2. 前向传播是否正常
         # 3. 数据损失 / 物理损失是否都能算
@@ -1244,20 +1547,41 @@ class SurrogateModeling:
         post_spans: Sequence[float] = (0.2, 0.5, 0.8),
         show_plots: bool = True,
         save_dir: str | Path | None = None,
+        save_checkpoint_path: str | Path | None = None,
+        plot_3d: bool = True,
+        save_history_plot_path: str | Path | None = None,
     ) -> list[dict[str, float]]:
         # 纯物理调试模式下，先看叶片导入，再训练，再看训练后的场。
         blade_plot_path = None
         post_plot_path = None
+        post_3d_path = None
+        history_plot_path = None
         if save_dir is not None:
             save_dir = Path(save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
             blade_plot_path = save_dir / "blade_spans.png"
             post_plot_path = save_dir / "post_physical_spans.png"
+            post_3d_path = save_dir / "post_3d_streamlines.png"
+            history_plot_path = save_dir / "training_loss_log.png"
+            if save_checkpoint_path is None:
+                save_checkpoint_path = save_dir / "surrogate_checkpoint.pt"
+        if save_history_plot_path is not None:
+            history_plot_path = Path(save_history_plot_path)
 
         print("纯物理调试模式：先展示叶片，再开始训练。")
         self.plot_blade_spans(case_index=0, spans=preview_spans, show=show_plots, save_path=blade_plot_path)
         history = self.fit(epochs=epochs, print_interval=print_interval)
-        self.post_process_case(case_index=0, spans=post_spans, show=show_plots, save_path=post_plot_path)
+        self.plot_training_history(history, show=show_plots, save_path=history_plot_path)
+        if save_checkpoint_path is not None:
+            self.save_checkpoint(save_checkpoint_path, history=history)
+        self.post_process_case(
+            case_index=0,
+            spans=post_spans,
+            show=show_plots,
+            save_path=post_plot_path,
+            plot_3d=plot_3d,
+            save_path_3d=post_3d_path,
+        )
         return history
 
     @torch.no_grad()
@@ -1266,57 +1590,51 @@ class SurrogateModeling:
         case: Mapping[str, Any],
         return_physical: bool = False,
     ) -> dict[str, torch.Tensor]:
-        dataset = BladeFlowDataset([case], input_mode=self.train_dataset.input_mode)
-        batch = dataset[0]
-        batch = {key: value.unsqueeze(0).to(self.device) for key, value in batch.items()}
-
-        pred = self.model(batch["x"], batch["phi"], batch["solid_ut"])
-
-        if not return_physical:
-            return {key: value[0].detach().cpu() for key, value in pred.items()}
-
-        u_omega = float(batch["u_omega"][0].cpu().item())
-        u_zo = float(batch["u_zo"][0].cpu().item())
-        p0 = float(batch["P0"][0].cpu().item())
-        return {
-            "UR": pred["UR"][0].detach().cpu() * u_omega,
-            "UT": pred["UT"][0].detach().cpu() * u_omega,
-            "UZ": pred["UZ"][0].detach().cpu() * u_zo,
-            "P": pred["P"][0].detach().cpu() * p0,
-        }
+        bundle = self._predict_case_bundle(case=case)
+        return bundle["pred_phy"] if return_physical else bundle["pred_dim"]
 
     @torch.no_grad()
     def post_process_case(
         self,
         case_index: int = 0,
+        case: Mapping[str, Any] | None = None,
         spans: Sequence[float] = (0.2, 0.5, 0.8),
         *,
         show: bool = True,
         save_path: str | Path | None = None,
-    ) -> dict[str, torch.Tensor]:
-        # 把预测场映回物理量，并做几个最直观的检查。
-        case = self.train_dataset.cases[case_index]
-        sample = self.train_dataset[case_index]
-        pred_dim = self.predict_case(case, return_physical=False)
-        pred_phy = self.predict_case(case, return_physical=True)
+        plot_3d: bool = False,
+        save_path_3d: str | Path | None = None,
+        passages_to_plot_3d: int | None = None,
+    ) -> dict[str, Any]:
+        # 这个 post 既能看训练样本，也能看一个全新的部署样本。
+        bundle = self._predict_case_bundle(case_index=case_index, case=case)
+        case_data = bundle["case"]
+        sample = bundle["sample"]
+        pred_dim = bundle["pred_dim"]
+        pred_phy = bundle["pred_phy"]
+        batch = bundle["batch"]
 
-        batch = {key: value.unsqueeze(0).to(self.device) for key, value in sample.items()}
         pred_batch = {key: value.unsqueeze(0).to(self.device) for key, value in pred_dim.items()}
-        q_pred = float(self.physics_loss.outlet_flow_rate(pred_batch["UZ"], batch).detach().cpu().item())
+        q_pred = float(self.physics_loss.outlet_flow_rate(pred_batch["UZ"], batch).detach().cpu().view(-1)[0].item())
         q_target = float(sample["qv_passage"].item())
+        train_n = int(self.train_dataset[0]["x"].shape[-1])
+        deploy_n = int(sample["x"].shape[-1])
 
         print("\n========== 训练后 Post 检查 ==========")
+        print(f"grid transfer: train_n={train_n}, deploy_n={deploy_n}")
+        if deploy_n > train_n:
+            print("当前展示的是“粗网格训练 -> 更细网格部署”的直接推理结果。")
         print(f"出口单流道体积流量: pred={q_pred:.6g}, target={q_target:.6g}")
-        print("下面给出各个 span 处流体区域的 mean / min / max，单位已经回到物理空间。")
+        print("下面给出各个 span 处流体区域的 mean / min / max，单位已经回到物理空间(SI)。")
         mask = sample["blade_mask"] < 0.5
         n = mask.shape[0]
         for span in spans:
             r_index = span_to_index(span, n)
             fluid = mask[r_index]
-            ur_stats = self._field_stats(pred_phy["UR"][r_index], fluid)
-            ut_stats = self._field_stats(pred_phy["UT"][r_index], fluid)
-            uz_stats = self._field_stats(pred_phy["UZ"][r_index], fluid)
-            p_stats = self._field_stats(pred_phy["P"][r_index], fluid)
+            ur_stats = field_stats(pred_phy["UR"][r_index], fluid)
+            ut_stats = field_stats(pred_phy["UT"][r_index], fluid)
+            uz_stats = field_stats(pred_phy["UZ"][r_index], fluid)
+            p_stats = field_stats(pred_phy["P"][r_index], fluid)
 
             print(f"span={span:.2f} (i={r_index})")
             print(f"  UR [mean/min/max] = {ur_stats[0]:.6g} / {ur_stats[1]:.6g} / {ur_stats[2]:.6g}")
@@ -1351,22 +1669,135 @@ class SurrogateModeling:
         else:
             plt.close(fig)
 
-        return pred_phy
+        three_d_info = None
+        if plot_3d:
+            three_d_info = self.plot_3d_streamlines(
+                case_index=case_index,
+                case=case_data,
+                show=show,
+                save_path=save_path_3d,
+                passages_to_plot=passages_to_plot_3d,
+            )
 
-    def save_checkpoint(self, path: str | Path) -> None:
+        return {
+            "case": case_data,
+            "sample": sample,
+            "pred_dim": pred_dim,
+            "pred_phy": pred_phy,
+            "q_pred": q_pred,
+            "q_target": q_target,
+            "train_n": train_n,
+            "deploy_n": deploy_n,
+            "three_d_info": three_d_info,
+        }
+
+    def save_checkpoint(
+        self,
+        path: str | Path,
+        *,
+        extra_metadata: Mapping[str, Any] | None = None,
+        history: Sequence[Mapping[str, float]] | None = None,
+        save_optimizer: bool = True,
+    ) -> None:
+        # checkpoint 不仅保存权重，也保存部署时所需的模型结构与训练摘要。
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
+                "checkpoint_version": 2,
                 "model_state_dict": self.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict() if save_optimizer else None,
                 "input_mode": self.train_dataset.input_mode,
+                "model_config": self.model_config,
+                "trainer_config": self.trainer_config,
+                "train_case_summaries": [case_summary(case) for case in self.train_dataset.cases],
+                "val_case_summaries": [case_summary(case) for case in self.val_dataset.cases],
+                "history": list(history) if history is not None else None,
+                "extra_metadata": dict(extra_metadata or {}),
             },
             str(path),
         )
+        print(f"模型 checkpoint 已保存到: {path}")
 
-    def load_checkpoint(self, path: str | Path) -> None:
+    def load_checkpoint(
+        self,
+        path: str | Path,
+        *,
+        load_optimizer: bool = True,
+    ) -> dict[str, Any]:
+        path = Path(path)
         payload = torch.load(str(path), map_location=self.device)
         self.model.load_state_dict(payload["model_state_dict"])
-        self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+        if load_optimizer and payload.get("optimizer_state_dict") is not None:
+            self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+        self.checkpoint_metadata = payload
+        print(f"模型 checkpoint 已读取: {path}")
+        return payload
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        path: str | Path,
+        cases: Sequence[Mapping[str, Any]] | Mapping[str, Any],
+        *,
+        device: str = "cuda",
+        batch_size: int = 1,
+        load_optimizer: bool = False,
+    ) -> "SurrogateModeling":
+        # 用 checkpoint 重建一个可直接部署的新 trainer。
+        path = Path(path)
+        payload = torch.load(str(path), map_location="cpu")
+        case_list = [cases] if isinstance(cases, Mapping) else list(cases)
+
+        model_config = dict(payload.get("model_config", {}))
+        trainer_config = dict(payload.get("trainer_config", {}))
+        input_mode = payload.get("input_mode", trainer_config.get("input_mode", "both"))
+
+        trainer = cls(
+            train_cases=case_list,
+            val_cases=case_list,
+            input_mode=input_mode,
+            batch_size=batch_size,
+            lr=float(trainer_config.get("lr", 1e-3)),
+            modes=int(model_config.get("modes", 8)),
+            width=int(model_config.get("width", 16)),
+            depth=int(model_config.get("depth", 4)),
+            z_padding=int(model_config.get("z_padding", 8)),
+            data_weight=float(trainer_config.get("data_weight", 0.0)),
+            physics_weight=float(trainer_config.get("physics_weight", 1.0)),
+            warmup_epochs=int(trainer_config.get("warmup_epochs", 0)),
+            ramp_epochs=int(trainer_config.get("ramp_epochs", 0)),
+            device=device,
+        )
+        trainer.load_checkpoint(path, load_optimizer=load_optimizer)
+        return trainer
+
+    @classmethod
+    def deploy_from_checkpoint(
+        cls,
+        checkpoint_path: str | Path,
+        case: Mapping[str, Any],
+        *,
+        device: str = "cuda",
+        show: bool = True,
+        save_path_2d: str | Path | None = None,
+        save_path_3d: str | Path | None = None,
+        spans: Sequence[float] = (0.2, 0.5, 0.8),
+        plot_3d: bool = True,
+        passages_to_plot_3d: int | None = None,
+    ) -> dict[str, Any]:
+        # 这是最直接的部署入口：
+        # 读模型 -> 输入新工况与新叶片参数 -> 输出二维 span 图和三维流线图。
+        trainer = cls.from_checkpoint(checkpoint_path, case, device=device, batch_size=1, load_optimizer=False)
+        return trainer.post_process_case(
+            case=case,
+            spans=spans,
+            show=show,
+            save_path=save_path_2d,
+            plot_3d=plot_3d,
+            save_path_3d=save_path_3d,
+            passages_to_plot_3d=passages_to_plot_3d,
+        )
 
 
 def load_cases_from_pt(path: str | Path) -> list[Mapping[str, Any]]:
@@ -1399,6 +1830,10 @@ if __name__ == "__main__":
             blade_params=blade_params,
             n=48,
             batch_size=1,
+            mu=0.006,   # LBE动力粘度
+            rho=10650.0,   # LBE密度
+            omega=-210.0 * 2 * np.pi / 60.0,  # 转速210rpm
+            qv=0.16,   # 出口体积流量0.16m3/s
         )
         smoke = trainer.smoke_test(do_backward=True)
         print("Smoke test:", smoke)
@@ -1409,6 +1844,27 @@ if __name__ == "__main__":
             post_spans=(0.4, 0.6, ),
             show_plots=True,
             save_dir="surrogate_debug_outputs",
+            save_checkpoint_path="surrogate_debug_outputs/surrogate_checkpoint.pt",
+            plot_3d=True,
+        )
+
+        # 体现“粗网格训练、细网格部署”，直接再构一个更细网格的部署工况：
+        fine_case = make_pure_physics_debug_case(
+            blade_params=blade_params,
+            n=96,
+            mu=0.006,
+            rho=10650.0,
+            omega=-210.0 * 2 * np.pi / 60.0,   # 转速210rpm
+            qv=0.16,
+        )
+        SurrogateModeling.deploy_from_checkpoint(
+            "surrogate_debug_outputs/surrogate_checkpoint.pt",
+            fine_case,
+            show=True,
+            save_path_2d="surrogate_debug_outputs/fine_grid_spans.png",
+            save_path_3d="surrogate_debug_outputs/fine_grid_3d_streamlines.png",
+            spans=(0.4, 0.6),
+            plot_3d=True,
         )
     else:
         print("No blade_params.json found. Use build_pure_physics_debug_trainer(...) or load_cases_from_pt(...).")
