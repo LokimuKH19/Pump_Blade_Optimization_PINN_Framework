@@ -21,3 +21,6 @@ Finished `BladeImport.py` thoroughly.
 
 ### May 2nd, 2026
 Updated `SurrogateModeling.py` and its dependencies `SurrogateModelingUtils.py`, facilitating the whole process of flow field surrogate modeling of the axial pump at certain operating conditions using a 2D-FNO([CFNO](https://github.com/LokimuKH19/SymPhONIC)) which shares parameters for each $(\Theta, Z)$ cylinderical layer. It supports model training, saving, reading and other CFD pre-post processes.
+
+### May 4th, 2026
+Updated `SurrogateModeling.py`. The 2 constants in the IBM mask are set as learnable parameters now.
