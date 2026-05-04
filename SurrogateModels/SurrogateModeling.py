@@ -211,12 +211,23 @@ def build_geometry_tensors(config: FlowCaseConfig) -> dict[str, torch.Tensor]:
 
 def build_phi_from_signed_distance(
     signed_distance: torch.Tensor,
-    ibm_C: float,
-    ibm_epsilon: float,
+    ibm_C: float | torch.Tensor,
+    ibm_epsilon: float | torch.Tensor,
 ) -> torch.Tensor:
     # 这里和 DataGenerator 中的浸没边界写法保持一致：
     # phi=1 近似纯流体，phi=0 近似纯固体，中间是平滑过渡层。
-    return 1.0 - torch.exp(-ibm_C * signed_distance ** 2 / (ibm_epsilon ** 2))
+    if torch.is_tensor(ibm_C):
+        c_value = ibm_C.to(device=signed_distance.device, dtype=signed_distance.dtype)
+    else:
+        c_value = torch.tensor(float(ibm_C), device=signed_distance.device, dtype=signed_distance.dtype)
+
+    if torch.is_tensor(ibm_epsilon):
+        epsilon_value = ibm_epsilon.to(device=signed_distance.device, dtype=signed_distance.dtype)
+    else:
+        epsilon_value = torch.tensor(float(ibm_epsilon), device=signed_distance.device, dtype=signed_distance.dtype)
+
+    epsilon_value = torch.clamp(epsilon_value, min=1e-8)
+    return 1.0 - torch.exp(-c_value * signed_distance ** 2 / (epsilon_value ** 2))
 
 
 def hard_project_theta_periodic(field: torch.Tensor, theta_dim: int) -> torch.Tensor:
@@ -313,6 +324,7 @@ class BladeFlowDataset(Dataset):
         geometry = build_geometry_tensors(config)
         blade_mask, phi, signed_distance = self._build_blade_channels(case, config)
         target, has_target = normalize_target_fields(case, config)
+        has_true_signed_distance = bool(_pick(case, "signed_distance") is not None or _pick(case, "blade_params") is not None)
 
         # 输入通道分两部分：
         # 一部分是叶片场本身；另一部分是几何系数和无量纲常数场。
@@ -357,6 +369,7 @@ class BladeFlowDataset(Dataset):
             "phi": phi.to(torch.float32),
             "blade_mask": blade_mask.to(torch.float32),
             "signed_distance": signed_distance.to(torch.float32),
+            "has_true_signed_distance": torch.tensor(1.0 if has_true_signed_distance else 0.0, dtype=torch.float32),
             "solid_ut": geometry["solid_ut"].to(torch.float32),
             "r_hat": geometry["r_hat"].to(torch.float32),
             "K_theta": geometry["K_theta"].to(torch.float32),
@@ -382,6 +395,8 @@ class BladeFlowDataset(Dataset):
             "qv_passage": torch.tensor(config.qv_passage, dtype=torch.float32),
             "qv_hat": torch.tensor(config.qv_hat, dtype=torch.float32),
             "g_star": torch.tensor(config.g_star, dtype=torch.float32),
+            "ibm_C": torch.tensor(config.ibm_C, dtype=torch.float32),
+            "ibm_epsilon": torch.tensor(config.ibm_epsilon, dtype=torch.float32),
             "absolute_frame": torch.tensor(1.0 if config.absolute_frame else 0.0, dtype=torch.float32),
         }
 
@@ -454,9 +469,9 @@ class SliceWiseFNOFlowModel(nn.Module):
         super().__init__()
         self.z_padding = int(max(z_padding, 0))
         # todo 在这里替换网络类型
-        self.core = NeuralOperators.FNO2d_small(
+        self.core = NeuralOperators.CFNO2d_small(
             modes=modes,
-            # cheb_modes=(modes, modes),
+            cheb_modes=(modes, modes),
             width=width,
             depth=depth,
             input_features=input_channels,
@@ -526,6 +541,102 @@ class SliceWiseFNOFlowModel(nn.Module):
             "UZ": uz,
             "P": p,
         }
+
+
+class AdaptiveIBMMaskController(nn.Module):
+    # 这里不把 ibm_C 和 ibm_epsilon 当成完全写死的常数。
+    # 做法是：给它们一个允许范围，然后根据当前样本的几何/工况特征，
+    # 学出每个样本各自的一对“等效 IBM 过渡层参数”。
+    #
+    # 注意这里仍然保持“单个样本内空间上统一”的 C / epsilon。
+    # 也就是说，我们先从“不同流场、不同叶型可以不同”这一步做起，
+    # 不直接把它扩成空间分布场，避免把训练问题一下子搞得过硬。
+    def __init__(
+        self,
+        *,
+        c_range: tuple[float, float] = (0.25, 4.0),
+        epsilon_range: tuple[float, float] = (0.01, 0.08),
+        hidden: int = 16,
+        default_c: float = 1.0,
+        default_epsilon: float = 0.025,
+    ):
+        super().__init__()
+
+        c_min, c_max = float(c_range[0]), float(c_range[1])
+        epsilon_min, epsilon_max = float(epsilon_range[0]), float(epsilon_range[1])
+        if not (c_max > c_min and epsilon_max > epsilon_min):
+            raise ValueError("ibm parameter ranges must satisfy max > min.")
+
+        self.c_range = (c_min, c_max)
+        self.epsilon_range = (epsilon_min, epsilon_max)
+        self.hidden = int(hidden)
+
+        default_c_ratio = np.clip((float(default_c) - c_min) / (c_max - c_min), 1e-4, 1.0 - 1e-4)
+        default_epsilon_ratio = np.clip(
+            (float(default_epsilon) - epsilon_min) / (epsilon_max - epsilon_min),
+            1e-4,
+            1.0 - 1e-4,
+        )
+        base_logit = torch.tensor(
+            [
+                np.log(default_c_ratio / (1.0 - default_c_ratio)),
+                np.log(default_epsilon_ratio / (1.0 - default_epsilon_ratio)),
+            ],
+            dtype=torch.float32,
+        )
+        self.base_logit = nn.Parameter(base_logit)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(8, self.hidden),
+            nn.SiLU(),
+            nn.Linear(self.hidden, self.hidden),
+            nn.SiLU(),
+            nn.Linear(self.hidden, 2),
+        )
+
+        # 让训练从 case 默认值附近起步，而不是一开始就把 phi 扭得很厉害。
+        last_layer = self.mlp[-1]
+        nn.init.zeros_(last_layer.weight)
+        nn.init.zeros_(last_layer.bias)
+
+    def _map_to_range(self, raw_value: torch.Tensor, low: float, high: float) -> torch.Tensor:
+        return low + (high - low) * torch.sigmoid(raw_value)
+
+    def extract_features(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        # 用少量全局特征描述这个样本的“几何 + 流动尺度”。
+        blade_fraction = torch.mean(batch["blade_mask"], dim=(1, 2, 3))
+        signed_distance_abs = torch.abs(batch["signed_distance"])
+        signed_distance_mean = torch.mean(signed_distance_abs, dim=(1, 2, 3))
+        signed_distance_std = torch.std(signed_distance_abs, dim=(1, 2, 3), unbiased=False)
+
+        qv_hat = batch["qv_hat"].view(-1)
+        re_log = torch.log(torch.clamp(batch["Re_omega"].view(-1), min=1e-12))
+        eu_log = torch.log(torch.clamp(batch["Eu_omega"].view(-1), min=1e-12))
+        lambda_value = batch["Lambda"].view(-1)
+        delta_value = batch["delta"].view(-1)
+
+        return torch.stack(
+            [
+                blade_fraction,
+                signed_distance_mean,
+                signed_distance_std,
+                qv_hat,
+                re_log,
+                eu_log,
+                lambda_value,
+                delta_value,
+            ],
+            dim=1,
+        )
+
+    def forward(self, batch: Mapping[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.extract_features(batch)
+        offset = 0.5 * torch.tanh(self.mlp(features))
+        raw_value = self.base_logit.view(1, 2) + offset
+
+        ibm_c = self._map_to_range(raw_value[:, 0], self.c_range[0], self.c_range[1]).view(-1, 1, 1, 1)
+        ibm_epsilon = self._map_to_range(raw_value[:, 1], self.epsilon_range[0], self.epsilon_range[1]).view(-1, 1, 1, 1)
+        return ibm_c, ibm_epsilon
 
 
 class BladeFlowPhysicsLoss(nn.Module):
@@ -809,6 +920,58 @@ def make_pure_physics_debug_case(
     }
 
 
+def _normalize_blade_params_inputs(
+    blade_params: str | Path | Sequence[str | Path],
+) -> list[Path]:
+    # 训练时允许同时输入多个叶片几何文件。
+    # 这里统一展开成 Path 列表，后面的建 case 流程就可以完全复用。
+    if isinstance(blade_params, (str, Path)):
+        items = [Path(blade_params)]
+    else:
+        items = [Path(item) for item in blade_params]
+    if len(items) == 0:
+        raise ValueError("blade_params must contain at least one blade geometry file.")
+    return items
+
+
+def make_pure_physics_debug_cases(
+    *,
+    blade_params: str | Path | Sequence[str | Path],
+    n: int = 64,
+    rh: float | None = None,
+    rs: float | None = None,
+    h: float | None = None,
+    mu: float = 0.006,
+    rho: float = 10650.0,
+    omega: float = -420.0 * np.pi / 60.0,
+    qv: float = 0.16,
+    n_blade: int | None = None,
+    z0: float | None = None,
+    g_star: float = 0.0,
+) -> list[dict[str, Any]]:
+    # 这是“同一工况、多叶型训练”的直接入口。
+    # 除了 blade_params 可以是一组之外，其他工况和几何尺度参数都保持一致。
+    cases: list[dict[str, Any]] = []
+    for blade_path in _normalize_blade_params_inputs(blade_params):
+        cases.append(
+            make_pure_physics_debug_case(
+                blade_params=blade_path,
+                n=n,
+                rh=rh,
+                rs=rs,
+                h=h,
+                mu=mu,
+                rho=rho,
+                omega=omega,
+                qv=qv,
+                n_blade=n_blade,
+                z0=z0,
+                g_star=g_star,
+            )
+        )
+    return cases
+
+
 class SurrogateModeling:
     # 训练器同时支持两种模式：
     # 1. 有监督样本：数据损失 + 物理损失
@@ -829,6 +992,10 @@ class SurrogateModeling:
         physics_weight: float = 0.1,
         warmup_epochs: int = 20,
         ramp_epochs: int = 30,
+        learn_ibm_params: bool = True,
+        ibm_c_range: tuple[float, float] = (0.25, 4.0),
+        ibm_epsilon_range: tuple[float, float] = (0.01, 0.08),
+        ibm_hidden: int = 16,
         device: str = "cuda",
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -854,6 +1021,28 @@ class SurrogateModeling:
             "z_padding": z_padding,
             "output_channels": 4,
         }
+        default_ibm_c = float(np.mean([float(_pick(case, "ibm_C", default=1.0)) for case in train_cases]))
+        default_ibm_epsilon = float(np.mean([float(_pick(case, "ibm_epsilon", default=0.025)) for case in train_cases]))
+        self.learn_ibm_params = bool(learn_ibm_params)
+        self.ibm_mask_controller = (
+            AdaptiveIBMMaskController(
+                c_range=ibm_c_range,
+                epsilon_range=ibm_epsilon_range,
+                hidden=ibm_hidden,
+                default_c=default_ibm_c,
+                default_epsilon=default_ibm_epsilon,
+            ).to(self.device)
+            if self.learn_ibm_params
+            else None
+        )
+        self.ibm_config = {
+            "learn_ibm_params": self.learn_ibm_params,
+            "ibm_c_range": tuple(float(v) for v in ibm_c_range),
+            "ibm_epsilon_range": tuple(float(v) for v in ibm_epsilon_range),
+            "ibm_hidden": int(ibm_hidden),
+            "default_ibm_c": default_ibm_c,
+            "default_ibm_epsilon": default_ibm_epsilon,
+        }
         self.trainer_config = {
             "input_mode": input_mode,
             "batch_size": batch_size,
@@ -862,11 +1051,18 @@ class SurrogateModeling:
             "physics_weight": physics_weight,
             "warmup_epochs": warmup_epochs,
             "ramp_epochs": ramp_epochs,
+            "learn_ibm_params": self.learn_ibm_params,
+            "ibm_c_range": tuple(float(v) for v in ibm_c_range),
+            "ibm_epsilon_range": tuple(float(v) for v in ibm_epsilon_range),
+            "ibm_hidden": int(ibm_hidden),
         }
         self.checkpoint_metadata: dict[str, Any] | None = None
 
         self.physics_loss = BladeFlowPhysicsLoss().to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        optimizer_params: list[nn.Parameter] = list(self.model.parameters())
+        if self.ibm_mask_controller is not None:
+            optimizer_params.extend(list(self.ibm_mask_controller.parameters()))
+        self.optimizer = torch.optim.Adam(optimizer_params, lr=lr)
 
         self.data_weight = data_weight
         self.physics_weight = physics_weight
@@ -879,6 +1075,8 @@ class SurrogateModeling:
         # 打印一次样本准备摘要，方便确认几何、尺度和边界设置是否符合预期。
         sample = self.train_dataset[case_index]
         case = self.train_dataset.cases[case_index]
+        blade_params_all = [str(item["blade_params"]) for item in self.train_dataset.cases if "blade_params" in item]
+        blade_geometry_count = len(set(blade_params_all))
 
         blade_cells = int(sample["blade_mask"].sum().item())
         total_cells = int(sample["blade_mask"].numel())
@@ -888,7 +1086,13 @@ class SurrogateModeling:
         print("\n========== SurrogateModeling: 数据准备摘要 ==========")
         print(f"device                : {self.device}")
         print(f"train_cases / val_cases: {len(self.train_dataset)} / {len(self.val_dataset)}")
+        print(f"train_blade_geometries: {blade_geometry_count}")
         print(f"input_mode            : {self.train_dataset.input_mode}")
+        print(f"learn_ibm_params      : {self.learn_ibm_params}")
+        print(
+            f"ibm_range             : C in {self.ibm_config['ibm_c_range']}, "
+            f"epsilon in {self.ibm_config['ibm_epsilon_range']}"
+        )
         print(f"input_channels        : {sample['x'].shape[0]}")
         print("theta_periodic        : 输入拼缝投影 + 输出拼缝投影 + 周期专用差分")
         print("z_boundary            : FNO 前向使用复制填充，弱化 Z 向伪周期影响")
@@ -914,9 +1118,88 @@ class SurrogateModeling:
             f"total_cells={total_cells}, fluid_phi_mean={fluid_ratio:.6f}"
         )
         print(f"supervised_target     : {'yes' if has_target else 'no, pure physics debug'}")
+        print(
+            f"default_ibm           : C={float(sample['ibm_C'].item()):.6g}, "
+            f"epsilon={float(sample['ibm_epsilon'].item()):.6g}"
+        )
         if "blade_params" in case:
-            print(f"blade_params          : {case['blade_params']}")
+            print(f"sample_blade_params   : {case['blade_params']}")
         print("===============================================\n")
+
+    def _current_ibm_params(self, batch: Mapping[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        # 如果开启了自适应 IBM 参数，就按当前样本动态求一对 C / epsilon。
+        # 否则退回到样本里保存的默认值。
+        if self.ibm_mask_controller is None:
+            ibm_c = batch["ibm_C"].view(-1, 1, 1, 1)
+            ibm_epsilon = batch["ibm_epsilon"].view(-1, 1, 1, 1)
+            return ibm_c, ibm_epsilon
+        return self.ibm_mask_controller(batch)
+
+    def _compose_model_input(self, batch: Mapping[str, torch.Tensor], phi: torch.Tensor) -> torch.Tensor:
+        # x 中只有前 1-2 个通道依赖叶片场，其余几何/工况通道都是固定的。
+        # 因此这里按当前的 phi 重新拼一次输入张量。
+        channels: list[torch.Tensor] = []
+        if self.train_dataset.input_mode == "mask":
+            channels.append(batch["blade_mask"])
+        elif self.train_dataset.input_mode == "phi":
+            channels.append(phi)
+        elif self.train_dataset.input_mode == "both":
+            channels.append(batch["blade_mask"])
+            channels.append(phi)
+        else:
+            raise ValueError("input_mode must be 'mask', 'phi', or 'both'")
+
+        theta_phase = 2.0 * np.pi * batch["Theta"]
+        theta_sin = torch.sin(theta_phase)
+        theta_cos = torch.cos(theta_phase)
+        ones = torch.ones_like(batch["r_hat"])
+
+        channels.extend(
+            [
+                batch["r_hat"],
+                batch["K_theta"],
+                theta_sin,
+                theta_cos,
+                batch["Z"],
+                batch["solid_ut"],
+                ones * expand_scalar(batch["Eu_omega"]),
+                ones * expand_scalar(batch["Re_omega"]),
+                ones * expand_scalar(batch["Lambda"]),
+                ones * expand_scalar(batch["Ku"]),
+                ones * expand_scalar(batch["delta"]),
+                ones * expand_scalar(batch["sgn_omega"]),
+                ones * expand_scalar(batch["g_star"]),
+            ]
+        )
+
+        x = torch.stack(channels, dim=1)
+        return hard_project_theta_periodic(x, theta_dim=3)
+
+    def _prepare_runtime_batch(self, batch: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        # 训练和部署阶段都使用“当前学习到的 IBM 参数”实时重建 phi 和 x。
+        ibm_c, ibm_epsilon = self._current_ibm_params(batch)
+        learned_phi = build_phi_from_signed_distance(batch["signed_distance"], ibm_c, ibm_epsilon)
+        learned_phi = torch.where(batch["blade_mask"] > 0.5, torch.zeros_like(learned_phi), learned_phi)
+        if "has_true_signed_distance" in batch:
+            true_distance_mask = batch["has_true_signed_distance"].view(-1, 1, 1, 1) > 0.5
+            phi = torch.where(true_distance_mask, learned_phi, batch["phi"])
+            ibm_c = torch.where(true_distance_mask, ibm_c, batch["ibm_C"].view(-1, 1, 1, 1))
+            ibm_epsilon = torch.where(
+                true_distance_mask,
+                ibm_epsilon,
+                batch["ibm_epsilon"].view(-1, 1, 1, 1),
+            )
+        else:
+            phi = learned_phi
+        phi = torch.clamp(phi, min=0.0, max=1.0)
+        phi = hard_project_theta_periodic(phi, theta_dim=2)
+
+        runtime_batch = dict(batch)
+        runtime_batch["phi"] = phi
+        runtime_batch["x"] = self._compose_model_input(runtime_batch, phi)
+        runtime_batch["ibm_C"] = ibm_c.view(-1)
+        runtime_batch["ibm_epsilon"] = ibm_epsilon.view(-1)
+        return runtime_batch
 
     def _resolve_case_sample(
         self,
@@ -952,11 +1235,18 @@ class SurrogateModeling:
     ) -> dict[str, Any]:
         # 统一构造部署所需的整套对象，避免 post 阶段重复 build dataset / 重复 forward。
         case_data, sample = self._resolve_case_sample(case_index=case_index, case=case)
-        batch = {key: value.unsqueeze(0).to(self.device) for key, value in sample.items()}
-
         self.model.eval()
+        if self.ibm_mask_controller is not None:
+            self.ibm_mask_controller.eval()
+        batch = {key: value.unsqueeze(0).to(self.device) for key, value in sample.items()}
+        batch = self._prepare_runtime_batch(batch)
         pred = self.model(batch["x"], batch["phi"], batch["solid_ut"])
         pred_dim = {key: value[0].detach().cpu() for key, value in pred.items()}
+        sample_runtime = dict(sample)
+        sample_runtime["x"] = batch["x"][0].detach().cpu()
+        sample_runtime["phi"] = batch["phi"][0].detach().cpu()
+        sample_runtime["ibm_C"] = batch["ibm_C"][0].detach().cpu()
+        sample_runtime["ibm_epsilon"] = batch["ibm_epsilon"][0].detach().cpu()
 
         u_omega = float(batch["u_omega"][0].cpu().item())
         u_zo = float(batch["u_zo"][0].cpu().item())
@@ -971,7 +1261,7 @@ class SurrogateModeling:
         boundary = self._build_boundary_for_case(case_data)
         return {
             "case": case_data,
-            "sample": sample,
+            "sample": sample_runtime,
             "batch": batch,
             "pred_dim": pred_dim,
             "pred_phy": pred_phy,
@@ -1077,6 +1367,8 @@ class SurrogateModeling:
         pred_phy = bundle["pred_phy"]
         boundary = bundle["boundary"]
         config = FlowCaseConfig.from_mapping(case_data)
+        ibm_c_value = float(sample["ibm_C"].item())
+        ibm_epsilon_value = float(sample["ibm_epsilon"].item())
 
         train_n = int(self.train_dataset[0]["x"].shape[-1])
         deploy_n = int(sample["x"].shape[-1])
@@ -1179,7 +1471,8 @@ class SurrogateModeling:
 
         # 在画面左下角保留一点文字信息，直接体现“粗网格训练、细网格部署”的部署特征。
         plotter.add_text(
-            f"Rotor Streamlines | train_n={train_n} | deploy_n={deploy_n} | blades={config.n_blade}",
+            f"Rotor Streamlines | train_n={train_n} | deploy_n={deploy_n} | "
+            f"blades={config.n_blade} | C={ibm_c_value:.4g} | eps={ibm_epsilon_value:.4g}",
             position="upper_left",
             font_size=10,
             color="white" if theme == "dark" else "black",
@@ -1217,8 +1510,10 @@ class SurrogateModeling:
     ) -> None:
         # 这个图首先用来确认叶片导入是否对齐。
         sample = self.train_dataset[case_index]
+        batch = {key: value.unsqueeze(0).to(self.device) for key, value in sample.items()}
+        batch = self._prepare_runtime_batch(batch)
         mask = sample["blade_mask"].detach().cpu().numpy()
-        phi = sample["phi"].detach().cpu().numpy()
+        phi = batch["phi"][0].detach().cpu().numpy()
         signed_distance = sample["signed_distance"].detach().cpu().numpy()
         n = mask.shape[0]
 
@@ -1257,7 +1552,7 @@ class SurrogateModeling:
     def build_pure_physics_debug_trainer(
         cls,
         *,
-        blade_params: str | Path,
+        blade_params: str | Path | Sequence[str | Path],
         n: int = 64,
         rh: float | None = None,
         rs: float | None = None,
@@ -1276,9 +1571,14 @@ class SurrogateModeling:
         width: int = 32,
         depth: int = 4,
         z_padding: int = 8,
+        learn_ibm_params: bool = True,
+        ibm_c_range: tuple[float, float] = (0.25, 4.0),
+        ibm_epsilon_range: tuple[float, float] = (0.01, 0.08),
+        ibm_hidden: int = 16,
         device: str = "cuda",
+        val_blade_params: str | Path | Sequence[str | Path] | None = None,
     ) -> "SurrogateModeling":
-        case = make_pure_physics_debug_case(
+        train_cases = make_pure_physics_debug_cases(
             blade_params=blade_params,
             n=n,
             rh=rh,
@@ -1292,9 +1592,25 @@ class SurrogateModeling:
             z0=z0,
             g_star=g_star,
         )
+        val_cases = None
+        if val_blade_params is not None:
+            val_cases = make_pure_physics_debug_cases(
+                blade_params=val_blade_params,
+                n=n,
+                rh=rh,
+                rs=rs,
+                h=h,
+                mu=mu,
+                rho=rho,
+                omega=omega,
+                qv=qv,
+                n_blade=n_blade,
+                z0=z0,
+                g_star=g_star,
+            )
         return cls(
-            train_cases=[case],
-            val_cases=[case],
+            train_cases=train_cases,
+            val_cases=val_cases if val_cases is not None else train_cases,
             input_mode=input_mode,
             batch_size=batch_size,
             lr=lr,
@@ -1306,6 +1622,10 @@ class SurrogateModeling:
             physics_weight=1.0,
             warmup_epochs=0,
             ramp_epochs=0,
+            learn_ibm_params=learn_ibm_params,
+            ibm_c_range=ibm_c_range,
+            ibm_epsilon_range=ibm_epsilon_range,
+            ibm_hidden=ibm_hidden,
             device=device,
         )
 
@@ -1366,8 +1686,12 @@ class SurrogateModeling:
     def run_epoch(self, loader: DataLoader, epoch: int, training: bool) -> dict[str, float]:
         if training:
             self.model.train()
+            if self.ibm_mask_controller is not None:
+                self.ibm_mask_controller.train()
         else:
             self.model.eval()
+            if self.ibm_mask_controller is not None:
+                self.ibm_mask_controller.eval()
 
         physics_factor = self.current_physics_factor(epoch)
         logs: dict[str, float] = {}
@@ -1375,6 +1699,7 @@ class SurrogateModeling:
 
         for batch in loader:
             batch = self._to_device(batch)
+            batch = self._prepare_runtime_batch(batch)
 
             with torch.set_grad_enabled(training):
                 pred = self.model(batch["x"], batch["phi"], batch["solid_ut"])
@@ -1387,7 +1712,12 @@ class SurrogateModeling:
                     loss.backward()
                     self.optimizer.step()
 
-            merged = {"loss_total": loss, "physics_factor": torch.tensor(physics_factor, device=loss.device)}
+            merged = {
+                "loss_total": loss,
+                "physics_factor": torch.tensor(physics_factor, device=loss.device),
+                "ibm_C": torch.mean(batch["ibm_C"]),
+                "ibm_epsilon": torch.mean(batch["ibm_epsilon"]),
+            }
             merged.update(log_data)
             merged.update(log_phys)
 
@@ -1418,6 +1748,8 @@ class SurrogateModeling:
                     f"train_data={train_log['loss_data']:.6e} | "
                     f"train_phys={train_log['loss_phys']:.6e} | "
                     f"train_qv={train_log['loss_qv']:.6e} | "
+                    f"train_ibm_C={train_log['ibm_C']:.6g} | "
+                    f"train_ibm_eps={train_log['ibm_epsilon']:.6g} | "
                     f"train_bc_periodic={train_log['loss_bc_periodic']:.6e} | "
                     f"train_bc_blade={train_log['loss_bc_blade']:.6e} | "
                     f"val_total={val_log['loss_total']:.6e} | "
@@ -1509,10 +1841,12 @@ class SurrogateModeling:
         # 2. 前向传播是否正常
         # 3. 数据损失 / 物理损失是否都能算
         # 4. backward 是否能打通
+        self.model.train()
+        if self.ibm_mask_controller is not None:
+            self.ibm_mask_controller.train()
         batch = next(iter(self.train_loader))
         batch = self._to_device(batch)
-
-        self.model.train()
+        batch = self._prepare_runtime_batch(batch)
         pred = self.model(batch["x"], batch["phi"], batch["solid_ut"])
         loss_data, log_data = self.supervised_loss(pred, batch)
         loss_phys, log_phys = self.physics_loss(pred, batch)
@@ -1533,6 +1867,8 @@ class SurrogateModeling:
             "q_hat_pred": float(log_phys["q_hat_pred"].detach().cpu().item()),
             "q_hat_target": float(log_phys["q_hat_target"].detach().cpu().item()),
             "physics_factor": float(physics_factor),
+            "ibm_C": float(batch["ibm_C"].detach().cpu().mean().item()),
+            "ibm_epsilon": float(batch["ibm_epsilon"].detach().cpu().mean().item()),
             "has_target": float(batch["has_target"][0].detach().cpu().item()),
             "input_channels": float(batch["x"].shape[1]),
             "grid_size": float(batch["x"].shape[-1]),
@@ -1619,12 +1955,15 @@ class SurrogateModeling:
         q_target = float(sample["qv_passage"].item())
         train_n = int(self.train_dataset[0]["x"].shape[-1])
         deploy_n = int(sample["x"].shape[-1])
+        ibm_c_value = float(sample["ibm_C"].item())
+        ibm_epsilon_value = float(sample["ibm_epsilon"].item())
 
         print("\n========== 训练后 Post 检查 ==========")
         print(f"grid transfer: train_n={train_n}, deploy_n={deploy_n}")
         if deploy_n > train_n:
             print("当前展示的是“粗网格训练 -> 更细网格部署”的直接推理结果。")
         print(f"出口单流道体积流量: pred={q_pred:.6g}, target={q_target:.6g}")
+        print(f"adaptive_ibm         : C={ibm_c_value:.6g}, epsilon={ibm_epsilon_value:.6g}")
         print("下面给出各个 span 处流体区域的 mean / min / max，单位已经回到物理空间(SI)。")
         mask = sample["blade_mask"] < 0.5
         n = mask.shape[0]
@@ -1686,6 +2025,8 @@ class SurrogateModeling:
             "pred_phy": pred_phy,
             "q_pred": q_pred,
             "q_target": q_target,
+            "ibm_C": ibm_c_value,
+            "ibm_epsilon": ibm_epsilon_value,
             "train_n": train_n,
             "deploy_n": deploy_n,
             "three_d_info": three_d_info,
@@ -1704,12 +2045,14 @@ class SurrogateModeling:
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
-                "checkpoint_version": 2,
+                "checkpoint_version": 3,
                 "model_state_dict": self.model.state_dict(),
+                "ibm_mask_controller_state_dict": self.ibm_mask_controller.state_dict() if self.ibm_mask_controller is not None else None,
                 "optimizer_state_dict": self.optimizer.state_dict() if save_optimizer else None,
                 "input_mode": self.train_dataset.input_mode,
                 "model_config": self.model_config,
                 "trainer_config": self.trainer_config,
+                "ibm_config": self.ibm_config,
                 "train_case_summaries": [case_summary(case) for case in self.train_dataset.cases],
                 "val_case_summaries": [case_summary(case) for case in self.val_dataset.cases],
                 "history": list(history) if history is not None else None,
@@ -1728,8 +2071,13 @@ class SurrogateModeling:
         path = Path(path)
         payload = torch.load(str(path), map_location=self.device)
         self.model.load_state_dict(payload["model_state_dict"])
+        ibm_state = payload.get("ibm_mask_controller_state_dict")
+        if self.ibm_mask_controller is not None and ibm_state is not None:
+            self.ibm_mask_controller.load_state_dict(ibm_state)
         if load_optimizer and payload.get("optimizer_state_dict") is not None:
             self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+        if "ibm_config" in payload:
+            self.ibm_config = dict(payload["ibm_config"])
         self.checkpoint_metadata = payload
         print(f"模型 checkpoint 已读取: {path}")
         return payload
@@ -1767,6 +2115,10 @@ class SurrogateModeling:
             physics_weight=float(trainer_config.get("physics_weight", 1.0)),
             warmup_epochs=int(trainer_config.get("warmup_epochs", 0)),
             ramp_epochs=int(trainer_config.get("ramp_epochs", 0)),
+            learn_ibm_params=bool(trainer_config.get("learn_ibm_params", True)),
+            ibm_c_range=tuple(trainer_config.get("ibm_c_range", (0.25, 4.0))),
+            ibm_epsilon_range=tuple(trainer_config.get("ibm_epsilon_range", (0.01, 0.08))),
+            ibm_hidden=int(trainer_config.get("ibm_hidden", 16)),
             device=device,
         )
         trainer.load_checkpoint(path, load_optimizer=load_optimizer)
@@ -1834,7 +2186,23 @@ if __name__ == "__main__":
             rho=10650.0,   # LBE密度
             omega=-210.0 * 2 * np.pi / 60.0,  # 转速210rpm
             qv=0.16,   # 出口体积流量0.16m3/s
+            lr=1e-3,   # 学习率
+            learn_ibm_params=True,    # 是否将IBM参数也纳入学习范围
+            ibm_c_range=(0.3, 3.0),
+            ibm_epsilon_range=(0.001, 0.05),
         )
+        '''
+        可以传入列表blade_params（训练集），val_blades为测试集
+        trainer = SurrogateModeling.build_pure_physics_debug_trainer(
+            blade_params=train_blades,
+            val_blade_params=val_blades,
+            n=48,
+            mu=0.006,
+            rho=10650.0,
+            omega=-210.0 * 2 * np.pi / 60.0,
+            qv=0.16,
+        )
+        '''
         smoke = trainer.smoke_test(do_backward=True)
         print("Smoke test:", smoke)
         trainer.fit_pure_physics_debug(

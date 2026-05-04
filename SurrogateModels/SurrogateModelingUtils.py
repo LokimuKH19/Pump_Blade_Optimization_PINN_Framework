@@ -51,18 +51,21 @@ def d1_periodic_with_overlap(
     x_perm = torch.movedim(x, dim, -1)
     out = torch.zeros_like(x_perm)
     n = x_perm.shape[-1]
+    spacing_value = spacing
+    while spacing_value.ndim > x_perm.ndim - 1:
+        spacing_value = spacing_value.squeeze(-1)
 
     if n <= 1:
         return torch.movedim(out, -1, dim)
 
     if n == 2:
-        seam = (x_perm[..., 1] - x_perm[..., 0]) / torch.clamp(spacing, min=1e-12)
+        seam = (x_perm[..., 1] - x_perm[..., 0]) / torch.clamp(spacing_value, min=1e-12)
         out[..., 0] = seam
         out[..., 1] = seam
         return torch.movedim(out, -1, dim)
 
     out[..., 1:-1] = (x_perm[..., 2:] - x_perm[..., :-2]) / (2.0 * spacing)
-    seam = (x_perm[..., 1] - x_perm[..., -2]) / (2.0 * spacing)
+    seam = (x_perm[..., 1] - x_perm[..., -2]) / (2.0 * spacing_value)
     out[..., 0] = seam
     out[..., -1] = seam
     return torch.movedim(out, -1, dim)
@@ -76,18 +79,21 @@ def d2_periodic_with_overlap(
     x_perm = torch.movedim(x, dim, -1)
     out = torch.zeros_like(x_perm)
     n = x_perm.shape[-1]
+    spacing_value = spacing
+    while spacing_value.ndim > x_perm.ndim - 1:
+        spacing_value = spacing_value.squeeze(-1)
 
     if n <= 1:
         return torch.movedim(out, -1, dim)
 
     if n == 2:
-        seam = (x_perm[..., 1] - 2.0 * x_perm[..., 0] + x_perm[..., 1]) / (spacing ** 2)
+        seam = (x_perm[..., 1] - 2.0 * x_perm[..., 0] + x_perm[..., 1]) / (spacing_value ** 2)
         out[..., 0] = seam
         out[..., 1] = seam
         return torch.movedim(out, -1, dim)
 
     out[..., 1:-1] = (x_perm[..., 2:] - 2.0 * x_perm[..., 1:-1] + x_perm[..., :-2]) / (spacing ** 2)
-    seam = (x_perm[..., 1] - 2.0 * x_perm[..., 0] + x_perm[..., -2]) / (spacing ** 2)
+    seam = (x_perm[..., 1] - 2.0 * x_perm[..., 0] + x_perm[..., -2]) / (spacing_value ** 2)
     out[..., 0] = seam
     out[..., -1] = seam
     return torch.movedim(out, -1, dim)
@@ -120,6 +126,8 @@ def case_summary(case: Mapping[str, Any]) -> dict[str, Any]:
         "n_blades",
         "z0",
         "g_star",
+        "ibm_C",
+        "ibm_epsilon",
         "absolute_frame",
         "blade_params",
     ]
