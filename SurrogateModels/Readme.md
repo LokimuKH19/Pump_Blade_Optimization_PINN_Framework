@@ -24,3 +24,6 @@ Updated `SurrogateModeling.py` and its dependencies `SurrogateModelingUtils.py`,
 
 ### May 4th, 2026
 Updated `SurrogateModeling.py`. The 2 constants in the IBM mask are set as learnable parameters now.
+
+### May 5th, 2026
+Updated `DataGenerator.py` and its dependencies `PressureUpdaters.py`. We finally decided to apply a more stable COUPLE method with pseudo transient and geometric multigrid (GMG) pressure updater to substitute the SIMPLE algo we adopted before... and thanks to Codex, it converged now.
