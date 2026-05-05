@@ -1,406 +1,372 @@
-# PressureUpdaters.py
+from __future__ import annotations
+
+from typing import Any
+
 import torch
+import torch.nn.functional as F
 
 
-def _neighbor(x, direction):
-    return torch.roll(
-        x,
-        shifts={"E": -1, "W": 1, "N": -1, "S": 1}[direction],
-        dims={"E": 0, "W": 0, "N": 1, "S": 1}[direction],
-    )
-# 压力求解器合集
-# 用于求解位移线性系统 acPc = sum afPf + sum affPff + beta
+class PressureUpdater:
+    """Pressure-correction and pressure linear-system manager for BladeCalc.
 
+    The flow solver owns geometry, fields, Rhie-Chow fluxes, and boundary
+    application. This class owns everything that assembles and solves pressure
+    corrections, including Jacobi, BiCGStab, GMG, SIMPLE pressure updates, and
+    the pseudo-transient COUPLE pressure projection.
+    """
 
-# 设法兼容一下3D和2D
-class Jacobi:
-    def __init__(self, coef, beta, device, max_inner=40000, tol=1e-8, report_interval=500):
-        """
-            coef: dict, including ac, af, aff
-            beta: RHS
-        """
-        self.coef = coef
-        self.beta = beta
-        self.device = device
-        self.max_inner = max_inner
-        self.tol = tol
-        self.report_interval = report_interval
+    def __init__(self, flow: Any):
+        self.flow = flow
 
-    # 测试用的雅各比迭代(2D用于验证程序正确性), 参数为P_stencil模板, 2d形态，每轮迭代作为预条件器使用
-    def solve2d(self, P_prime, P_prime_old):
-        alpha_C = self.coef["C"]
-        alpha_E = self.coef["E"]
-        alpha_W = self.coef["W"]
-        alpha_N = self.coef["N"]
-        alpha_S = self.coef["S"]
-        alpha_NE = self.coef["NE"]
-        alpha_NW = self.coef["NW"]
-        alpha_SE = self.coef["SE"]
-        alpha_SW = self.coef["SW"]
-        beta = self.beta
-        # 约束边界
-        alpha_W[0, :], alpha_NW[0, :], alpha_SW[0, :] = 0, 0, 0
-        alpha_E[-1, :], alpha_NE[-1, :], alpha_SE[-1, :] = 0, 0, 0
+    def _operator(self, p_prime: torch.Tensor, coef: dict[str, torch.Tensor]) -> torch.Tensor:
+        return self._operator_for(p_prime, coef, self.flow.blade_mask)
 
-        for inner_iter in range(self.max_inner):
-            # 获取邻居（周期性已在 neighbor 中处理）
-            P_E = _neighbor(P_prime, "E")
-            P_W = _neighbor(P_prime, "W")
-            P_N = _neighbor(P_prime, "N")
-            P_S = _neighbor(P_prime, "S")
-            P_NE = _neighbor(_neighbor(P_prime_old, "N"), "E")
-            P_NW = _neighbor(_neighbor(P_prime_old, "N"), "W")
-            P_SE = _neighbor(_neighbor(P_prime_old, "S"), "E")
-            P_SW = _neighbor(_neighbor(P_prime_old, "S"), "W")
+    def _operator_for(
+        self,
+        p_prime: torch.Tensor,
+        coef: dict[str, torch.Tensor],
+        blade_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        flow = self.flow
+        p_prime = p_prime.clone()
+        flow._project_theta_periodic(p_prime)
+        pn = flow.neighbor(p_prime, "N")
+        ps = flow.neighbor(p_prime, "S")
+        pt = flow.neighbor(p_prime, "T")
+        pb = flow.neighbor(p_prime, "B")
+        out = coef["C"] * p_prime - (coef["N"] * pn + coef["S"] * ps + coef["T"] * pt + coef["B"] * pb)
+        out[:, :, 0] = p_prime[:, :, 0]
+        out[:, :, -1] = p_prime[:, :, -1]
+        out[:, -1, :] = out[:, 0, :]
+        if blade_mask is not None and blade_mask.shape == p_prime.shape:
+            out[blade_mask] = p_prime[blade_mask]
+        return out
 
-            # 径向边界镜像修正（与 momentum 一致）
-            P_E[-1, :] = P_prime[-1, :]  # 外边界 E 面用外壁值
-            P_W[0, :] = P_prime[0, :]  # 内边界 W 面用内壁值
-            # 角点也需相应修正（因涉及 NE, SE 等）
-            P_NE[-1, :] = P_N[-1, :]
-            P_SE[-1, :] = P_S[-1, :]
-            P_NW[0, :] = P_N[0, :]
-            P_SW[0, :] = P_S[0, :]
+    def _project(self, x: torch.Tensor, blade_mask: torch.Tensor | None = None) -> torch.Tensor:
+        flow = self.flow
+        x[:, :, 0] = 0.0
+        x[:, :, -1] = 0.0
+        flow._project_theta_periodic(x)
+        if blade_mask is not None and blade_mask.shape == x.shape:
+            x[blade_mask] = 0.0
+        return x
 
-            rhs = (alpha_E * P_E + alpha_W * P_W + alpha_N * P_N + alpha_S * P_S +
-                   alpha_NE * P_NE + alpha_NW * P_NW + alpha_SE * P_SE + alpha_SW * P_SW +
-                   beta)
-            P_prime_new = rhs / (alpha_C + 1e-12)
-            omega = 0.3
-            P_prime = (1 - omega) * P_prime + omega * P_prime_new
+    @staticmethod
+    def _pool_keep_r(x: torch.Tensor) -> torch.Tensor:
+        nr, nt, nz = x.shape
+        nt_even = nt - (nt % 2)
+        nz_even = nz - (nz % 2)
+        x_even = x[:, :nt_even, :nz_even]
+        pooled = F.avg_pool2d(x_even.unsqueeze(1), kernel_size=2, stride=2).squeeze(1)
+        if pooled.shape[1] >= 2:
+            pooled[:, -1, :] = pooled[:, 0, :]
+        pooled[:, :, 0] = 0.0
+        pooled[:, :, -1] = 0.0
+        return pooled
 
-            # ===== 内迭代收敛监控 =====
-            residual = rhs-P_prime*alpha_C
-            res_inner = torch.max(torch.abs(residual)).item()
-            res = torch.mean(torch.abs(P_prime - P_prime_new))
+    @staticmethod
+    def _prolong_keep_r(x: torch.Tensor, target_shape: torch.Size | tuple[int, int, int]) -> torch.Tensor:
+        _, nt, nz = target_shape
+        out = x.repeat_interleave(2, dim=1).repeat_interleave(2, dim=2)
+        if out.shape[1] < nt:
+            out = torch.cat([out, out[:, : nt - out.shape[1], :]], dim=1)
+        if out.shape[2] < nz:
+            out = torch.cat([out, out[:, :, -1:].expand(-1, -1, nz - out.shape[2])], dim=2)
+        out = out[:, :nt, :nz]
+        if out.shape[1] >= 2:
+            out[:, -1, :] = out[:, 0, :]
+        out[:, :, 0] = 0.0
+        out[:, :, -1] = 0.0
+        return out
 
-            # 验证压力方程
-            if (inner_iter+1) % self.report_interval == 0:
-                print(f"  Jacobi inner_iter={inner_iter+1}, res={res:.3e}")
+    def coefficients(
+        self,
+        inv_theta: torch.Tensor,
+        inv_z: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        flow = self.flow
+        dtheta_c = flow.dA * inv_theta
+        dz_c = flow.dA * inv_z
+        dtheta_n = 0.5 * (dtheta_c + flow.neighbor(dtheta_c, "N"))
+        dtheta_s = 0.5 * (dtheta_c + flow.neighbor(dtheta_c, "S"))
+        dz_t = 0.5 * (dz_c + flow.neighbor(dz_c, "T"))
+        dz_b = 0.5 * (dz_c + flow.neighbor(dz_c, "B"))
+        phi_n, phi_s, phi_t, phi_b = flow._face_opening()
 
-            # 内迭代提前停止说明
-            if res < self.tol:
-                print(f"  inner converged at {inner_iter+1}, res={res_inner:.3e}")
-                break
-            # 固定一个压力点
-            P_prime[0, 0] = 0.0
+        alpha_n = phi_n * (flow.K_theta_C**2) * flow.Eu_omega * dtheta_n * flow.theta_area / flow.dTheta
+        alpha_s = phi_s * (flow.K_theta_C**2) * flow.Eu_omega * dtheta_s * flow.theta_area / flow.dTheta
+        alpha_t = phi_t * (flow.Lambda**2) * flow.Eu_omega * dz_t * flow.z_area / flow.dZ
+        alpha_b = phi_b * (flow.Lambda**2) * flow.Eu_omega * dz_b * flow.z_area / flow.dZ
+        alpha_c = alpha_n + alpha_s + alpha_t + alpha_b + 1e-12
 
-        print("Maximum P_prime: ", torch.max(torch.abs(P_prime)).cpu().numpy(),
-              ", Avg P_prime: ", torch.mean(torch.abs(P_prime)).cpu().numpy())
-        return P_prime
+        for field in (alpha_n, alpha_s, alpha_t, alpha_b, alpha_c, beta):
+            field[:, :, 0] = 0.0
+            field[:, :, -1] = 0.0
+            field[:, -1, :] = field[:, 0, :]
+        alpha_c[:, :, 0] = 1.0
+        alpha_c[:, :, -1] = 1.0
 
+        return {
+            "C": alpha_c,
+            "N": alpha_n,
+            "S": alpha_s,
+            "T": alpha_t,
+            "B": alpha_b,
+        }
 
-# 工程中用的BiCGStab
-class BiCGStab:
-    def __init__(self, coef, beta, device="cuda", max_inner=40000, tol=1e-8, report_interval=500):
-        self.coef = coef
-        self.beta = beta
-        self.device = device
-        self.max_inner = max_inner
-        self.tol = tol
-        self.report_interval = report_interval
-
-    def apply_A_2D(self, P):
-        """
-        计算 A @ P
-        """
-        alpha_C = self.coef["C"]
-        alpha_E = self.coef["E"]
-        alpha_W = self.coef["W"]
-        alpha_N = self.coef["N"]
-        alpha_S = self.coef["S"]
-        alpha_NE = self.coef["NE"]
-        alpha_NW = self.coef["NW"]
-        alpha_SE = self.coef["SE"]
-        alpha_SW = self.coef["SW"]
-
-        # neighbor
-        def nb(x, d):
-            return torch.roll(x, shifts={"E": -1, "W": 1, "N": -1, "S": 1}[d],
-                              dims={"E": 0, "W": 0, "N": 1, "S": 1}[d])
-
-        P_E = nb(P, "E")
-        P_W = nb(P, "W")
-        P_N = nb(P, "N")
-        P_S = nb(P, "S")
-
-        P_NE = nb(nb(P, "N"), "E")
-        P_NW = nb(nb(P, "N"), "W")
-        P_SE = nb(nb(P, "S"), "E")
-        P_SW = nb(nb(P, "S"), "W")
-
-        # 径向边界镜像 (零梯度边界条件)
-        P_E[-1, :] = P[-1, :]
-        P_W[0, :] = P[0, :]
-
-        P_NE[-1, :] = P_N[-1, :]
-        P_SE[-1, :] = P_S[-1, :]
-        P_NW[0, :] = P_N[0, :]
-        P_SW[0, :] = P_S[0, :]
-
-        AP = (
-                alpha_C * P
-                - (alpha_E * P_E + alpha_W * P_W +
-                   alpha_N * P_N + alpha_S * P_S +
-                   alpha_NE * P_NE + alpha_NW * P_NW +
-                   alpha_SE * P_SE + alpha_SW * P_SW)
+    def correction_gradient(self, p_prime: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        flow = self.flow
+        gt_prime = flow.dA * flow.Eu_omega * flow.K_theta_C * flow._pressure_gradient_theta(p_prime)
+        gz_prime = (
+            flow.dA
+            * flow.Eu_omega
+            * (flow.Lambda / max(flow.Ku, 1e-12))
+            * flow._pressure_gradient_z(p_prime)
         )
+        return gt_prime, gz_prime
 
-        # 【核心修复1】：在矩阵映射层面锁定 [0,0] 点，打破奇异性
-        AP[0, 0] = P[0, 0]
+    def solve_bicgstab(self, coef: dict[str, torch.Tensor], beta: torch.Tensor) -> torch.Tensor:
+        flow = self.flow
+        x = flow.P_prime.clone()
+        x[:, :, 0] = 0.0
+        x[:, :, -1] = 0.0
+        flow._project_theta_periodic(x)
+        b = beta.clone()
+        b[:, :, 0] = 0.0
+        b[:, :, -1] = 0.0
+        b[:, -1, :] = b[:, 0, :]
+        if flow.blade_mask is not None:
+            b[flow.blade_mask] = 0.0
+            x[flow.blade_mask] = 0.0
 
-        return AP
-
-    def solve2d(self, x0):
-        """
-        BiCGStab 主求解器
-        """
-        # 在SIMPLE算法中，压力修正量 P' 的初值永远应该给 0，不要继承上一步的 P'
-        x = torch.zeros_like(x0)
-
-        b = self.beta.clone()
-        # 对应 AP[0,0] = P[0,0]，将源项的这个点设为 0
-        b[0, 0] = 0.0
-
-        r = b - self.apply_A_2D(x)
+        r = b - self._operator(x, coef)
         r_hat = r.clone()
-
-        rho_old = torch.tensor(1.0, device=self.device)
-        alpha = torch.tensor(1.0, device=self.device)
-        omega = torch.tensor(1.0, device=self.device)
-
+        rho_old = torch.tensor(1.0, device=flow.device)
+        alpha = torch.tensor(1.0, device=flow.device)
+        omega = torch.tensor(1.0, device=flow.device)
         v = torch.zeros_like(x)
         p = torch.zeros_like(x)
-        res = torch.norm(r)
-        for k in range(self.max_inner):
+
+        for _ in range(flow.pressure_max_inner):
             rho_new = torch.sum(r_hat * r)
-            if (k + 1) % self.report_interval == 0:
-                print(f"  BiCG iter={k + 1}, res={res.item():.3e}")
-            # 安全检查：允许负数，但如果是真正的 0 则中断避免除零错误
-            if torch.abs(rho_new) < 1e-10 or torch.abs(rho_old) < 1e-10 or torch.abs(omega) < 1e-10:
+            if torch.abs(rho_new) < 1e-30 or torch.abs(rho_old) < 1e-30 or torch.abs(omega) < 1e-30:
                 break
             beta_k = (rho_new / rho_old) * (alpha / omega)
             p = r + beta_k * (p - omega * v)
-            v = self.apply_A_2D(p)
+            v = self._operator(p, coef)
             den_alpha = torch.sum(r_hat * v)
-            if torch.abs(den_alpha) < 1e-10:
+            if torch.abs(den_alpha) < 1e-30:
                 break
             alpha = rho_new / den_alpha
             s = r - alpha * v
-            if torch.norm(s) < self.tol:
+            if torch.linalg.vector_norm(s) < flow.pressure_tol:
                 x = x + alpha * p
                 break
-            t = self.apply_A_2D(s)
+            t = self._operator(s, coef)
             tt = torch.sum(t * t)
-            if torch.abs(tt) < 1e-10:
+            if torch.abs(tt) < 1e-30:
                 break
             omega = torch.sum(t * s) / tt
-
             x = x + alpha * p + omega * s
+            x[:, :, 0] = 0.0
+            x[:, :, -1] = 0.0
+            flow._project_theta_periodic(x)
+            if flow.blade_mask is not None:
+                x[flow.blade_mask] = 0.0
             r = s - omega * t
-
             rho_old = rho_new
-
-            res = torch.norm(r)
-
-            if res < self.tol:
-                print(f"BiCG converged at iter={k + 1}, res={res.item():.3e}")
+            if torch.linalg.vector_norm(r) < flow.pressure_tol:
                 break
 
-        print(
-            f"Maximum P_prime: {torch.max(torch.abs(x)).item():.6f}, Avg P_prime: {torch.mean(torch.abs(x)).item():.6f}")
+        x[:, :, 0] = 0.0
+        x[:, :, -1] = 0.0
+        flow._project_theta_periodic(x)
+        if flow.blade_mask is not None:
+            x[flow.blade_mask] = 0.0
         return x
 
+    def solve_jacobi(self, coef: dict[str, torch.Tensor], beta: torch.Tensor) -> torch.Tensor:
+        flow = self.flow
+        x = flow.P_prime.clone()
+        x[:, :, 0] = 0.0
+        x[:, :, -1] = 0.0
+        flow._project_theta_periodic(x)
+        beta = beta.clone()
+        beta[:, :, 0] = 0.0
+        beta[:, :, -1] = 0.0
+        beta[:, -1, :] = beta[:, 0, :]
 
-class GMG:
-    def __init__(self, coef, device="cuda", levels=3, pre_smooth=3, post_smooth=3):
-        """
-        coef: dict with keys C, E, W, N, S
-        """
-        self.device = device
-        self.levels = levels
-        self.pre = pre_smooth
-        self.post = post_smooth
-
-        self.hierarchy = self.build_hierarchy(coef)
-
-    # ===============================
-    # 构建多层网格
-    # ===============================
-    def build_hierarchy(self, coef):
-        levels = []
-        current = coef
-
-        for _ in range(self.levels):
-            levels.append(current)
-
-            # 最粗网格停止
-            if current["C"].shape[0] <= 4:
+        for _ in range(flow.pressure_max_inner):
+            rhs = (
+                coef["N"] * flow.neighbor(x, "N")
+                + coef["S"] * flow.neighbor(x, "S")
+                + coef["T"] * flow.neighbor(x, "T")
+                + coef["B"] * flow.neighbor(x, "B")
+                + beta
+            )
+            x_new = rhs / torch.clamp(coef["C"], min=1e-12)
+            x_new[:, :, 0] = 0.0
+            x_new[:, :, -1] = 0.0
+            flow._project_theta_periodic(x_new)
+            if flow.blade_mask is not None:
+                x_new[flow.blade_mask] = 0.0
+            err = torch.mean(torch.abs(x_new - x))
+            x = 0.75 * x_new + 0.25 * x
+            if err < flow.pressure_tol:
                 break
+        return x
 
-            current = self.coarsen(current)
-
-        return levels
-
-    # ===============================
-    # 粗化（2x降采样）
-    # ===============================
-    def coarsen(self, coef):
-        def downsample(x):
-            return x[::2, ::2]
-
-        return {
-            "C": downsample(coef["C"]),
-            "E": downsample(coef["E"]),
-            "W": downsample(coef["W"]),
-            "N": downsample(coef["N"]),
-            "S": downsample(coef["S"]),
-        }
-
-    # ===============================
-    # 邻居（周期）
-    # ===============================
-    def nb(self, x, d):
-        return torch.roll(
-            x,
-            shifts={"E": -1, "W": 1, "N": -1, "S": 1}[d],
-            dims={"E": 0, "W": 0, "N": 1, "S": 1}[d]
+    def _coarsen_coef(self, coef: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        coarse = {name: self._pool_keep_r(value) for name, value in coef.items()}
+        for name in ("N", "S", "T", "B"):
+            coarse[name][:, :, 0] = 0.0
+            coarse[name][:, :, -1] = 0.0
+            coarse[name][:, -1, :] = coarse[name][:, 0, :]
+        coarse["C"] = torch.clamp(
+            coarse["N"] + coarse["S"] + coarse["T"] + coarse["B"],
+            min=1e-12,
         )
+        coarse["C"][:, :, 0] = 1.0
+        coarse["C"][:, :, -1] = 1.0
+        if coarse["C"].shape[1] >= 2:
+            coarse["C"][:, -1, :] = coarse["C"][:, 0, :]
+        return coarse
 
-    # ===============================
-    # A @ x
-    # ===============================
-    def apply_A(self, coef, x):
-        C = coef["C"]
-        E = coef["E"]
-        W = coef["W"]
-        N = coef["N"]
-        S = coef["S"]
-
-        xE = self.nb(x, "E")
-        xW = self.nb(x, "W")
-        xN = self.nb(x, "N")
-        xS = self.nb(x, "S")
-
-        # 径向镜像
-        xE[-1, :] = x[-1, :]
-        xW[0, :] = x[0, :]
-
-        Ax = C * x - (E * xE + W * xW + N * xN + S * xS)
-
-        # 锁点
-        Ax[0, 0] = x[0, 0]
-
-        return Ax
-
-    # ===============================
-    # Jacobi smoother
-    # ===============================
-    def smooth(self, coef, b, x):
-        C = coef["C"]
-        E = coef["E"]
-        W = coef["W"]
-        N = coef["N"]
-        S = coef["S"]
-
-        for _ in range(self.pre):
-            xE = self.nb(x, "E")
-            xW = self.nb(x, "W")
-            xN = self.nb(x, "N")
-            xS = self.nb(x, "S")
-
-            xE[-1, :] = x[-1, :]
-            xW[0, :] = x[0, :]
-
-            rhs = E * xE + W * xW + N * xN + S * xS + b
-            x_new = rhs / (C + 1e-12)
-
-            # 松弛
-            x = 0.7 * x_new + 0.3 * x
-
-            x[0, 0] = 0.0
-
+    def _smooth_gmg(
+        self,
+        coef: dict[str, torch.Tensor],
+        beta: torch.Tensor,
+        x: torch.Tensor,
+        steps: int,
+        omega: float,
+    ) -> torch.Tensor:
+        for _ in range(steps):
+            residual = beta - self._operator_for(x, coef, None)
+            x = x + omega * residual / torch.clamp(coef["C"], min=1e-12)
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            self._project(x)
         return x
 
-    # ===============================
-    # Restriction（下采样）
-    # ===============================
-    def restrict(self, r):
-        return r[::2, ::2]
+    def _v_cycle(
+        self,
+        coef_levels: list[dict[str, torch.Tensor]],
+        level: int,
+        beta: torch.Tensor,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        flow = self.flow
+        coef = coef_levels[level]
+        if level == len(coef_levels) - 1 or min(x.shape[1], x.shape[2]) <= 4:
+            return self._smooth_gmg(coef, beta, x, 30, flow.gmg_omega)
 
-    # ===============================
-    # Prolongation（插值）
-    # ===============================
-    def prolong(self, ec, shape):
-        ef = torch.zeros(shape, device=self.device)
-
-        # 1️⃣ 粗点直接赋值
-        ef[::2, ::2] = ec
-
-        # 2️⃣ x方向插值（行方向）
-        ef[1:-1:2, ::2] = 0.5 * (ec[:-1, :] + ec[1:, :])
-
-        # 边界（最后一行复制）
-        ef[-1, ::2] = ec[-1, :]
-
-        # 3️⃣ y方向插值（列方向）
-        ef[:, 1:-1:2] = 0.5 * (ef[:, :-2:2] + ef[:, 2::2])
-
-        # 边界（最后一列复制）
-        ef[:, -1] = ef[:, -2]
-
-        return ef
-
-    # ===============================
-    # V-cycle
-    # ===============================
-    def v_cycle(self, level, b, x):
-
-        coef = self.hierarchy[level]
-
-        # 最粗网格：直接迭代
-        if level == len(self.hierarchy) - 1:
-            for _ in range(20):
-                x = self.smooth(coef, b, x)
-            return x
-
-        # 1️⃣ 预平滑
-        x = self.smooth(coef, b, x)
-
-        # 2️⃣ 残差
-        r = b - self.apply_A(coef, x)
-
-        # 3️⃣ restrict
-        r_c = self.restrict(r)
-
-        # 4️⃣ coarse solve
-        ec = torch.zeros_like(r_c)
-        ec = self.v_cycle(level + 1, r_c, ec)
-
-        # 5️⃣ prolong
-        x = x + self.prolong(ec, x.shape)
-
-        # 6️⃣ 后平滑
-        for _ in range(self.post):
-            x = self.smooth(coef, b, x)
-
+        x = self._smooth_gmg(coef, beta, x, flow.gmg_pre_smooth, flow.gmg_omega)
+        residual = beta - self._operator_for(x, coef, None)
+        residual_c = self._pool_keep_r(residual)
+        error_c = torch.zeros_like(residual_c)
+        error_c = self._v_cycle(coef_levels, level + 1, residual_c, error_c)
+        x = x + self._prolong_keep_r(error_c, x.shape)
+        self._project(x)
+        x = self._smooth_gmg(coef, beta, x, flow.gmg_post_smooth, flow.gmg_omega)
         return x
 
-    # ===============================
-    # 外部接口
-    # ===============================
-    def solve(self, b, max_iter=20):
-        x = torch.zeros_like(b)
+    def solve_gmg(self, coef: dict[str, torch.Tensor], beta: torch.Tensor) -> torch.Tensor:
+        flow = self.flow
+        beta = beta.clone()
+        beta[:, :, 0] = 0.0
+        beta[:, :, -1] = 0.0
+        if beta.shape[1] >= 2:
+            beta[:, -1, :] = beta[:, 0, :]
+        if flow.blade_mask is not None and flow.blade_mask.shape == beta.shape:
+            beta[flow.blade_mask] = 0.0
 
-        for k in range(max_iter):
-            x = self.v_cycle(0, b, x)
-
-            r = b - self.apply_A(self.hierarchy[0], x)
-            res = torch.norm(r)
-
-            print(f"  GMG iter={k+1}, res={res.item():.3e}")
-
-            if res < 1e-8:
+        coef_levels = [coef]
+        for _ in range(1, flow.gmg_levels):
+            last_shape = coef_levels[-1]["C"].shape
+            if min(last_shape[1], last_shape[2]) <= 4:
                 break
+            coef_levels.append(self._coarsen_coef(coef_levels[-1]))
 
-        return x
+        x = flow.P_prime.clone()
+        if x.shape != beta.shape:
+            x = torch.zeros_like(beta)
+        x = self._project(x, flow.blade_mask)
+
+        rhs_norm = torch.linalg.vector_norm(beta).item()
+        for _ in range(flow.gmg_cycles):
+            x = self._v_cycle(coef_levels, 0, beta, x)
+            residual = beta - self._operator_for(x, coef, flow.blade_mask)
+            res_norm = torch.linalg.vector_norm(residual).item()
+            if res_norm < flow.pressure_tol * max(rhs_norm, 1.0):
+                break
+        return self._project(x, flow.blade_mask)
+
+    def solve_system(self, coef: dict[str, torch.Tensor], beta: torch.Tensor) -> torch.Tensor:
+        solver_name = self.flow.pressure_solver
+        if solver_name == "jacobi":
+            return self.solve_jacobi(coef, beta)
+        if solver_name == "gmg":
+            return self.solve_gmg(coef, beta)
+        return self.solve_bicgstab(coef, beta)
+
+    def simple_step(self) -> None:
+        flow = self.flow
+        inv_theta = flow.phi / torch.clamp(flow.A_theta + (1.0 - flow.phi), min=1e-12)
+        inv_z = flow.phi / torch.clamp(flow.A_z + (1.0 - flow.phi), min=1e-12)
+
+        ut_n_face, ut_s_face, uz_t_face, uz_b_face = flow.rhie_chow(
+            flow.UT_tilde,
+            flow.Uz_tilde,
+            flow.P,
+            flow.A_theta,
+            flow.A_z,
+        )
+        fn, fs, ft, fb = flow._face_fluxes(ut_n_face, ut_s_face, uz_t_face, uz_b_face)
+        phi_n, phi_s, phi_t, phi_b = flow._face_opening()
+        fn = fn * phi_n
+        fs = fs * phi_s
+        ft = ft * phi_t
+        fb = fb * phi_b
+        beta = -(fn + fs + ft + fb)
+        coef = self.coefficients(inv_theta, inv_z, beta)
+        p_prime = self.solve_system(coef, beta)
+        flow.P_prime = p_prime
+
+        gt_prime, gz_prime = self.correction_gradient(p_prime)
+        ut_corr = flow.UT_tilde - inv_theta * gt_prime
+        uz_corr = flow.Uz_tilde - inv_z * gz_prime
+        flow.UT = flow.UT + flow.u_relax * (ut_corr - flow.UT)
+        flow.Uz = flow.Uz + flow.u_relax * (uz_corr - flow.Uz)
+        flow.P = flow.P + flow.p_relax * p_prime
+
+    def project(
+        self,
+        inv_theta: torch.Tensor,
+        inv_z: torch.Tensor,
+        beta: torch.Tensor,
+        relax: float,
+        velocity_update_limit: float | None = None,
+        pressure_update_limit: float | None = None,
+    ) -> torch.Tensor:
+        flow = self.flow
+        pcoef = self.coefficients(inv_theta, inv_z, beta)
+        p_prime = self.solve_system(pcoef, beta)
+        gt_prime, gz_prime = self.correction_gradient(p_prime)
+
+        d_ut = -relax * inv_theta * gt_prime
+        d_uz = -relax * inv_z * gz_prime
+        d_p = relax * p_prime
+        scale = min(
+            flow._velocity_update_scale(d_ut, d_uz, velocity_update_limit),
+            flow._pressure_update_scale(d_p, pressure_update_limit),
+        )
+        if scale <= 0.0:
+            flow.P_prime = torch.zeros_like(p_prime)
+            return flow.P_prime
+
+        flow.P_prime = scale * p_prime
+        flow.UT = flow.UT + scale * d_ut
+        flow.Uz = flow.Uz + scale * d_uz
+        flow.P = flow.P + scale * d_p
+        flow._apply_boundary()
+        return flow.P_prime

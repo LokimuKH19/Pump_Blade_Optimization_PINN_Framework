@@ -1,739 +1,1145 @@
-# DataGenerator.py
+﻿from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import sys
+from typing import Any
+
 from BladeImport import attach_blade_to_solver
 import matplotlib.pyplot as plt
 import numpy as np
+from PressureUpdaters import PressureUpdater
 import torch
 
-import PressureUpdaters
+
+@dataclass
+class SolveLog:
+    method: str
+    converged: bool
+    iterations: int
+    final_momentum: float
+    final_mass: float
+    final_update: float
+    final_q_hat: float
+    delta_p: float
 
 
-# 最早是个二维程序，现在要按照pdf内容改成三维程序
 class BladeCalc:
-    """
-    三维叶片环形库埃特流动求解器
-    使用有限体积法和SIMPLE算法
-    坐标为归一化柱坐标 R 和 Theta
-    注意周期性边界条件的Theta控制体j的特殊性
-    i = 1~N-2
-    j = 0~N-1
-    k = 1~N-2
+    """Slice-wise 2D cylindrical-layer flow generator.
+
+    The R direction is treated as a batch of independent cylindrical layers.
+    Each layer solves a collocated FVM system on the Theta-Z plane, using
+    Rhie-Chow interpolation and SIMPLE pressure correction.
     """
 
-    def __init__(self, n=64, rh=2.0, rs=4.0, h=8.0,
-                 mu=1.0, rho=1.0, omega=1.0, qv=1.0, n_blade=1,
-                 max_iter=5000, tol=1e-6,
-                 u_relax=0.5, p_relax=0.3,
-                 device="cuda", z0=0.0, blade_params="blade_params.json"):
+    def __init__(
+        self,
+        n: int = 64,
+        rh: float = 2.0,
+        rs: float = 4.0,
+        h: float = 8.0,
+        mu: float = 1.0,
+        rho: float = 1.0,
+        omega: float = 1.0,
+        qv: float = 1.0,
+        n_blade: int = 1,
+        max_iter: int = 5000,
+        tol: float = 1e-6,
+        u_relax: float = 0.5,
+        p_relax: float = 0.3,
+        device: str = "cuda",
+        z0: float = 0.0,
+        blade_params: str | Path | None = "blade_params.json",
+        absolute_frame: bool = True,
+        delta_p_initial: float = 0.0,
+        pressure_solver: str = "bicgstab",
+        pressure_max_inner: int = 600,
+        pressure_tol: float = 1e-8,
+        ibm_C: float = 1.0,
+        ibm_epsilon: float = 0.025,
+        pseudo_dt: float = 0.001,
+        rans_model: str = "none",
+        rans_mixing_length: float = 0.08,
+        rans_nut_max_ratio: float = 250.0,
+        local_pseudo_dt: bool = False,
+        pseudo_cfl: float = 2.0,
+    ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
-        print("---Initializing Constants...---")
-        self.g = 9.8    # 重力加速度
-        self.n = n    # 旋转平面的点数
-        self.rh = rh   # 轮毂半径
-        self.rs = rs   # 轮缘半径
-        self.h = h    # 流道总高度
-        self.z0 = z0
-        self.mu = mu    # 动力粘度
-        self.rho = rho    # 密度
-        self.nu = mu / rho    # 运动粘度
-        self.omega = omega    # 转子角速度
-        self.qv = qv  # 出口体积流量
-        self.n_blade = n_blade    # 叶片数，没有叶片的时候为1否则为叶片数
-        self.theta0 = 2*np.pi/self.n_blade    # 角度范围
-        self.blade_params = blade_params  # 叶片定义
+        self.g = 9.8
+        self.n = int(n)
+        if self.n < 48:
+            print(
+                f"Warning: n={self.n} is intended only for debugging. "
+                "IBM blade geometry is under-resolved on coarse grids, so convergence behavior is not representative."
+            )
+        self.rh = float(rh)
+        self.rs = float(rs)
+        self.h = float(h)
+        self.z0 = float(z0)
+        self.mu = float(mu)
+        self.rho = float(rho)
+        self.nu = self.mu / self.rho
+        self.omega = float(omega)
+        self.omega_abs = max(abs(self.omega), 1e-12)
+        self.sgn_omega = 1.0 if self.omega >= 0.0 else -1.0
+        self.qv = float(qv)
+        self.n_blade = int(n_blade)
+        self.n_blades = self.n_blade
+        self.theta0 = 2.0 * np.pi / self.n_blade
+        self.blade_params = None if blade_params is None else str(blade_params)
+        self.absolute_frame = bool(absolute_frame)
 
-        self.max_iter = max_iter    # 最大迭代轮
-        self.tol = tol    # 允差
-        self.u_relax = u_relax   # 速度松弛因子
-        self.p_relax = p_relax   # 压力松弛因子
+        self.max_iter = int(max_iter)
+        self.tol = float(tol)
+        self.u_relax = float(u_relax)
+        self.p_relax = float(p_relax)
+        self.pressure_solver = str(pressure_solver).lower()
+        self.pressure_max_inner = int(pressure_max_inner)
+        self.pressure_tol = float(pressure_tol)
+        self.pseudo_dt = max(float(pseudo_dt), 1e-6)
+        self.local_pseudo_dt = bool(local_pseudo_dt)
+        self.pseudo_cfl = max(float(pseudo_cfl), 1e-6)
 
-        self.delta_r = rs - rh    # 流道宽度
-        self.u_omega = rs * self.omega    # 参考旋转平面速度
-        self.u_zo = self.qv / np.pi / (self.rs**2-self.rh**2)    # 参考轴向速度
-        self.P0 = self.rho * (self.u_omega ** 2 / 2 + self.u_zo ** 2 / 2 + self.g * self.h)    # 参考压力
-        self.Re_omega = self.u_omega * self.delta_r / self.nu    # 旋转雷诺数
-        self.Eu_omega = self.P0 / (self.rho * self.u_omega ** 2)    # 欧拉数
-        self.Gamma = self.delta_r / self.h    # 流道宽高比
-        self.Ku = self.u_zo / self.u_omega    # 参考速度比
+        self.delta_r = self.rs - self.rh
+        if self.delta_r <= 0.0:
+            raise ValueError("rs must be larger than rh.")
+        self.u_omega = self.rs * self.omega_abs
+        self.u_zo = self.qv / (np.pi * (self.rs**2 - self.rh**2))
+        self.P0 = self.rho * (0.5 * self.u_omega**2 + 0.5 * self.u_zo**2 + self.g * self.h)
+        self.Re_omega = self.u_omega * self.delta_r / max(self.nu, 1e-30)
+        self.Eu_omega = self.P0 / (self.rho * self.u_omega**2)
+        self.Lambda = self.delta_r / self.h
+        self.Ku = self.u_zo / self.u_omega
         self.delta = self.delta_r / self.rs
-        self.sgn_omega = 1.0 if self.omega >= 0 else -1.0
+        self.G_star = self.g * self.delta_r / (self.u_omega * max(self.u_zo, 1e-30))
 
-        # 生成该求解的东西
-        print("---Preparing Variables...---")
-        self.P = torch.zeros((n, n, n), device=self.device)
-        self.UR = 0.01*torch.randn((n, n, n), device=self.device)
-        self.UT = 0.01*torch.randn((n, n, n), device=self.device)
-        self.UR_tilde = torch.zeros((n, n, n), device=self.device)    # 存储动量方程专用更新
-        self.UT_tilde = torch.zeros((n, n, n), device=self.device)    # 存储动量方程专用更新
-        self.Uz_tilde = torch.zeros((n, n, n), device=self.device)
-        self.P_prime = torch.zeros((n, n, n), device=self.device)    # 存储压力修正值
-        self.UR_prime = torch.zeros((n, n, n), device=self.device)    # 存储动量方程更新系数 # todo 可能要改，不一定用得上
-        self.UT_prime = torch.zeros((n, n, n), device=self.device)    # 存储动量方程更新系数
+        self.qv_passage = self.qv / self.n_blade
+        self.qv_hat = self.qv_passage / (self.u_zo * self.delta_r**2 * self.theta0)
+        self.delta_p_global = float(delta_p_initial)
+        self.delta_p_min = 1e-8
+        self.delta_p_max = 1e8
+        self.outer_flow_tol = 2e-3
+        self.delta_p_relax = 0.55
+        self.couple_relax = 0.35
+        self.gmg_levels = 5
+        self.gmg_pre_smooth = 3
+        self.gmg_post_smooth = 3
+        self.gmg_cycles = 8
+        self.gmg_omega = 0.72
+        self.couple_pressure_sweeps = 3
+        self.pressure_projection_relax = 0.8
+        self.couple_momentum_update_limit = 0.35
+        self.couple_pressure_velocity_limit = 0.25
+        self.couple_pressure_update_limit = 0.75
+        self.couple_field_abs_limit = 50.0
+        self.couple_flow_control = False
+        self.couple_flow_control_interval = 20
+        self.couple_flow_control_gain = 0.18
+        self.couple_flow_control_clip = 0.12
+        self.momentum_sweeps = 3
+        self.momentum_solver_relax = 0.75
+        self.couple_pressure_backtracking = True
+        self.couple_pressure_max_momentum_growth = 1.25
+        self.couple_pressure_min_relax = 1e-3
+        self.couple_pressure_interval = 1
+        self.rans_model = str(rans_model).lower()
+        self.rans_mixing_length = max(float(rans_mixing_length), 0.0)
+        self.rans_nut_max_ratio = max(float(rans_nut_max_ratio), 0.0)
+        self.rans_smoothing_steps = 1
+        self.ibm_hard_phi = 0.05
+        self.ibm_C = float(ibm_C)
+        self.ibm_epsilon = float(ibm_epsilon)
 
-        # 生成系数矩阵
-        self.A11 = torch.ones((n, n, n), device=self.device)
-        self.A22 = torch.ones((n, n, n), device=self.device)
-        self.A12 = torch.ones((n, n, n), device=self.device)
-        self.A21 = torch.ones((n, n, n), device=self.device)
-        self.A33 = torch.ones((n, n, n), device=self.device)
+        self._build_grid()
+        self._build_geometry()
+        self._init_fields()
+        self._init_blade_boundary()
+        self._apply_boundary()
 
-        # 叶片定义
+        self.A_theta = torch.ones_like(self.P)
+        self.A_z = torch.ones_like(self.P)
+        self.P_prime = torch.zeros_like(self.P)
+        self.pressure_updater = PressureUpdater(self)
+        self.nut_ratio = torch.zeros_like(self.P)
+        self.UT_tilde = self.UT.clone()
+        self.Uz_tilde = self.Uz.clone()
+        self.last_history: list[dict[str, float]] = []
+        self.iteration_history: list[dict[str, float]] = []
+        self.last_solve_method = ""
+        self._couple_step_count = 0
+
+    def _build_grid(self) -> None:
+        n = self.n
+        if n < 4:
+            raise ValueError("n must be at least 4 for the Theta-Z stencil.")
+        self.dR = 1.0 / (n - 1)
+        self.dTheta = 1.0 / (n - 1)
+        self.dZ = 1.0 / (n - 1)
+
+        r = torch.linspace(0.0, 1.0, n, device=self.device)
+        theta = torch.linspace(0.0, 1.0, n, device=self.device)
+        z = torch.linspace(0.0, 1.0, n, device=self.device)
+        rr, tt, zz = torch.meshgrid(r, theta, z, indexing="ij")
+
+        self.R = rr
+        self.Theta = tt
+        self.Z = zz
+        self.r_hatC = rr + self.rh / self.delta_r
+        self.K_theta_C = 1.0 / torch.clamp(self.r_hatC * self.theta0, min=1e-12)
+
+    def _build_geometry(self) -> None:
+        self.dA = torch.full_like(self.r_hatC, self.dTheta * self.dZ)
+        self.theta_area = torch.full_like(self.r_hatC, self.dZ)
+        self.z_area = torch.full_like(self.r_hatC, self.dTheta)
+
+        r_weight = torch.ones(self.n, device=self.device)
+        theta_weight = torch.ones(self.n, device=self.device)
+        r_weight[0] = r_weight[-1] = 0.5
+        theta_weight[0] = theta_weight[-1] = 0.5
+        self.r_quad_weight = r_weight.view(-1, 1)
+        self.theta_quad_weight = theta_weight.view(1, -1)
+        self.outlet_area_weight = (
+            self.r_hatC[:, :, -1] * self.r_quad_weight * self.theta_quad_weight * self.dR * self.dTheta
+        )
+        self.outlet_area_target = torch.sum(self.outlet_area_weight)
+
+    def _init_fields(self) -> None:
+        shape = self.r_hatC.shape
+        self.P = self.delta_p_global * (1.0 - self.Z)
+        self.UT = torch.zeros(shape, device=self.device)
+        self.Uz = torch.ones(shape, device=self.device)
         self.blade_mask = None
         self.blade_distance = None
         self.blade_distance_z = None
         self.blade_footprint = None
         self.blade_boundary_meta = None
-        self.blade_boundary_band_cells = 1.5    # 边界影响区域
+        self.blade_boundary_band_cells = 1.5
+        self.boundary = None
+        self.phi = torch.ones(shape, device=self.device)
+        self.phi_mask = self.phi
 
-        # 启动
-        print("---Creating Dimensionless Mesh Automatically...---")
-        self._build_grid()
-        self._apply_boundary()
+    def _init_blade_boundary(self) -> None:
+        if self.blade_params is None:
+            return
+        path = Path(self.blade_params)
+        if not path.exists():
+            return
+        self.boundary = self.attach_blade_boundary(path, self.blade_boundary_band_cells)
+        signed_distance = torch.as_tensor(self.boundary.signed_distance, dtype=torch.float32, device=self.device)
+        eps2 = max(self.ibm_epsilon**2, 1e-20)
+        self.phi = 1.0 - torch.exp(-self.ibm_C * signed_distance**2 / eps2)
+        self.phi = torch.clamp(self.phi, 0.0, 1.0)
+        self.phi_mask = self.phi
 
-        # 几何坐标网格定义
-        self.RE = torch.roll(self.R, -1, dims=0)
-        self.RW = torch.roll(self.R, 1, dims=0)
-        self.RC = self.R
-        self.r_hatC = self.R + self.rh / self.delta_r
-        self.r_hatE = self.RE + self.rh / self.delta_r
-        self.r_hatW = self.RW + self.rh / self.delta_r
-        # 相应的界面值
-        self.r_hatEf = 0.5 * (self.r_hatC + self.neighbor(self.r_hatC, "E"))
-        self.r_hatWf = 0.5 * (self.r_hatC + self.neighbor(self.r_hatC, "W"))
-        # 边界处修正：内边界西界面在 R=0 处，r̂ = rh/ΔR
-        self.r_hatWf[0, :] = self.rh / self.delta_r
-        # 外边界东界面在 R=1 处，r̂ = rs/ΔR
-        self.r_hatEf[-1, :] = self.rs / self.delta_r
-        self.r_hatW[0, :] = self.rh / self.delta_r
-        self.r_hatE[-1, :] = self.rs / self.delta_r
-        self.K_theta_C = self.K_theta
-        self.K_theta_Ef = 1.0 / (self.r_hatEf * self.theta0)
-        self.K_theta_Wf = 1.0 / (self.r_hatWf * self.theta0)
-
-        # 面积（内部点对应的界面）
-        self.AE = self.r_hatEf * self.dTheta * self.dZ
-        self.AW = self.r_hatWf * self.dTheta * self.dZ
-        self.AN = self.dR * self.dZ
-        self.AS = self.dR * self.dZ
-        self.AT = self.r_hat * self.dTheta * self.dR
-        self.AB = self.r_hat * self.dTheta * self.dR
-        # 控制体无量纲体积
-        self.dV = self.r_hatC * self.dR * self.dTheta * self.dZ
-
-        # 确认边界
-        print("---Importing Blades...---")
-        self.boundary = self.attach_blade_boundary(self.blade_params, self.blade_boundary_band_cells)
-
-        # 计算蒙版
-        print("---Creating the Blade Mask---")
-        C = 1    # 日后可以学习
-        epsilon = 0.025    # 经验边界层厚度[0.001~0.3]，在算子学习AI版本中可以在CFD中学习
-        self.phi_mask = 1 - torch.exp(-C*torch.tensor(self.boundary.signed_distance, device=self.device)**2/epsilon**2)
-
-    # 第一步：生成n*n网格
-    def _build_grid(self):
-        N = self.n
-        self.dR = 1.0 / (N - 1)
-        self.dTheta = 1.0 / (N - 1)
-        self.dZ = 1.0 / (N - 1)
-        R = torch.linspace(0, 1, N, device=self.device)
-        Theta = torch.linspace(0, 1, N, device=self.device)
-        Z = torch.linspace(0, 1, N, device=self.device)
-        RR, TT = torch.meshgrid(R, Theta, indexing='ij')
-        self.R = RR
-        self.Theta = TT
-        self.Z = Z
-        self.r_hat = RR + self.rh / self.delta_r
-        self.K_theta = 1.0 / (self.r_hat * self.theta0)
-
-    # 传输给，BladeImport.py，这样隔壁就知道归一化的标准是怎样的了
-    def set_blade_boundary(self, boundary_data, band_cells=1.5):
-        def read_field(name):
+    def set_blade_boundary(self, boundary_data: Any, band_cells: float = 1.5) -> None:
+        def read_field(name: str) -> Any:
             if isinstance(boundary_data, dict):
                 return boundary_data[name]
-            # 正常来说是个类，不是字典
             return getattr(boundary_data, name)
 
         self.blade_mask = torch.as_tensor(read_field("mask"), dtype=torch.bool, device=self.device)
-        self.blade_distance = torch.as_tensor(
-            read_field("signed_distance"),    # 新版欧氏距离
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.blade_distance_z = torch.as_tensor(
-            read_field("signed_distance_z"),    # 旧版z距离
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.blade_footprint = torch.as_tensor(
-            read_field("footprint_mask"),
-            dtype=torch.bool,
-            device=self.device,
-        )
+        self.blade_distance = torch.as_tensor(read_field("signed_distance"), dtype=torch.float32, device=self.device)
+        self.blade_distance_z = torch.as_tensor(read_field("signed_distance_z"), dtype=torch.float32, device=self.device)
+        self.blade_footprint = torch.as_tensor(read_field("footprint_mask"), dtype=torch.bool, device=self.device)
         self.blade_boundary_meta = read_field("metadata")
         self.blade_boundary_band_cells = float(band_cells)
-        self._apply_boundary()
 
-    # 传入blade, 输出标记的boundary
-    def attach_blade_boundary(self, blade_params_path="blade_params.json", band_cells=1.5):
+    def attach_blade_boundary(self, blade_params_path: str | Path = "blade_params.json", band_cells: float = 1.5):
         return attach_blade_to_solver(self, blade_params_path, band_cells=band_cells)
 
-    # 辅助整定边界条件
-    def _apply_boundary(self):
-        self.UR[0, :, :] = 0.0
-        self.UR[-1, :, :] = 0.0
-        self.UT[0, :, :] = self.rh*self.omega    # 转子角速度
-        self.UT[-1, :, :] = 0.0
+    def _solid_ut(self) -> torch.Tensor:
+        if not self.absolute_frame:
+            return torch.zeros_like(self.r_hatC)
+        return self.sgn_omega * self.delta * self.r_hatC
 
-        if self.blade_mask is None:
-            return
+    def _hard_solid_mask(self) -> torch.Tensor:
+        return self.phi <= self.ibm_hard_phi
 
-        # 边界硬约束
-        distance_field = self.blade_distance_z if self.blade_distance_z is not None else self.blade_distance
-        # todo 这个distance的约束要重新写一下
-        if distance_field is not None:
-            band_width = max(self.blade_boundary_band_cells * self.dZ, self.dZ)
-            # todo 开始改吧
-            wall_weight = torch.clamp(distance_field / band_width, min=0.0, max=1.0)
-            self.UR = self.UR * wall_weight
-            self.UT = self.UT * wall_weight
-            self.UR_tilde = self.UR_tilde * wall_weight
-            self.UT_tilde = self.UT_tilde * wall_weight
+    def _theta_plus(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        out[:, :-1, :] = x[:, 1:, :]
+        out[:, -1, :] = x[:, 1, :]
+        return out
 
-        self.UR[self.blade_mask] = 0.0
-        self.UT[self.blade_mask] = 0.0    # todo 应该是ωr归一化的结果，需要推导一下
-        self.UR_tilde[self.blade_mask] = 0.0
-        self.UT_tilde[self.blade_mask] = 0.0
-        self.P_prime[self.blade_mask] = 0.0
+    def _theta_minus(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        out[:, 1:, :] = x[:, :-1, :]
+        out[:, 0, :] = x[:, -2, :]
+        return out
 
-    # 用于找邻居的方法
-    @staticmethod
-    def neighbor(x, direction):
-        dims = {"E": 0, "W": 0, "N": 1, "S": 1}
-        forward = {"E": -1, "N": -1, "W": 1, "S": 1}
-        return torch.roll(x, forward[direction], dims[direction])
+    def _z_plus(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        out[:, :, :-1] = x[:, :, 1:]
+        out[:, :, -1] = x[:, :, -1]
+        return out
 
-    # 第二步：Rhie-Chow插值
-    def rhie_chow(self, UR, UT, P, A11, A12, A21, A22):
-        dR = self.dR
-        dTheta = self.dTheta
-        K_theta = self.K_theta_C
-        Eu = self.Eu_omega
-        dV = self.dV
-        neighbor = self.neighbor
+    def _z_minus(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        out[:, :, 1:] = x[:, :, :-1]
+        out[:, :, 0] = x[:, :, 0]
+        return out
 
-        # ---------- 径向邻居（需要边界修正） ----------
-        P_ip = neighbor(P, "E")
-        P_im = neighbor(P, "W")
-        UR_ip = neighbor(UR, "E")
-        UR_im = neighbor(UR, "W")
-        A11_ip = neighbor(A11, "E")
-        A11_im = neighbor(A11, "W")
-        A12_ip = neighbor(A12, "E")
-        A12_im = neighbor(A12, "W")
-        A21_ip = neighbor(A21, "E")
-        A21_im = neighbor(A21, "W")
-        A22_ip = neighbor(A22, "E")
-        A22_im = neighbor(A22, "W")
+    def neighbor(self, x: torch.Tensor, direction: str) -> torch.Tensor:
+        if direction == "N":
+            return self._theta_plus(x)
+        if direction == "S":
+            return self._theta_minus(x)
+        if direction == "T":
+            return self._z_plus(x)
+        if direction == "B":
+            return self._z_minus(x)
+        raise ValueError(f"unknown direction {direction!r}")
 
-        # ---------- 周向邻居（周期性，无需修正） ----------
-        P_jp = neighbor(P, "N")
-        P_jm = neighbor(P, "S")
-        UT_jp = neighbor(UT, "N")
-        UT_jm = neighbor(UT, "S")
-        A11_jp = neighbor(A11, "N")
-        A11_jm = neighbor(A11, "S")
-        A12_jp = neighbor(A12, "N")
-        A12_jm = neighbor(A12, "S")
-        A21_jp = neighbor(A21, "N")
-        A21_jm = neighbor(A21, "S")
-        A22_jp = neighbor(A22, "N")
-        A22_jm = neighbor(A22, "S")
+    def _project_theta_periodic(self, *fields: torch.Tensor) -> None:
+        for field in fields:
+            field[:, -1, :] = field[:, 0, :]
 
-        # ---------- 径向边界镜像修正 ----------
-        P_ip[-1, :] = P[-1, :]
-        P_im[0, :] = P[0, :]
-        UR_ip[-1, :] = UR[-1, :]
-        UR_im[0, :] = UR[0, :]
-        A11_ip[-1, :] = A11[-1, :]
-        A11_im[0, :] = A11[0, :]
-        A12_ip[-1, :] = A12[-1, :]
-        A12_im[0, :] = A12[0, :]
-        A21_ip[-1, :] = A21[-1, :]
-        A21_im[0, :] = A21[0, :]
-        A22_ip[-1, :] = A22[-1, :]
-        A22_im[0, :] = A22[0, :]
+    def _set_pressure_boundary(self) -> None:
+        self.P[:, :, 0] = self.delta_p_global
+        self.P[:, :, -1] = 0.0
+        self._project_theta_periodic(self.P)
 
-        # ======================
-        # 2. 梯度，同动量方程，中心FVM，面上FDM
-        # ======================
-        GR_C = dV * Eu * (P_ip - P_im) / (2 * dR)
-        GT_C = dV * Eu * K_theta * (P_jp - P_jm) / (2 * dTheta)
+    def _set_velocity_boundary(self) -> None:
+        if self.n > 2:
+            self.UT[:, :, 0] = self.UT[:, :, 1]
+            self.UT[:, :, -1] = self.UT[:, :, -2]
+            self.Uz[:, :, 0] = self.Uz[:, :, 1]
+            self.Uz[:, :, -1] = self.Uz[:, :, -2]
+        self._project_theta_periodic(self.UT, self.Uz)
 
-        # 面梯度
-        GR_e = dV * Eu * (P_ip - P) / dR
-        GR_w = dV * Eu * (P - P_im) / dR
+    def _apply_ibm(self) -> None:
+        solid_ut = self._solid_ut()
+        hard_solid = self._hard_solid_mask()
+        self.UT = torch.where(hard_solid, solid_ut, self.UT)
+        self.Uz = torch.where(hard_solid, torch.zeros_like(self.Uz), self.Uz)
+        if hasattr(self, "UT_tilde"):
+            self.UT_tilde = torch.where(hard_solid, solid_ut, self.UT_tilde)
+            self.Uz_tilde = torch.where(hard_solid, torch.zeros_like(self.Uz_tilde), self.Uz_tilde)
 
-        GT_n = dV * Eu * K_theta * (P_jp - P) / dTheta
-        GT_s = dV * Eu * K_theta * (P - P_jm) / dTheta
+    def _apply_boundary(self) -> None:
+        self._set_pressure_boundary()
+        self._set_velocity_boundary()
+        self._apply_ibm()
+        self._project_theta_periodic(self.UT, self.Uz, self.P)
 
-        # ======================
-        # 3. 构造 A^{-1} G P，计算修正速度
-        # ======================
-        def apply_Ainv(GR, GT, a11, a12, a21, a22):
-            det = a11 * a22 - a12 * a21
-            det = torch.clamp(det, min=1e-12)
-            _UR_ = (a22 * GR - a12 * GT) / det
-            _UT_ = (-a21 * GR + a11 * GT) / det
-            return _UR_, _UT_
+    def _pressure_gradient_theta(self, P: torch.Tensor) -> torch.Tensor:
+        return (self.neighbor(P, "N") - self.neighbor(P, "S")) / (2.0 * self.dTheta)
 
-        # 中心
-        URc_corr, UTc_corr = apply_Ainv(GR_C, GT_C, A11, A12, A21, A22)
+    def _pressure_gradient_z(self, P: torch.Tensor) -> torch.Tensor:
+        grad = (self.neighbor(P, "T") - self.neighbor(P, "B")) / (2.0 * self.dZ)
+        grad[:, :, 0] = (P[:, :, 1] - P[:, :, 0]) / self.dZ
+        grad[:, :, -1] = (P[:, :, -1] - P[:, :, -2]) / self.dZ
+        return grad
 
-        # 东邻点
-        UR_ip_corr, UT_ip_corr = apply_Ainv(
-            neighbor(GR_C, "E"), neighbor(GT_C, "E"),
-            A11_ip, A12_ip, A21_ip, A22_ip
+    def _effective_inv_reynolds(self) -> torch.Tensor:
+        inv_re = 1.0 / max(self.Re_omega, 1e-12)
+        if self.rans_model in {"none", "off", "laminar"} or self.rans_mixing_length <= 0.0:
+            self.nut_ratio = torch.zeros_like(self.P)
+            return torch.full_like(self.P, inv_re)
+
+        dUT_dtheta = self._pressure_gradient_theta(self.UT)
+        dUT_dz = self._pressure_gradient_z(self.UT)
+        dUz_dtheta = self._pressure_gradient_theta(self.Uz)
+        dUz_dz = self._pressure_gradient_z(self.Uz)
+
+        s_tt = self.K_theta_C * dUT_dtheta
+        s_zz = self.Ku * self.Lambda * dUz_dz
+        s_tz = self.Lambda * dUT_dz + self.Ku * self.K_theta_C * dUz_dtheta
+        strain = torch.sqrt(torch.clamp(2.0 * (s_tt**2 + s_zz**2) + s_tz**2, min=0.0) + 1e-20)
+
+        mixing_length = torch.full_like(strain, self.rans_mixing_length)
+        if self.blade_distance is not None:
+            wall_distance = torch.clamp(self.blade_distance, min=0.0)
+            mixing_length = torch.minimum(mixing_length, 0.41 * wall_distance + min(self.dTheta, self.dZ))
+
+        damping = torch.clamp(self.phi, 0.0, 1.0) ** 2
+        nut_ratio = (mixing_length**2) * strain * self.Re_omega * damping
+        nut_ratio = torch.clamp(nut_ratio, min=0.0, max=self.rans_nut_max_ratio)
+        for _ in range(max(int(self.rans_smoothing_steps), 0)):
+            nut_ratio = (
+                0.5 * nut_ratio
+                + 0.125
+                * (
+                    self.neighbor(nut_ratio, "N")
+                    + self.neighbor(nut_ratio, "S")
+                    + self.neighbor(nut_ratio, "T")
+                    + self.neighbor(nut_ratio, "B")
+                )
+            )
+            nut_ratio = torch.clamp(nut_ratio, min=0.0, max=self.rans_nut_max_ratio)
+            self._project_theta_periodic(nut_ratio)
+
+        self.nut_ratio = nut_ratio
+        return inv_re * (1.0 + nut_ratio)
+
+    def rhie_chow(
+        self,
+        UT: torch.Tensor,
+        Uz: torch.Tensor,
+        P: torch.Tensor,
+        A_theta: torch.Tensor,
+        A_z: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        A_theta = A_theta + (1.0 - self.phi) * 1.0 + 1e-6
+        A_z = A_z + (1.0 - self.phi) * 1.0 + 1e-6
+        P_n = self.neighbor(P, "N")
+        P_s = self.neighbor(P, "S")
+        P_t = self.neighbor(P, "T")
+        P_b = self.neighbor(P, "B")
+
+        UT_n_cell = self.neighbor(UT, "N")
+        UT_s_cell = self.neighbor(UT, "S")
+        Uz_t_cell = self.neighbor(Uz, "T")
+        Uz_b_cell = self.neighbor(Uz, "B")
+
+        A_theta_n = 0.5 * (A_theta + self.neighbor(A_theta, "N"))
+        A_theta_s = 0.5 * (A_theta + self.neighbor(A_theta, "S"))
+        A_z_t = 0.5 * (A_z + self.neighbor(A_z, "T"))
+        A_z_b = 0.5 * (A_z + self.neighbor(A_z, "B"))
+
+        grad_theta_c = self._pressure_gradient_theta(P)
+        grad_z_c = self._pressure_gradient_z(P)
+        grad_theta_n = self.neighbor(grad_theta_c, "N")
+        grad_theta_s = self.neighbor(grad_theta_c, "S")
+        grad_z_t = self.neighbor(grad_z_c, "T")
+        grad_z_b = self.neighbor(grad_z_c, "B")
+
+        gt_c = self.dA * self.Eu_omega * self.K_theta_C * grad_theta_c
+        gz_c = self.dA * self.Eu_omega * (self.Lambda / max(self.Ku, 1e-12)) * grad_z_c
+        gt_n_cell = self.neighbor(gt_c, "N")
+        gt_s_cell = self.neighbor(gt_c, "S")
+        gz_t_cell = self.neighbor(gz_c, "T")
+        gz_b_cell = self.neighbor(gz_c, "B")
+
+        gt_n_face = self.dA * self.Eu_omega * self.K_theta_C * (P_n - P) / self.dTheta
+        gt_s_face = self.dA * self.Eu_omega * self.K_theta_C * (P - P_s) / self.dTheta
+        gz_t_face = self.dA * self.Eu_omega * (self.Lambda / max(self.Ku, 1e-12)) * (P_t - P) / self.dZ
+        gz_b_face = self.dA * self.Eu_omega * (self.Lambda / max(self.Ku, 1e-12)) * (P - P_b) / self.dZ
+
+        inv_theta = 1.0 / torch.clamp(A_theta, min=1e-12)
+        inv_z = 1.0 / torch.clamp(A_z, min=1e-12)
+
+        UT_n = 0.5 * (UT + UT_n_cell) - (
+            gt_n_face / torch.clamp(A_theta_n, min=1e-12)
+            - 0.5 * (gt_c * inv_theta + gt_n_cell / torch.clamp(self.neighbor(A_theta, "N"), min=1e-12))
         )
-        # 西邻点
-        UR_im_corr, UT_im_corr = apply_Ainv(
-            neighbor(GR_C, "W"), neighbor(GT_C, "W"),
-            A11_im, A12_im, A21_im, A22_im
+        UT_s = 0.5 * (UT + UT_s_cell) - (
+            gt_s_face / torch.clamp(A_theta_s, min=1e-12)
+            - 0.5 * (gt_c * inv_theta + gt_s_cell / torch.clamp(self.neighbor(A_theta, "S"), min=1e-12))
         )
-        # 北邻点
-        UR_jp_corr, UT_jp_corr = apply_Ainv(
-            neighbor(GR_C, "N"), neighbor(GT_C, "N"),
-            A11_jp, A12_jp, A21_jp, A22_jp
+        Uz_t = 0.5 * (Uz + Uz_t_cell) - (
+            gz_t_face / torch.clamp(A_z_t, min=1e-12)
+            - 0.5 * (gz_c * inv_z + gz_t_cell / torch.clamp(self.neighbor(A_z, "T"), min=1e-12))
         )
-        # 南邻点
-        UR_jm_corr, UT_jm_corr = apply_Ainv(
-            neighbor(GR_C, "S"), neighbor(GT_C, "S"),
-            A11_jm, A12_jm, A21_jm, A22_jm
-        )
-        # 面系数需要算术平均
-        A11_e = 0.5 * (A11 + A11_ip)
-        A12_e = 0.5 * (A12 + A12_ip)
-        A21_e = 0.5 * (A21 + A21_ip)
-        A22_e = 0.5 * (A22 + A22_ip)
-
-        A11_w = 0.5 * (A11 + A11_im)
-        A12_w = 0.5 * (A12 + A12_im)
-        A21_w = 0.5 * (A21 + A21_im)
-        A22_w = 0.5 * (A22 + A22_im)
-
-        A11_n = 0.5 * (A11 + A11_jp)
-        A12_n = 0.5 * (A12 + A12_jp)
-        A21_n = 0.5 * (A21 + A21_jp)
-        A22_n = 0.5 * (A22 + A22_jp)
-
-        A11_s = 0.5 * (A11 + A11_jm)
-        A12_s = 0.5 * (A12 + A12_jm)
-        A21_s = 0.5 * (A21 + A21_jm)
-        A22_s = 0.5 * (A22 + A22_jm)
-
-        # 面（直接用面梯度 + 中心A）
-        UR_e_corr, UT_e_corr = apply_Ainv(GR_e, GT_C, A11_e, A12_e, A21_e, A22_e)
-        UR_w_corr, UT_w_corr = apply_Ainv(GR_w, GT_C, A11_w, A12_w, A21_w, A22_w)
-        UR_n_corr, UT_n_corr = apply_Ainv(GR_C, GT_n, A11_n, A12_n, A21_n, A22_n)
-        UR_s_corr, UT_s_corr = apply_Ainv(GR_C, GT_s, A11_s, A12_s, A21_s, A22_s)
-
-        # ======================
-        # 4. Rhie–Chow 重构
-        # ======================
-        UR_e = 0.5 * (UR + UR_ip) - (UR_e_corr - 0.5 * (URc_corr + UR_ip_corr))
-        UR_w = 0.5 * (UR + UR_im) - (UR_w_corr - 0.5 * (URc_corr + UR_im_corr))
-
-        UT_n = 0.5 * (UT + UT_jp) - (UT_n_corr - 0.5 * (UTc_corr + UT_jp_corr))
-        UT_s = 0.5 * (UT + UT_jm) - (UT_s_corr - 0.5 * (UTc_corr + UT_jm_corr))
-
-        return UR_e, UR_w, UT_n, UT_s
-
-    def momentum(self):
-        UR = self.UR
-        UT = self.UT
-
-        P = self.P
-        neighbor = self.neighbor
-
-        # 周期性邻居（在完整网格上操作）
-        UR_jp = neighbor(UR, "N")
-        UR_jm = neighbor(UR, "S")
-        UT_jp = neighbor(UT, "N")
-        UT_jm = neighbor(UT, "S")
-        P_jp = neighbor(P, "N")
-        P_jm = neighbor(P, "S")
-
-        # 径向邻居（修改为能够兼容边界的形式，直接用roll代替邻居，后面再做边界修正）
-        UR_ip = neighbor(UR, "E")
-        UR_im = neighbor(UR, "W")
-        UT_ip = neighbor(UT, "E")
-        UT_im = neighbor(UT, "W")
-        P_ip = neighbor(P, "E")
-        P_im = neighbor(P, "W")
-
-        # 内边界（i=0，布置ghost point）
-        UR_im[0, :] = UR[0, :]
-        UT_im[0, :] = UT[0, :]
-        P_im[0, :] = P[0, :]
-        # 外边界（i=N-1，布置ghost point）
-        UR_ip[-1, :] = UR[-1, :]
-        UT_ip[-1, :] = UT[-1, :]
-        P_ip[-1, :] = P[-1, :]
-
-        # 几何量（全场）
-        r_hatC = self.r_hatC
-        K_theta_C = self.K_theta
-
-        # 面积（内部点对应的界面）
-        AE = self.AE
-        AW = self.AW
-        AN = self.AN
-        AS = self.AS
-        # 控制体无量纲体积
-        dV = self.dV
-
-        # 无量纲数
-        Re = self.Re_omega
-        Eu = self.Eu_omega
-
-        # Rhie‑Chow 界面速度（均为 (N, N)）
-        uRe, uRw, uTn, uTs = self.rhie_chow(
-            UR, UT, P,
-            self.A11, self.A12, self.A21, self.A22
+        Uz_b = 0.5 * (Uz + Uz_b_cell) - (
+            gz_b_face / torch.clamp(A_z_b, min=1e-12)
+            - 0.5 * (gz_c * inv_z + gz_b_cell / torch.clamp(self.neighbor(A_z, "B"), min=1e-12))
         )
 
-        # 通量（已带方向符号，注意 Fn, Fs 已乘 r_hatC）
-        Fe = uRe * AE
-        Fw = -uRw * AW
-        Fn = K_theta_C * uTn * AN * r_hatC
-        Fs = -K_theta_C * uTs * AS * r_hatC
+        Uz_t[:, :, -1] = Uz[:, :, -1]
+        Uz_b[:, :, 0] = Uz[:, :, 0]
+        self._project_theta_periodic(UT_n, UT_s, Uz_t, Uz_b)
+        return UT_n, UT_s, Uz_t, Uz_b
 
-        # 扩散系数（已按公式 2.78，周向已包含 r_hatC 和 K_theta^2）
-        De = (1.0 / Re) * AE / self.dR
-        Dw = (1.0 / Re) * AW / self.dR
-        Dn = (1.0 / Re) * AN * r_hatC * (K_theta_C ** 2) / self.dTheta
-        Ds = (1.0 / Re) * AS * r_hatC * (K_theta_C ** 2) / self.dTheta
+    def _face_fluxes(
+        self,
+        UT_face_n: torch.Tensor,
+        UT_face_s: torch.Tensor,
+        Uz_face_t: torch.Tensor,
+        Uz_face_b: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        Fn = self.K_theta_C * self.theta_area * UT_face_n
+        Fs = -self.K_theta_C * self.theta_area * UT_face_s
+        Ft = self.Lambda * self.Ku * self.z_area * Uz_face_t
+        Fb = -self.Lambda * self.Ku * self.z_area * Uz_face_b
+        return Fn, Fs, Ft, Fb
 
-        # 邻点系数 a_F = a_{F,diff} + a_{F,conv} （式 2.74 与 2.77）
-        # a_{F,conv} = -min(0, F_F) = clamp(-F_F, min=0) 考虑可读性，此处按文档严格写为 -clamp(F_F, max=0)
-        aE = De - torch.clamp(Fe, max=0.0)
-        aW = Dw - torch.clamp(Fw, max=0.0)
+    def _face_opening(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        phi_n = torch.minimum(self.phi, self.neighbor(self.phi, "N"))
+        phi_s = torch.minimum(self.phi, self.neighbor(self.phi, "S"))
+        phi_t = torch.minimum(self.phi, self.neighbor(self.phi, "T"))
+        phi_b = torch.minimum(self.phi, self.neighbor(self.phi, "B"))
+        phi_t[:, :, -1] = self.phi[:, :, -1]
+        phi_b[:, :, 0] = self.phi[:, :, 0]
+        self._project_theta_periodic(phi_n, phi_s, phi_t, phi_b)
+        return phi_n, phi_s, phi_t, phi_b
+
+    def _assemble_momentum_coefficients(self) -> dict[str, torch.Tensor]:
+        UT_n_face, UT_s_face, Uz_t_face, Uz_b_face = self.rhie_chow(
+            self.UT,
+            self.Uz,
+            self.P,
+            self.A_theta,
+            self.A_z,
+        )
+        Fn, Fs, Ft, Fb = self._face_fluxes(UT_n_face, UT_s_face, Uz_t_face, Uz_b_face)
+        phi_n, phi_s, phi_t, phi_b = self._face_opening()
+        Fn = Fn * phi_n
+        Fs = Fs * phi_s
+        Ft = Ft * phi_t
+        Fb = Fb * phi_b
+
+        inv_re = self._effective_inv_reynolds()
+        inv_re_n = 0.5 * (inv_re + self.neighbor(inv_re, "N"))
+        inv_re_s = 0.5 * (inv_re + self.neighbor(inv_re, "S"))
+        inv_re_t = 0.5 * (inv_re + self.neighbor(inv_re, "T"))
+        inv_re_b = 0.5 * (inv_re + self.neighbor(inv_re, "B"))
+        Dn = phi_n * (self.K_theta_C**2) * self.theta_area * inv_re_n / self.dTheta
+        Ds = phi_s * (self.K_theta_C**2) * self.theta_area * inv_re_s / self.dTheta
+        Dt = phi_t * (self.Lambda**2) * self.z_area * inv_re_t / self.dZ
+        Db = phi_b * (self.Lambda**2) * self.z_area * inv_re_b / self.dZ
+
         aN = Dn - torch.clamp(Fn, max=0.0)
         aS = Ds - torch.clamp(Fs, max=0.0)
-
-        # 对流对中心的贡献 a_{C,conv} = sum max(F_F, 0)
-        aP_conv = (torch.clamp(Fe, min=0.0) + torch.clamp(Fw, min=0.0) +
-                   torch.clamp(Fn, min=0.0) + torch.clamp(Fs, min=0.0))
-
-        # 扩散对中心的贡献 a_{C,diff} = sum D_F
-        aP_diff = De + Dw + Dn + Ds
-
-        # 基础中心系数（不含曲率修正和耦合项）
-        aP_base = aP_conv + aP_diff + 1e-12
-
-        # ================== 按照文档 (2.80) 和 (2.82) 构建系数 ==================
-        # 内部点当前迭代步速度值（上一迭代步的值）
-        UR_C = UR  # 尺寸 (N, N)
-        UT_C = UT
-
-        # ---- 径向动量方程系数 a11, a12, b1 ----
-        # a11 = a_C,diff + a_C,conv + ΔV/(Re * r_hat^2)
-        a11 = aP_base + dV / (Re * (r_hatC ** 2))
-
-        # a12 = - (2 * UT^* / r_hat) * ΔV
-        a12 = - (2.0 * UT_C / r_hatC) * dV
-
-        # 源项 b1 = sum_F (a_F * U_R,F) - ΔV * [ Eu * ((r_hat P)_E - (r_hat P)_W)/(2 r_hat ΔR) - (UT^*^2)/r_hat + (
-        # K_theta/(Re r_hat)) * (U_Θ,N - U_Θ,S)/ΔΘ ] 注意：右端项中已包含邻点贡献，将其单独写出
-        bf1 = aE * UR_ip + aW * UR_im + aN * UR_jp + aS * UR_jm
-
-        # 压力正常有限差分
-        pressure_R = Eu * (P_ip - P_im) / (2.0 * self.dR)
-
-        # 曲率显式项: (UT^*^2) / r_hatC
-        curve_exp_R = (UT_C ** 2) / r_hatC
-
-        # 交叉导数项: (K_theta/(Re * r_hatC)) * (UT_N - UT_S) / ΔΘ
-        UT_N = UT_jp
-        UT_S = UT_jm
-        cross_deriv_R = (K_theta_C / (Re * r_hatC)) * (UT_N - UT_S) / self.dTheta
-
-        # 源项
-        bs1 = - dV * (pressure_R + curve_exp_R + cross_deriv_R)
-        # 组合 b1
-        b1 = bf1 + bs1
-
-        # ---- 周向动量方程系数 a21, a22, b2 ----
-        # a21 = (UT^* / r_hat) * ΔV
-        a21 = (UT_C / r_hatC) * dV
-
-        # a22 = aP_base + ΔV/(Re * r_hat^2) + (UR^* / r_hat) * ΔV
-        a22 = aP_base + dV / (Re * (r_hatC ** 2)) + (UR_C / r_hatC) * dV
-
-        # 源项 b2 = sum_F (a_F * U_Θ,F) - ΔV * [ Eu * K_theta * (P_N - P_S)/(2 ΔΘ) - (UT^* UR^*)/r_hat - (K_theta/(Re *
-        # r_hat)) * (UR_N - UR_S)/ΔΘ ]
-        bf2 = aE * UT_ip + aW * UT_im + aN * UT_jp + aS * UT_jm
-
-        # 压力梯度项（周向）
-        P_N = P_jp
-        P_S = P_jm
-        pressure_T = Eu * K_theta_C * (P_N - P_S) / (2.0 * self.dTheta)
-
-        # 耦合项显式部分: (UT^* UR^*) / r_hat
-        couple_exp_T = (UT_C * UR_C) / r_hatC
-
-        # 交叉导数项: (K_theta/(Re * r_hat)) * (UR_N - UR_S) / ΔΘ
-        UR_N = UR_jp
-        UR_S = UR_jm
-        cross_deriv_T = (K_theta_C / (Re * r_hatC)) * (UR_N - UR_S) / self.dTheta
-        # 源项
-        bs2 = - dV * (pressure_T - couple_exp_T - cross_deriv_T)
-        # 组合系数
-        b2 = bf2 + bs2
-
-        # ================== 联立求解 2x2 线性系统 ==================
-        # 方程组：
-        # a11 * UR_new + a12 * UT_new = b1
-        # a21 * UR_new + a22 * UT_new = b2
-        # 求解行列式
-        det = a11 * a22 - a12 * a21
-        # 防止除零
-        det = torch.clamp(det, min=1e-12)
-        # 大学第一年学的线性代数be like：这个就是SIMPLE格式中动量方程得到的U_star，不过在文档里写的是\tilde{U}
-        self.UR_tilde = (b1 * a22 - a12 * b2) / det
-        self.UT_tilde = (a11 * b2 - a21 * b1) / det
-
-        # 保存各系数供压力修正使用以及Rhie-Chow插值
-        self.A11, self.A12, self.A21, self.A22 = a11, a12, a21, a22
-
-    def pressure(self):
-        # ---------- 引用常用几何量与参数 ----------
-        r_hatC = self.r_hatC
-        K_theta = self.K_theta_C  # 中心 K_theta
-        # K_theta要用界面值
-        K_theta_Ef = self.K_theta_Ef
-        K_theta_Wf = self.K_theta_Wf
-        # 周向界面的 K_theta 与中心相同（因为同一径向位置），但为统一仍用中心值
-        K_theta_N = K_theta
-        K_theta_S = K_theta
-
-        AE = self.AE
-        AW = self.AW
-        AN = self.AN
-        AS = self.AS
-        dV = self.dV
-        dR = self.dR
-        dTheta = self.dTheta
-        Eu = self.Eu_omega
-        neighbor = self.neighbor
-
-        # 动量系数（上一迭代步保存）
-        A11 = self.A11
-        A12 = self.A12
-        A21 = self.A21
-        A22 = self.A22
-
-        # 计算行列式及逆矩阵元素 (式 2.95)
-        det2 = A11 * A22 - A12 * A21 + 1e-12
-        a11_r = A22 / det2
-        a12_r = -A21 / det2
-        a21_r = -A12 / det2
-        a22_r = A11 / det2
-
-        # ---------- 1. 左侧：预测通量求和 β = -Σ F̃ ----------
-        utRe, utRw, utTn, utTs = self.rhie_chow(
-            self.UR_tilde, self.UT_tilde, self.P,
-            A11, A12, A21, A22
+        aT = Dt - torch.clamp(Ft, max=0.0)
+        aB = Db - torch.clamp(Fb, max=0.0)
+        aP_conv = (
+            torch.clamp(Fn, min=0.0)
+            + torch.clamp(Fs, min=0.0)
+            + torch.clamp(Ft, min=0.0)
+            + torch.clamp(Fb, min=0.0)
         )
-        Fe_tilde = utRe * AE
-        Fw_tilde = -utRw * AW
-        Fn_tilde = K_theta * utTn * AN * r_hatC
-        Fs_tilde = -K_theta * utTs * AS * r_hatC
-        beta = -(Fe_tilde + Fw_tilde + Fn_tilde + Fs_tilde)
+        aP_diff = Dn + Ds + Dt + Db
 
-        # ---------- 2. 计算压力修正方程系数 (式 2.102-2.105) ----------
-        Cv = dV * Eu
+        solid = 1.0 - self.phi
+        pseudo = self.dA / self.pseudo_dt
+        if self.local_pseudo_dt:
+            spectral_radius = (
+                torch.abs(Fn)
+                + torch.abs(Fs)
+                + torch.abs(Ft)
+                + torch.abs(Fb)
+                + 2.0 * aP_diff
+                + solid
+            )
+            pseudo = pseudo + spectral_radius / self.pseudo_cfl
+        A_theta = aP_conv + aP_diff + self.dA * inv_re / torch.clamp(self.r_hatC**2, min=1e-12) + 1e-12
+        A_z = aP_conv + aP_diff + 1e-12
+        A_theta = A_theta + solid + pseudo
+        A_z = A_z + solid + pseudo
 
-        D_RE = Cv * AE / dR
-        D_RW = Cv * AW / dR
-        D_TN = Cv * r_hatC * AN * (K_theta_N ** 2) / dTheta
-        D_TS = Cv * r_hatC * AS * (K_theta_S ** 2) / dTheta
-
-        # 交叉系数，注意使用界面上的 K_theta
-        X_12E = Cv * AE * K_theta_Ef / (4.0 * dTheta)
-        X_12W = Cv * AW * K_theta_Wf / (4.0 * dTheta)
-        X_21N = Cv * r_hatC * AN * K_theta_N / (4.0 * dR)
-        X_21S = Cv * r_hatC * AS * K_theta_S / (4.0 * dR)
-
-        # 界面逆矩阵元素（算术平均）
-        def face_avg_E(f): return 0.5 * (f + neighbor(f, "E"))
-        def face_avg_W(f): return 0.5 * (f + neighbor(f, "W"))
-        def face_avg_N(f): return 0.5 * (f + neighbor(f, "N"))
-        def face_avg_S(f): return 0.5 * (f + neighbor(f, "S"))
-
-        a11_E = face_avg_E(a11_r)
-        a12_E = face_avg_E(a12_r)
-        a11_W = face_avg_W(a11_r)
-        a12_W = face_avg_W(a12_r)
-        a21_N = face_avg_N(a21_r)
-        a22_N = face_avg_N(a22_r)
-        a21_S = face_avg_S(a21_r)
-        a22_S = face_avg_S(a22_r)
-
-        alpha_E = D_RE * a11_E + X_21N * a21_N - X_21S * a21_S
-        alpha_W = D_RW * a11_W - X_21N * a21_N + X_21S * a21_S
-        alpha_N = X_12E * a12_E - X_12W * a12_W + D_TN * a22_N
-        alpha_S = -X_12E * a12_E + X_12W * a12_W + D_TS * a22_S
-
-        alpha_NE = X_12E * a12_E + X_21N * a21_N
-        alpha_NW = -X_12W * a12_W - X_21N * a21_N
-        alpha_SE = -X_12E * a12_E - X_21S * a21_S
-        alpha_SW = X_12W * a12_W + X_21S * a21_S
-
-        # 中心系数
-        alpha_C = alpha_E + alpha_W + alpha_N + alpha_S
-
-        # ---------- 3. 迭代求解 P' (带径向边界镜像) ----------
-        P_prime = self.P_prime.clone()
-        _alpha_ = {"C": alpha_C, "E": alpha_E, "W": alpha_W, "N": alpha_N, "S": alpha_S,
-                   "NE": alpha_NE, "NW": alpha_NW, "SE": alpha_SE, "SW": alpha_SW}
-        # todo 在这里选择替换压力求解器
-        # Jacobi预条件
-        P_PRIME_SOLVER = PressureUpdaters.Jacobi(
-            _alpha_, beta, self.device,
-            max_inner=100,
-            tol=1e-6,
-            report_interval=100,
-        )    # 初始化压力求解器
-        P_prime = P_PRIME_SOLVER.solve2d(P_prime, self.P_prime)
-        '''
-        # BiCG正式
-        P_PRIME_SOLVER = PressureUpdaters.BiCGStab(
-            _alpha_, beta, self.device,
-            max_inner=max_inner,
-            tol=1e-10,
-            report_interval=1,
-        )    # 初始化压力求解器
-        P_prime = P_PRIME_SOLVER.solve2d(P_prime)
-        '''
-        # 只取5点
-        coef_gmg = {
-            "C": alpha_C,
-            "E": alpha_E,
-            "W": alpha_W,
-            "N": alpha_N,
-            "S": alpha_S
+        return {
+            "N": aN,
+            "S": aS,
+            "T": aT,
+            "B": aB,
+            "A_theta": A_theta,
+            "A_z": A_z,
+            "pseudo": pseudo,
         }
-        GMG_SOLVER = PressureUpdaters.GMG(coef_gmg, self.device, levels=4)
-        P_prime = GMG_SOLVER.solve(beta)
 
-        # ---------- 4. 速度修正 U' = -A^{-1} G P' (式 2.86) ----------
-        self.P_prime = P_prime
-        P_ip = neighbor(P_prime, "E")
-        P_im = neighbor(P_prime, "W")
-        P_jp = neighbor(P_prime, "N")
-        P_jm = neighbor(P_prime, "S")
-        # 边界镜像
-        P_ip[-1, :] = P_prime[-1, :]
-        P_im[0, :] = P_prime[0, :]
+    def momentum(self) -> None:
+        coef = self._assemble_momentum_coefficients()
+        self.A_theta = coef["A_theta"]
+        self.A_z = coef["A_z"]
 
-        GR_prime = Cv * (P_ip - P_im) / (2.0 * dR)
-        GT_prime = Cv * K_theta * (P_jp - P_jm) / (2.0 * dTheta)
+        pressure_theta = self.Eu_omega * self.K_theta_C * self._pressure_gradient_theta(self.P)
+        pressure_z = self.Eu_omega * (self.Lambda / max(self.Ku, 1e-12)) * self._pressure_gradient_z(self.P)
 
-        UR_prime = -(a11_r * GR_prime + a12_r * GT_prime)
-        UT_prime = -(a21_r * GR_prime + a22_r * GT_prime)
+        UT_ref = self.UT.clone()
+        Uz_ref = self.Uz.clone()
+        UT_iter = self.UT.clone()
+        Uz_iter = self.Uz.clone()
+        solid = 1.0 - self.phi
+        solid_ut = self._solid_ut()
+        hard_solid = self._hard_solid_mask()
+        relax = float(np.clip(self.momentum_solver_relax, 0.05, 1.0))
 
-        # 监控连续性
-        mass_res = torch.max(torch.abs(Fe_tilde + Fw_tilde + Fn_tilde + Fs_tilde)).item()
-        print(f"mass = {mass_res: .3e}")
+        for _ in range(max(int(self.momentum_sweeps), 1)):
+            UT_n = self.neighbor(UT_iter, "N")
+            UT_s = self.neighbor(UT_iter, "S")
+            UT_t = self.neighbor(UT_iter, "T")
+            UT_b = self.neighbor(UT_iter, "B")
+            Uz_n = self.neighbor(Uz_iter, "N")
+            Uz_s = self.neighbor(Uz_iter, "S")
+            Uz_t = self.neighbor(Uz_iter, "T")
+            Uz_b = self.neighbor(Uz_iter, "B")
 
-        # ---------- 5. 更新速度与压力 ----------
-        self.UR = self.UR_tilde + self.u_relax * UR_prime
-        self.UT = self.UT_tilde + self.u_relax * UT_prime
-        self.P = self.P + self.p_relax * P_prime
+            bf_theta = coef["N"] * UT_n + coef["S"] * UT_s + coef["T"] * UT_t + coef["B"] * UT_b
+            bf_z = coef["N"] * Uz_n + coef["S"] * Uz_s + coef["T"] * Uz_t + coef["B"] * Uz_b
+            bf_theta = bf_theta + solid * solid_ut + coef["pseudo"] * UT_ref
+            bf_z = bf_z + coef["pseudo"] * Uz_ref
 
-    def solve(self):
-        for it in range(self.max_iter):
+            UT_new = (bf_theta - self.dA * pressure_theta) / torch.clamp(self.A_theta, min=1e-12)
+            Uz_new = (bf_z - self.dA * pressure_z - self.dA * self.G_star) / torch.clamp(self.A_z, min=1e-12)
+            UT_new = torch.where(hard_solid, solid_ut, UT_new)
+            Uz_new = torch.where(hard_solid, torch.zeros_like(Uz_new), Uz_new)
+            UT_iter = UT_iter + relax * (UT_new - UT_iter)
+            Uz_iter = Uz_iter + relax * (Uz_new - Uz_iter)
+            self._project_theta_periodic(UT_iter, Uz_iter)
 
-            UR_old = self.UR.clone()
-            UT_old = self.UT.clone()
+        self.UT_tilde = UT_iter
+        self.Uz_tilde = Uz_iter
+        self._project_theta_periodic(self.UT_tilde, self.Uz_tilde)
 
-            self.momentum()
+    def pressure(self) -> None:
+        self.pressure_updater.simple_step()
+
+    def _linear_flux_divergence(self, UT: torch.Tensor, Uz: torch.Tensor) -> torch.Tensor:
+        UT_n = 0.5 * (UT + self.neighbor(UT, "N"))
+        UT_s = 0.5 * (UT + self.neighbor(UT, "S"))
+        Uz_t = 0.5 * (Uz + self.neighbor(Uz, "T"))
+        Uz_b = 0.5 * (Uz + self.neighbor(Uz, "B"))
+        Uz_t[:, :, -1] = Uz[:, :, -1]
+        Uz_b[:, :, 0] = Uz[:, :, 0]
+        Fn, Fs, Ft, Fb = self._face_fluxes(UT_n, UT_s, Uz_t, Uz_b)
+        phi_n, phi_s, phi_t, phi_b = self._face_opening()
+        return Fn * phi_n + Fs * phi_s + Ft * phi_t + Fb * phi_b
+
+    def _rhie_flux_divergence(self, UT: torch.Tensor, Uz: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
+        UT_n_face, UT_s_face, Uz_t_face, Uz_b_face = self.rhie_chow(
+            UT,
+            Uz,
+            P,
+            self.A_theta,
+            self.A_z,
+        )
+        Fn, Fs, Ft, Fb = self._face_fluxes(UT_n_face, UT_s_face, Uz_t_face, Uz_b_face)
+        phi_n, phi_s, phi_t, phi_b = self._face_opening()
+        return Fn * phi_n + Fs * phi_s + Ft * phi_t + Fb * phi_b
+
+    def _momentum_residual(self, coef: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        UT_n = self.neighbor(self.UT, "N")
+        UT_s = self.neighbor(self.UT, "S")
+        UT_t = self.neighbor(self.UT, "T")
+        UT_b = self.neighbor(self.UT, "B")
+        Uz_n = self.neighbor(self.Uz, "N")
+        Uz_s = self.neighbor(self.Uz, "S")
+        Uz_t = self.neighbor(self.Uz, "T")
+        Uz_b = self.neighbor(self.Uz, "B")
+
+        pressure_theta = self.Eu_omega * self.K_theta_C * self._pressure_gradient_theta(self.P)
+        pressure_z = self.Eu_omega * (self.Lambda / max(self.Ku, 1e-12)) * self._pressure_gradient_z(self.P)
+        solid = 1.0 - self.phi
+
+        res_theta = (
+            coef["A_theta"] * self.UT
+            - coef["N"] * UT_n
+            - coef["S"] * UT_s
+            - coef["T"] * UT_t
+            - coef["B"] * UT_b
+            - coef["pseudo"] * self.UT
+            - solid * self._solid_ut()
+            + self.dA * pressure_theta
+        )
+        res_z = (
+            coef["A_z"] * self.Uz
+            - coef["N"] * Uz_n
+            - coef["S"] * Uz_s
+            - coef["T"] * Uz_t
+            - coef["B"] * Uz_b
+            - coef["pseudo"] * self.Uz
+            + self.dA * pressure_z
+            + self.dA * self.G_star
+        )
+        return res_theta, res_z
+
+    def _fluid_residual_mask(self) -> torch.Tensor:
+        mask = self.phi > 0.2
+        mask[:, :, 0] = False
+        mask[:, :, -1] = False
+        return mask
+
+    @staticmethod
+    def _masked_absmax(field: torch.Tensor, mask: torch.Tensor) -> float:
+        if torch.any(mask):
+            return float(torch.max(torch.abs(field[mask])).item())
+        return float(torch.max(torch.abs(field)).item())
+
+    @staticmethod
+    def _fields_are_finite(*fields: torch.Tensor) -> bool:
+        return all(bool(torch.isfinite(field).all().item()) for field in fields)
+
+    def _velocity_update_scale(self, dUT: torch.Tensor, dUz: torch.Tensor, limit: float | None) -> float:
+        if limit is None or limit <= 0.0:
+            return 1.0
+        mask = self.phi > 0.2
+        if torch.any(mask):
+            max_update = torch.maximum(
+                torch.max(torch.abs(dUT[mask])),
+                torch.max(torch.abs(dUz[mask])),
+            )
+        else:
+            max_update = torch.maximum(torch.max(torch.abs(dUT)), torch.max(torch.abs(dUz)))
+        max_value = float(max_update.item())
+        if not np.isfinite(max_value) or max_value <= limit:
+            return 1.0 if np.isfinite(max_value) else 0.0
+        return max(float(limit) / max(max_value, 1e-30), 0.0)
+
+    def _pressure_update_scale(self, dP: torch.Tensor, limit: float | None) -> float:
+        if limit is None or limit <= 0.0:
+            return 1.0
+        max_update = float(torch.max(torch.abs(dP)).item())
+        if not np.isfinite(max_update) or max_update <= limit:
+            return 1.0 if np.isfinite(max_update) else 0.0
+        return max(float(limit) / max(max_update, 1e-30), 0.0)
+
+    def _clamp_couple_fields(self) -> None:
+        limit = float(self.couple_field_abs_limit)
+        if limit <= 0.0:
+            return
+        self.UT = torch.clamp(self.UT, min=-limit, max=limit)
+        self.Uz = torch.clamp(self.Uz, min=-limit, max=limit)
+        p_limit = max(limit, 4.0 * abs(self.delta_p_global), 1.0)
+        self.P = torch.clamp(self.P, min=-p_limit, max=p_limit)
+        self._apply_boundary()
+
+    def momentum_error(self) -> float:
+        coef = self._assemble_momentum_coefficients()
+        res_theta, res_z = self._momentum_residual(coef)
+        mask = self._fluid_residual_mask()
+        return max(self._masked_absmax(res_theta, mask), self._masked_absmax(res_z, mask))
+
+    def couple_step(self) -> tuple[float, float]:
+        step_count = int(getattr(self, "_couple_step_count", 0))
+        UT_old = self.UT.clone()
+        Uz_old = self.Uz.clone()
+        P_old = self.P.clone()
+        P_prime_old = self.P_prime.clone()
+
+        self.momentum()
+        inv_theta = self.phi / torch.clamp(self.A_theta + (1.0 - self.phi), min=1e-12)
+        inv_z = self.phi / torch.clamp(self.A_z + (1.0 - self.phi), min=1e-12)
+
+        dUT = self.couple_relax * (self.UT_tilde - UT_old)
+        dUz = self.couple_relax * (self.Uz_tilde - Uz_old)
+        scale = self._velocity_update_scale(dUT, dUz, self.couple_momentum_update_limit)
+        self.UT = UT_old + scale * dUT
+        self.Uz = Uz_old + scale * dUz
+        self._apply_boundary()
+        self._clamp_couple_fields()
+
+        if not self._fields_are_finite(self.UT, self.Uz, self.P):
+            self.UT = UT_old
+            self.Uz = Uz_old
+            self.P = P_old
+            self.P_prime = P_prime_old
             self._apply_boundary()
-            res = torch.max(torch.abs(self.UR - UR_old)) + torch.max(torch.abs(self.UT - UT_old))
+            return 0.0, self.continuity_error()
 
-            print(it, res.item())
-
-            if res < self.tol:
-                print("converged", it)
+        do_pressure = (
+            self.couple_pressure_sweeps > 0
+            and self.couple_pressure_interval > 0
+            and step_count % self.couple_pressure_interval == 0
+        )
+        for _ in range(self.couple_pressure_sweeps if do_pressure else 0):
+            beta = -self._rhie_flux_divergence(self.UT, self.Uz, self.P)
+            base_mass = self.continuity_error()
+            base_momentum = self.momentum_error()
+            saved_state = (self.UT.clone(), self.Uz.clone(), self.P.clone(), self.P_prime.clone())
+            relax = self.pressure_projection_relax
+            accepted = False
+            while relax >= self.couple_pressure_min_relax:
+                self.pressure_updater.project(
+                    inv_theta,
+                    inv_z,
+                    beta,
+                    relax,
+                    self.couple_pressure_velocity_limit,
+                    self.couple_pressure_update_limit,
+                )
+                self._clamp_couple_fields()
+                new_mass = self.continuity_error()
+                new_momentum = self.momentum_error()
+                finite = self._fields_are_finite(self.UT, self.Uz, self.P)
+                momentum_limit = max(base_momentum * self.couple_pressure_max_momentum_growth, base_momentum + 1e-4)
+                if finite and new_mass <= base_mass and new_momentum <= momentum_limit:
+                    accepted = True
+                    break
+                self.UT, self.Uz, self.P, self.P_prime = (item.clone() for item in saved_state)
+                self._apply_boundary()
+                if not self.couple_pressure_backtracking:
+                    break
+                relax *= 0.5
+            if not accepted:
+                self.UT, self.Uz, self.P, self.P_prime = (item.clone() for item in saved_state)
+                self._apply_boundary()
                 break
 
-    def post(self):
-        N = self.n
+        self._couple_step_count = step_count + 1
+        update = torch.maximum(
+            torch.max(torch.abs(self.UT - UT_old)),
+            torch.max(torch.abs(self.Uz - Uz_old)),
+        )
+        mass = self.continuity_error()
+        return float(update.item()), mass
 
-        # ===== 构造计算空间网格 =====
-        R = np.linspace(0, 1, N)
-        Theta = np.linspace(0, 1, N)
+    def simple_step(self) -> tuple[float, float, float]:
+        UT_old = self.UT.clone()
+        Uz_old = self.Uz.clone()
+        self.momentum()
+        self.pressure()
+        self._apply_boundary()
 
-        RR, TT = np.meshgrid(R, Theta, indexing='ij')
+        update = torch.maximum(
+            torch.max(torch.abs(self.UT - UT_old)),
+            torch.max(torch.abs(self.Uz - Uz_old)),
+        )
+        mass = self.continuity_error()
+        momentum = self.momentum_error()
+        return float(update.item()), mass, momentum
 
-        # ===== 映射到物理空间 =====
-        r = self.rh + RR * (self.rs - self.rh)
-        theta = TT * self.theta0
+    def continuity_error(self) -> float:
+        div = self._rhie_flux_divergence(self.UT, self.Uz, self.P)
+        mask = self._fluid_residual_mask()
+        if torch.any(mask):
+            return float(torch.max(torch.abs(div[mask])).item())
+        return float(torch.max(torch.abs(div)).item())
 
-        X = r * np.cos(theta)
-        Y = r * np.sin(theta)
+    def outlet_flow_rate_hat(self) -> float:
+        fluid = self.phi[:, :, -1]
+        weighted = self.Uz[:, :, -1] * fluid * self.outlet_area_weight
+        q_raw = torch.sum(weighted)
+        return float((q_raw / torch.clamp(self.outlet_area_target, min=1e-12)).item())
+
+    def _nudge_delta_p(self, q_hat: float, prev: tuple[float, float] | None) -> tuple[float, float]:
+        err = q_hat - 1.0
+        old_dp = self.delta_p_global
+        if prev is not None:
+            prev_dp, prev_err = prev
+            denom = err - prev_err
+            if abs(denom) > 1e-8:
+                candidate = old_dp - err * (old_dp - prev_dp) / denom
+            else:
+                candidate = old_dp * (1.0 - 0.5 * err)
+        else:
+            candidate = old_dp * (1.0 - 0.5 * err)
+        if old_dp <= self.delta_p_min * 10.0 and err < 0.0:
+            candidate = max(candidate, 0.02)
+        if not np.isfinite(candidate) or candidate <= 0.0:
+            candidate = old_dp * (1.25 if err < 0.0 else 0.75)
+        candidate = float(np.clip(candidate, self.delta_p_min, self.delta_p_max))
+        new_dp = (1.0 - self.delta_p_relax) * old_dp + self.delta_p_relax * candidate
+        self.P = self.P + (new_dp - old_dp) * (1.0 - self.Z)
+        self.delta_p_global = new_dp
+        self._set_pressure_boundary()
+        return old_dp, err
+
+    def _relax_delta_p_to_flow(self, q_hat: float) -> None:
+        if not np.isfinite(q_hat):
+            return
+        err = q_hat - 1.0
+        old_dp = self.delta_p_global
+        log_factor = float(np.clip(-self.couple_flow_control_gain * err, -self.couple_flow_control_clip, self.couple_flow_control_clip))
+        candidate = old_dp * float(np.exp(log_factor))
+        if old_dp <= self.delta_p_min * 10.0 and err < 0.0:
+            candidate = max(candidate, 0.02)
+        if not np.isfinite(candidate) or candidate <= 0.0:
+            candidate = old_dp * (1.05 if err < 0.0 else 0.95)
+        new_dp = float(np.clip(candidate, self.delta_p_min, self.delta_p_max))
+        self.P = self.P + (new_dp - old_dp) * (1.0 - self.Z)
+        self.delta_p_global = new_dp
+        self._set_pressure_boundary()
+
+    def solve(
+        self,
+        max_outer: int = 8,
+        inner_per_outer: int | None = None,
+        report_interval: int = 25,
+        method: str = "simple",
+    ) -> SolveLog:
+        method = method.lower()
+        if method == "couple":
+            return self.solve_couple(max_iter=self.max_iter, report_interval=report_interval)
+        self.last_solve_method = "simple"
+
+        inner_limit = int(inner_per_outer or max(1, self.max_iter // max(max_outer, 1)))
+        prev_secant: tuple[float, float] | None = None
+        history: list[dict[str, float]] = []
+        iteration_history: list[dict[str, float]] = []
+        total_iter = 0
+        converged = False
+        final_update = float("inf")
+        final_mass = float("inf")
+        final_momentum = float("inf")
+
+        for outer in range(max_outer):
+            for inner in range(inner_limit):
+                final_update, final_mass, final_momentum = self.simple_step()
+                total_iter += 1
+                q_hat = self.outlet_flow_rate_hat()
+                iteration_history.append(
+                    {
+                        "iteration": float(total_iter),
+                        "outer": float(outer),
+                        "inner": float(inner),
+                        "momentum": final_momentum,
+                        "continuity": final_mass,
+                        "update": final_update,
+                        "q_hat": q_hat,
+                        "delta_p": self.delta_p_global,
+                        "nut_max": float(torch.max(self.nut_ratio).item()) if hasattr(self, "nut_ratio") else 0.0,
+                        "nut_mean": float(torch.mean(self.nut_ratio).item()) if hasattr(self, "nut_ratio") else 0.0,
+                    }
+                )
+                if report_interval and (inner % report_interval == 0 or inner == inner_limit - 1):
+                    print(
+                        f"SIMPLE outer={outer:02d} inner={inner:04d} "
+                        f"mom={final_momentum:.3e} mass={final_mass:.3e} "
+                        f"update={final_update:.3e} "
+                        f"q_hat={q_hat:.5f} dP={self.delta_p_global:.5e}"
+                    )
+                if final_update < self.tol and final_mass < 5.0 * self.tol and final_momentum < 5.0 * self.tol:
+                    break
+
+            q_hat = self.outlet_flow_rate_hat()
+            q_err = q_hat - 1.0
+            history.append(
+                {
+                    "outer": float(outer),
+                    "iterations": float(total_iter),
+                    "update": final_update,
+                    "momentum": final_momentum,
+                    "mass": final_mass,
+                    "q_hat": q_hat,
+                    "delta_p": self.delta_p_global,
+                }
+            )
+            if abs(q_err) < self.outer_flow_tol and final_mass < 1e-3 and final_momentum < 1e-3:
+                converged = True
+                break
+            prev_secant = self._nudge_delta_p(q_hat, prev_secant)
+
+        self.last_history = history
+        self.iteration_history = iteration_history
+        return SolveLog(
+            method="SIMPLE",
+            converged=converged,
+            iterations=total_iter,
+            final_momentum=final_momentum,
+            final_mass=final_mass,
+            final_update=final_update,
+            final_q_hat=self.outlet_flow_rate_hat(),
+            delta_p=self.delta_p_global,
+        )
+
+    def solve_couple(self, max_iter: int | None = None, report_interval: int = 25) -> SolveLog:
+        limit = int(max_iter or self.max_iter)
+        converged = False
+        final_update = float("inf")
+        final_mass = float("inf")
+        final_momentum = float("inf")
+        self.last_solve_method = "couple"
+        self.iteration_history = []
+        self._couple_step_count = 0
+        for it in range(limit):
+            final_update, final_mass = self.couple_step()
+            final_momentum = self.momentum_error()
+            q_hat = self.outlet_flow_rate_hat()
+            self.iteration_history.append(
+                {
+                    "iteration": float(it + 1),
+                    "outer": 0.0,
+                    "inner": float(it),
+                    "momentum": final_momentum,
+                    "continuity": final_mass,
+                    "update": final_update,
+                    "q_hat": q_hat,
+                    "delta_p": self.delta_p_global,
+                    "nut_max": float(torch.max(self.nut_ratio).item()) if hasattr(self, "nut_ratio") else 0.0,
+                    "nut_mean": float(torch.mean(self.nut_ratio).item()) if hasattr(self, "nut_ratio") else 0.0,
+                }
+            )
+            if report_interval and (it % report_interval == 0 or it == limit - 1):
+                print(
+                    f"COUPLE iter={it:04d} mom={final_momentum:.3e} "
+                    f"mass={final_mass:.3e} update={final_update:.3e} "
+                    f"q_hat={q_hat:.5f} "
+                    f"dP={self.delta_p_global:.5e}"
+                )
+            if (
+                self.couple_flow_control
+                and self.couple_flow_control_interval > 0
+                and (it + 1) % self.couple_flow_control_interval == 0
+            ):
+                self._relax_delta_p_to_flow(q_hat)
+            if final_update < self.tol and final_mass < 5.0 * self.tol and final_momentum < 5.0 * self.tol:
+                converged = True
+                break
+        return SolveLog(
+            method="COUPLE",
+            converged=converged,
+            iterations=it + 1,
+            final_momentum=final_momentum,
+            final_mass=final_mass,
+            final_update=final_update,
+            final_q_hat=self.outlet_flow_rate_hat(),
+            delta_p=self.delta_p_global,
+        )
+
+    def _output_stem(self, prefix: str | None = None) -> str:
+        if prefix:
+            return prefix
+        if self.last_solve_method == "simple":
+            return "simple"
+        if self.last_solve_method == "couple" and self.pressure_solver == "gmg":
+            return "couple_gmg"
+        if self.last_solve_method:
+            return self.last_solve_method
+        return "couple_gmg" if self.pressure_solver == "gmg" else "flow"
+
+    def export_flow_field(self, output_dir: str | Path = "surrogate_debug_outputs", prefix: str | None = None) -> Path:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        stem = self._output_stem(prefix)
+        file_path = output_path / f"{stem}_3d_flow_field.npz"
+        history_iteration = np.asarray([item["iteration"] for item in self.iteration_history], dtype=float)
+        history_momentum = np.asarray([item["momentum"] for item in self.iteration_history], dtype=float)
+        history_continuity = np.asarray([item["continuity"] for item in self.iteration_history], dtype=float)
+        history_update = np.asarray([item["update"] for item in self.iteration_history], dtype=float)
+        history_q_hat = np.asarray([item["q_hat"] for item in self.iteration_history], dtype=float)
+        history_delta_p = np.asarray([item["delta_p"] for item in self.iteration_history], dtype=float)
+        history_nut_max = np.asarray([item.get("nut_max", 0.0) for item in self.iteration_history], dtype=float)
+        history_nut_mean = np.asarray([item.get("nut_mean", 0.0) for item in self.iteration_history], dtype=float)
+        np.savez_compressed(
+            file_path,
+            R=self.R.detach().cpu().numpy(),
+            Theta=self.Theta.detach().cpu().numpy(),
+            Z=self.Z.detach().cpu().numpy(),
+            phi=self.phi.detach().cpu().numpy(),
+            UTheta=self.UT.detach().cpu().numpy(),
+            UZ=self.Uz.detach().cpu().numpy(),
+            P=self.P.detach().cpu().numpy(),
+            u_theta=(self.UT * self.u_omega).detach().cpu().numpy(),
+            u_z=(self.Uz * self.u_zo).detach().cpu().numpy(),
+            p=(self.P * self.P0).detach().cpu().numpy(),
+            history_iteration=history_iteration,
+            history_momentum=history_momentum,
+            history_continuity=history_continuity,
+            history_update=history_update,
+            history_q_hat=history_q_hat,
+            history_delta_p=history_delta_p,
+            history_nut_max=history_nut_max,
+            history_nut_mean=history_nut_mean,
+        )
+        return file_path
+
+    def plot_convergence(
+        self,
+        output_dir: str | Path = "surrogate_debug_outputs",
+        prefix: str | None = None,
+    ) -> tuple[Path, Path, Path]:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        if not self.iteration_history:
+            raise RuntimeError("No iteration history to plot. Run solve() first.")
+
+        iterations = np.asarray([item["iteration"] for item in self.iteration_history], dtype=float)
+        momentum = np.asarray([item["momentum"] for item in self.iteration_history], dtype=float)
+        continuity = np.asarray([item["continuity"] for item in self.iteration_history], dtype=float)
+        momentum = np.clip(momentum, 1e-30, None)
+        continuity = np.clip(continuity, 1e-30, None)
+
+        stem = self._output_stem(prefix)
+        title = stem.replace("_", "-").upper()
+        momentum_path = output_path / f"{stem}_momentum_residual.png"
+        continuity_path = output_path / f"{stem}_continuity_residual.png"
+        combined_path = output_path / f"{stem}_convergence.png"
+
+        plt.figure(figsize=(7, 4))
+        plt.semilogy(iterations, momentum, color="#335c81", linewidth=1.8)
+        plt.xlabel("Iteration")
+        plt.ylabel("Momentum residual")
+        plt.title(f"{title} Momentum Residual")
+        plt.grid(True, which="both", alpha=0.25)
+        plt.tight_layout()
+        plt.savefig(momentum_path, dpi=180)
+        plt.close()
+
+        plt.figure(figsize=(7, 4))
+        plt.semilogy(iterations, continuity, color="#b35c2e", linewidth=1.8)
+        plt.xlabel("Iteration")
+        plt.ylabel("Continuity residual")
+        plt.title(f"{title} Continuity Residual")
+        plt.grid(True, which="both", alpha=0.25)
+        plt.tight_layout()
+        plt.savefig(continuity_path, dpi=180)
+        plt.close()
+
+        fig, axes = plt.subplots(2, 1, figsize=(7, 7), sharex=True)
+        axes[0].semilogy(iterations, momentum, color="#335c81", linewidth=1.8)
+        axes[0].set_ylabel("Momentum residual")
+        axes[0].grid(True, which="both", alpha=0.25)
+        axes[1].semilogy(iterations, continuity, color="#b35c2e", linewidth=1.8)
+        axes[1].set_xlabel("Iteration")
+        axes[1].set_ylabel("Continuity residual")
+        axes[1].grid(True, which="both", alpha=0.25)
+        fig.suptitle(f"{title} Convergence")
+        fig.tight_layout()
+        fig.savefig(combined_path, dpi=180)
+        plt.close(fig)
+        return momentum_path, continuity_path, combined_path
+
+    def plot_flow_slices(
+        self,
+        output_dir: str | Path = "surrogate_debug_outputs",
+        spans: tuple[float, ...] = (0.2, 0.5, 0.8),
+        prefix: str | None = None,
+    ) -> Path:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        stem = self._output_stem(prefix)
+        file_path = output_path / f"{stem}_flow_slices.png"
+
+        fig, axes = plt.subplots(len(spans), 3, figsize=(12, 3.6 * len(spans)), squeeze=False)
+        fields = [
+            (self.UT.detach().cpu().numpy() * self.u_omega, "u_theta"),
+            (self.Uz.detach().cpu().numpy() * self.u_zo, "u_z"),
+            (self.P.detach().cpu().numpy() * self.P0, "p"),
+        ]
+        for row, span in enumerate(spans):
+            i = int(np.clip(round(span * (self.n - 1)), 0, self.n - 1))
+            for col, (field, name) in enumerate(fields):
+                ax = axes[row, col]
+                image = ax.imshow(field[i, :, :].T, origin="lower", aspect="auto", cmap="cividis")
+                ax.set_title(f"{name} @ span={span:.2f}")
+                ax.set_xlabel("Theta index")
+                ax.set_ylabel("Z index")
+                fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        fig.savefig(file_path, dpi=180)
+        plt.close(fig)
+        return file_path
+
+    def post(self) -> None:
+        r = np.linspace(0.0, 1.0, self.n)
+        theta = np.linspace(0.0, 1.0, self.n)
+        rr, tt = np.meshgrid(r, theta, indexing="ij")
+
+        r_phys = self.rh + rr * (self.rs - self.rh)
+        theta_phys = tt * self.theta0
+        x = r_phys * np.cos(theta_phys)
+        y = r_phys * np.sin(theta_phys)
 
         k_mid = self.n // 2
+        ut = self.UT[:, :, k_mid].detach().cpu().numpy() * self.u_omega
+        uz = self.Uz[:, :, k_mid].detach().cpu().numpy() * self.u_zo
+        p = self.P[:, :, k_mid].detach().cpu().numpy() * self.P0
 
-        # ===== 数据 =====
-        UT = self.UT[:, :, k_mid].cpu().numpy()
-        UR = self.UR[:, :, k_mid].cpu().numpy()
-        P = self.P[:, :, k_mid].cpu().numpy()
+        for data, title, label in [
+            (ut, "Tangential Velocity", "ut / m s-1"),
+            (uz, "Axial Velocity", "uz / m s-1"),
+            (p, "Pressure", "p / Pa"),
+        ]:
+            plt.figure(figsize=(6, 6))
+            plt.pcolormesh(x, y, data, shading="auto", cmap="cividis")
+            plt.colorbar(label=label)
+            plt.title(f"{title} (Physical Space)")
+            plt.axis("equal")
+            plt.xlabel("x")
+            plt.ylabel("y")
+            plt.show()
 
-        # 映射回标准空间
-        ut = UT * self.u_omega
-        ur = UR * self.u_omega
-        p = P * self.P0
-
-        # ===== 1️⃣ 周向速度 =====
-        plt.figure(figsize=(6, 6))
-        plt.pcolormesh(X, Y, ut, shading='auto', cmap='cividis')
-        plt.colorbar(label="ut/m s-1")
-        plt.title("Tangential Velocity (Physical Space)")
-        plt.axis('equal')
-        plt.xlabel("x")
-        plt.ylabel("y")
-        plt.show()
-
-        # ===== 2️⃣ 径向速度 =====
-        plt.figure(figsize=(6, 6))
-        plt.pcolormesh(X, Y, ur, shading='auto', cmap='cividis')
-        plt.colorbar(label="ur/m s-1")
-        plt.title("Radial Velocity (Physical Space)")
-        plt.axis('equal')
-        plt.xlabel("x")
-        plt.ylabel("y")
-        plt.show()
-
-        # ===== 3️⃣ 压力 =====
-        plt.figure(figsize=(6, 6))
-        plt.pcolormesh(X, Y, p, shading='auto', cmap='cividis')
-        plt.colorbar(label="p/Pa")
-        plt.title("Pressure (Physical Space)")
-        plt.axis('equal')
-        plt.xlabel("x")
-        plt.ylabel("y")
-        plt.show()
-
-    # 用来展示叶片边界识别的效果，改成R向的
-    def plot_blade_boundary(self, span=0.5):
-        if self.blade_mask is None:
-            raise RuntimeError("No blade boundary has been attached yet.")
-        r_index = int(self.n * span) if span != 1.0 else -1    # 取span=0.5的地方
+    def plot_blade_boundary(self, span: float = 0.5) -> None:
+        if self.blade_mask is None or self.blade_distance is None:
+            print("No blade boundary is attached.")
+            return
+        r_index = int(self.n * span) if span != 1.0 else -1
+        r_index = int(np.clip(r_index, 0, self.n - 1))
         mask_slice = self.blade_mask[r_index, :, :].detach().cpu().numpy().T
         dist_slice = self.blade_distance[r_index, :, :].detach().cpu().numpy().T
-        phi_mask = self.phi_mask[r_index, :, :].detach().cpu().numpy().T
+        phi_slice = self.phi[r_index, :, :].detach().cpu().numpy().T
 
         fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
         axes[0].imshow(mask_slice, origin="lower", aspect="auto", cmap="gray_r")
@@ -747,47 +1153,136 @@ class BladeCalc:
         axes[1].set_ylabel("Z index k")
         fig.colorbar(image, ax=axes[1], fraction=0.046, pad=0.04)
 
-        img = axes[2].imshow(phi_mask, origin="lower", aspect="auto", cmap="GnBu")
-        axes[2].set_title(f"Blade Phi Mask @ i={r_index} (span={span})")
+        image = axes[2].imshow(phi_slice, origin="lower", aspect="auto", cmap="GnBu")
+        axes[2].set_title(f"Phi Mask @ i={r_index} (span={span})")
         axes[2].set_xlabel("Theta index j")
         axes[2].set_ylabel("Z index k")
-        fig.colorbar(img, ax=axes[2], fraction=0.046, pad=0.04)
+        fig.colorbar(image, ax=axes[2], fraction=0.046, pad=0.04)
         fig.tight_layout()
         plt.show()
 
 
-# 确定随机数的函数
-def seed_everything(seed):
+def seed_everything(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
-if __name__ == "__main__":
+def _write_debug_outputs(solver: BladeCalc, output_dir: Path, prefix: str) -> None:
+    field_path = solver.export_flow_field(output_dir, prefix=prefix)
+    momentum_path, continuity_path, combined_path = solver.plot_convergence(output_dir, prefix=prefix)
+    slices_path = solver.plot_flow_slices(output_dir, prefix=prefix)
+    print(f"3D flow field saved to: {field_path}")
+    print(f"Momentum residual curve saved to: {momentum_path}")
+    print(f"Continuity residual curve saved to: {continuity_path}")
+    print(f"Combined convergence curve saved to: {combined_path}")
+    print(f"Flow slices saved to: {slices_path}")
+
+
+def run_simple_main() -> SolveLog:
     seed_everything(10492)
-    N = 256
+    output_dir = Path("surrogate_debug_outputs")
     solver = BladeCalc(
-        n=N,
+        n=48,
         rh=0.0605,
         rs=0.08,
         h=0.125,
-        mu=1.0,
-        rho=1.0,
-        omega=1.0,
+        mu=0.006,
+        rho=10650,
+        omega=-420 * np.pi / 60,
+        qv=0.16,
         n_blade=6,
-        max_iter=200,
-        tol=1e-5,
-        u_relax=0.3,
-        p_relax=0.3,
+        max_iter=480,
+        tol=1e-4,
+        pressure_solver="gmg",
+        pressure_max_inner=80,
+        pressure_tol=1e-7,
         device="cuda",
-        z0=0.0,
         blade_params="../BladeOptimizerLFR/CQ_20260327_232449_RealExp_Calc/blade_params.json",
+        delta_p_initial=0.1,
+        pseudo_dt=0.001,
+        rans_model="mixing_length",
+        rans_mixing_length=0.03,
+        rans_nut_max_ratio=20.0,
+        local_pseudo_dt=True,
+        pseudo_cfl=1.5,
     )
-    span = 0.5
-    Ri = int(N * span) if span != 1.0 else -1
-    slice_distance = solver.boundary.signed_distance[Ri, :, :].copy()
-    inside_vals = slice_distance[solver.boundary.mask[Ri, :, :]]
-    print(f"内部体素距离值: min={inside_vals.min()}, max={inside_vals.max()}, mean={inside_vals.mean()}")
-    print(f"Blade boundary attached, masked points = {solver.boundary.metadata['mask_points']}")
-    solver.plot_blade_boundary(span=span)
+    solver.u_relax = 0.45
+    solver.p_relax = 0.25
+    solver.momentum_sweeps = 5
+    solver.momentum_solver_relax = 0.8
+    solver.gmg_cycles = 8
+    solver.gmg_levels = 5
+    solver.rans_smoothing_steps = 2
+    log = solver.solve(method="simple", max_outer=8, report_interval=20)
+    _write_debug_outputs(solver, output_dir, "simple")
+    return log
+
+
+# 主程序用这个GMG COUPLE Pseudo Transient
+def run_couple_gmg_main() -> SolveLog:
+    seed_everything(10492)
+    output_dir = Path("surrogate_debug_outputs")
+    solver = BladeCalc(
+        n=256,
+        rh=0.0605,
+        rs=0.08,
+        h=0.125,
+        mu=0.006,
+        rho=10650,
+        omega=-420 * np.pi / 60,
+        qv=0.16,
+        n_blade=6,
+        max_iter=360,
+        tol=1e-4,
+        pressure_solver="gmg",
+        pressure_max_inner=800,
+        pressure_tol=1e-7,
+        device="cuda",
+        blade_params="../BladeOptimizerLFR/CQ_20260327_232449_RealExp_Calc/blade_params.json",
+        delta_p_initial=0.1,
+        pseudo_dt=0.0005,
+        rans_model="mixing_length",
+        rans_mixing_length=0.03,
+        rans_nut_max_ratio=20.0,
+        local_pseudo_dt=True,
+        pseudo_cfl=1.5,
+    )
+    solver.couple_relax = 0.2
+    solver.couple_momentum_update_limit = 0.2
+    solver.couple_pressure_velocity_limit = 0.2
+    solver.couple_pressure_update_limit = 1.0
+    solver.couple_flow_control = False
+    solver.couple_flow_control_interval = 20
+    solver.couple_flow_control_gain = 0.25
+    solver.couple_flow_control_clip = 0.08
+    solver.momentum_sweeps = 10
+    solver.momentum_solver_relax = 0.8
+    solver.couple_pressure_backtracking = True
+    solver.couple_pressure_max_momentum_growth = 1.0
+    solver.couple_pressure_min_relax = 1e-3
+    solver.couple_pressure_interval = 10
+    solver.rans_smoothing_steps = 1
+    solver.gmg_cycles = 8
+    solver.gmg_levels = 6
+    solver.couple_pressure_sweeps = 1
+    solver.pressure_projection_relax = 0.25
+    log = solver.solve(method="couple", report_interval=1)
+    _write_debug_outputs(solver, output_dir, "couple_gmg")
+    return log
+
+
+def run_main(method: str = "couple") -> SolveLog:
+    method = method.lower().replace("-", "_")
+    if method in {"simple", "simple_gmg"}:
+        return run_simple_main()
+    if method in {"couple", "couple_gmg", "gmg"}:
+        return run_couple_gmg_main()
+    raise ValueError("method must be 'couple' or 'simple'.")
+
+
+if __name__ == "__main__":
+    selected_method = "couple_gmg"   # 主程序生成
+    log = run_main(selected_method)
+    print(log)
