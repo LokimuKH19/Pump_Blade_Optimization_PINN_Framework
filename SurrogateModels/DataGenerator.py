@@ -1,9 +1,11 @@
 ﻿from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import json
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Sequence
 
 from BladeImport import attach_blade_to_solver
 import matplotlib.pyplot as plt
@@ -622,7 +624,7 @@ class BladeCalc:
             - coef["pseudo"] * self.UT
             - solid * self._solid_ut()
             + self.dA * pressure_theta
-        )
+        )    # 角向残差
         res_z = (
             coef["A_z"] * self.Uz
             - coef["N"] * Uz_n
@@ -632,7 +634,7 @@ class BladeCalc:
             - coef["pseudo"] * self.Uz
             + self.dA * pressure_z
             + self.dA * self.G_star
-        )
+        )    # 轴向残差
         return res_theta, res_z
 
     def _fluid_residual_mask(self) -> torch.Tensor:
@@ -780,6 +782,7 @@ class BladeCalc:
         momentum = self.momentum_error()
         return float(update.item()), mass, momentum
 
+    # 计算连续性的情况（因为假设了没有r向流动因此其实没有完全封闭）
     def continuity_error(self) -> float:
         div = self._rhie_flux_divergence(self.UT, self.Uz, self.P)
         mask = self._fluid_residual_mask()
@@ -998,9 +1001,12 @@ class BladeCalc:
             Theta=self.Theta.detach().cpu().numpy(),
             Z=self.Z.detach().cpu().numpy(),
             phi=self.phi.detach().cpu().numpy(),
+            UR=torch.zeros_like(self.UT).detach().cpu().numpy(),
+            UT=self.UT.detach().cpu().numpy(),
             UTheta=self.UT.detach().cpu().numpy(),
             UZ=self.Uz.detach().cpu().numpy(),
             P=self.P.detach().cpu().numpy(),
+            u_r=torch.zeros_like(self.UT).detach().cpu().numpy(),
             u_theta=(self.UT * self.u_omega).detach().cpu().numpy(),
             u_z=(self.Uz * self.u_zo).detach().cpu().numpy(),
             p=(self.P * self.P0).detach().cpu().numpy(),
@@ -1014,6 +1020,231 @@ class BladeCalc:
             history_nut_mean=history_nut_mean,
         )
         return file_path
+
+    @staticmethod
+    def _json_ready(value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, (np.integer, np.floating, np.bool_)):
+            return value.item()
+        if torch.is_tensor(value):
+            if value.numel() == 1:
+                return value.detach().cpu().item()
+            return value.detach().cpu().tolist()
+        if isinstance(value, dict):
+            return {str(key): BladeCalc._json_ready(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [BladeCalc._json_ready(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _condition_parameters_payload(
+        self,
+        *,
+        case_id: str,
+        flow_path: Path,
+        shape_path: Path,
+        visualizations: dict[str, Path],
+        log: SolveLog | None,
+    ) -> dict[str, Any]:
+        result = {
+            "method": self.last_solve_method or self._output_stem(),
+            "converged": bool(log.converged) if log is not None else None,
+            "iterations": int(log.iterations) if log is not None else len(self.iteration_history),
+            "final_momentum": float(log.final_momentum) if log is not None else self.momentum_error(),
+            "final_mass": float(log.final_mass) if log is not None else self.continuity_error(),
+            "final_update": float(log.final_update) if log is not None else None,
+            "final_q_hat": float(log.final_q_hat) if log is not None else self.outlet_flow_rate_hat(),
+            "delta_p": float(log.delta_p) if log is not None else self.delta_p_global,
+        }
+        return {
+            "schema_version": 1,
+            "case_id": case_id,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "files": {
+                "flow_field": str(flow_path),
+                "shape_parameters": str(shape_path),
+                **{name: str(path) for name, path in visualizations.items()},
+            },
+            "condition_parameters": {
+                "rh": self.rh,
+                "rs": self.rs,
+                "h": self.h,
+                "z0": self.z0,
+                "mu": self.mu,
+                "rho": self.rho,
+                "nu": self.nu,
+                "omega": self.omega,
+                "qv": self.qv,
+                "n_blade": self.n_blade,
+                "absolute_frame": self.absolute_frame,
+                "delta_p_initial_or_current": self.delta_p_global,
+            },
+            "dimensionless_parameters": {
+                "u_omega": self.u_omega,
+                "u_zo": self.u_zo,
+                "P0": self.P0,
+                "Re_omega": self.Re_omega,
+                "Eu_omega": self.Eu_omega,
+                "Lambda": self.Lambda,
+                "Ku": self.Ku,
+                "delta": self.delta,
+                "G_star": self.G_star,
+                "qv_passage": self.qv_passage,
+                "qv_hat": self.qv_hat,
+            },
+            "solver_parameters": {
+                "n": self.n,
+                "max_iter": self.max_iter,
+                "tol": self.tol,
+                "u_relax": self.u_relax,
+                "p_relax": self.p_relax,
+                "pressure_solver": self.pressure_solver,
+                "pressure_max_inner": self.pressure_max_inner,
+                "pressure_tol": self.pressure_tol,
+                "pseudo_dt": self.pseudo_dt,
+                "local_pseudo_dt": self.local_pseudo_dt,
+                "pseudo_cfl": self.pseudo_cfl,
+                "rans_model": self.rans_model,
+                "rans_mixing_length": self.rans_mixing_length,
+                "rans_nut_max_ratio": self.rans_nut_max_ratio,
+                "couple_relax": self.couple_relax,
+                "momentum_sweeps": self.momentum_sweeps,
+                "momentum_solver_relax": self.momentum_solver_relax,
+                "gmg_levels": self.gmg_levels,
+                "gmg_cycles": self.gmg_cycles,
+                "couple_pressure_sweeps": self.couple_pressure_sweeps,
+                "couple_pressure_interval": self.couple_pressure_interval,
+                "pressure_projection_relax": self.pressure_projection_relax,
+            },
+            "result_summary": result,
+            "iteration_history": self.iteration_history,
+        }
+
+    def _shape_parameters_payload(self, *, case_id: str, condition_path: Path, flow_path: Path) -> dict[str, Any]:
+        boundary_meta = self.boundary.metadata if self.boundary is not None else None
+        mask_points = int(self.blade_mask.detach().cpu().sum().item()) if self.blade_mask is not None else 0
+        return {
+            "schema_version": 1,
+            "case_id": case_id,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "files": {
+                "condition_parameters": str(condition_path),
+                "flow_field": str(flow_path),
+                "blade_params": self.blade_params,
+            },
+            "shape_parameters": {
+                "blade_params": self.blade_params,
+                "blade_params_is_path": self.blade_params is not None,
+                "n_blade": self.n_blade,
+                "rh": self.rh,
+                "rs": self.rs,
+                "h": self.h,
+                "z0": self.z0,
+                "theta0": self.theta0,
+                "delta_r": self.delta_r,
+            },
+            "ibm_parameters": {
+                "ibm_C": self.ibm_C,
+                "ibm_epsilon": self.ibm_epsilon,
+                "ibm_hard_phi": self.ibm_hard_phi,
+                "blade_mask_points": mask_points,
+            },
+            "blade_boundary_metadata": boundary_meta,
+        }
+
+    def export_case_parameters(
+        self,
+        case_dir: str | Path,
+        *,
+        case_id: str,
+        flow_path: Path,
+        visualizations: dict[str, Path] | None = None,
+        log: SolveLog | None = None,
+    ) -> tuple[Path, Path]:
+        output_path = Path(case_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        visualizations = dict(visualizations or {})
+        condition_path = output_path / "condition_parameters.json"
+        shape_path = output_path / "shape_parameters.json"
+        condition_payload = self._condition_parameters_payload(
+            case_id=case_id,
+            flow_path=flow_path,
+            shape_path=shape_path,
+            visualizations=visualizations,
+            log=log,
+        )
+        shape_payload = self._shape_parameters_payload(
+            case_id=case_id,
+            condition_path=condition_path,
+            flow_path=flow_path,
+        )
+        condition_path.write_text(
+            json.dumps(self._json_ready(condition_payload), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        shape_path.write_text(
+            json.dumps(self._json_ready(shape_payload), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return condition_path, shape_path
+
+    def export_dataset_case(
+        self,
+        output_root: str | Path = "generated_flow_cases",
+        *,
+        case_name: str | None = None,
+        prefix: str | None = None,
+        log: SolveLog | None = None,
+        save_visualizations: bool = True,
+        plot_3d: bool = False,
+        show: bool = False,
+    ) -> dict[str, Path]:
+        stem = self._output_stem(prefix)
+        case_id = case_name or f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        case_dir = Path(output_root) / case_id
+        case_dir.mkdir(parents=True, exist_ok=True)
+
+        flow_path = self.export_flow_field(case_dir, prefix=case_id)
+        visualizations: dict[str, Path] = {}
+        if save_visualizations:
+            momentum_path, continuity_path, combined_path = self.plot_convergence(case_dir, prefix=case_id)
+            slices_path = self.plot_flow_slices(case_dir, prefix=case_id)
+            physical_path = self.plot_physical_flow_spans(
+                spans=(0.2, 0.5, 0.8),
+                show=show,
+                save_path=case_dir / f"{case_id}_physical_spans.png",
+            )
+            visualizations.update(
+                {
+                    "momentum_residual": momentum_path,
+                    "continuity_residual": continuity_path,
+                    "convergence": combined_path,
+                    "flow_slices": slices_path,
+                    "physical_spans": physical_path,
+                }
+            )
+            if plot_3d:
+                stream_path = case_dir / f"{case_id}_3d_streamlines.png"
+                info = self.plot_3d_streamlines(show=show, save_path=stream_path)
+                if info.get("saved", False):
+                    visualizations["streamlines_3d"] = stream_path
+
+        condition_path, shape_path = self.export_case_parameters(
+            case_dir,
+            case_id=case_id,
+            flow_path=flow_path,
+            visualizations=visualizations,
+            log=log,
+        )
+        return {
+            "case_dir": case_dir,
+            "flow_field": flow_path,
+            "condition_parameters": condition_path,
+            "shape_parameters": shape_path,
+            **visualizations,
+        }
 
     def plot_convergence(
         self,
@@ -1102,6 +1333,262 @@ class BladeCalc:
         plt.close(fig)
         return file_path
 
+    @staticmethod
+    def _span_to_index(span: float, n: int) -> int:
+        span = float(np.clip(span, 0.0, 1.0))
+        return int(round(span * (n - 1)))
+
+    @staticmethod
+    def _field_stats_np(field: np.ndarray, mask: np.ndarray) -> tuple[float, float, float]:
+        values = np.asarray(field)[np.asarray(mask, dtype=bool)]
+        if values.size == 0:
+            return float("nan"), float("nan"), float("nan")
+        return float(np.mean(values)), float(np.min(values)), float(np.max(values))
+
+    def _blade_mask_numpy(self) -> np.ndarray:
+        if self.blade_mask is not None:
+            return self.blade_mask.detach().cpu().numpy().astype(bool)
+        return (self.phi.detach().cpu().numpy() <= self.ibm_hard_phi).astype(bool)
+
+    def _physical_field_arrays(self) -> dict[str, np.ndarray]:
+        return {
+            "UR": np.zeros(self.r_hatC.shape, dtype=np.float32),
+            "UT": (self.UT * self.u_omega).detach().cpu().numpy(),
+            "UZ": (self.Uz * self.u_zo).detach().cpu().numpy(),
+            "P": (self.P * self.P0).detach().cpu().numpy(),
+        }
+
+    def plot_physical_flow_spans(
+        self,
+        spans: Sequence[float] = (0.2, 0.5, 0.8),
+        *,
+        show: bool = True,
+        save_path: str | Path | None = None,
+    ) -> Path:
+        fields = self._physical_field_arrays()
+        blade_mask_3d = self._blade_mask_numpy()
+        fluid_mask_3d = ~blade_mask_3d
+        n = self.n
+
+        print("\n========== DataGenerator Flow Post Check ==========")
+        print(f"grid n={n}, method={self.last_solve_method or self._output_stem()}, pressure_solver={self.pressure_solver}")
+        print(f"outlet q_hat={self.outlet_flow_rate_hat():.6g}, delta_p={self.delta_p_global:.6g}")
+        print("span statistics are computed in physical SI units over fluid cells.")
+        for span in spans:
+            r_index = self._span_to_index(float(span), n)
+            fluid = fluid_mask_3d[r_index]
+            ur_stats = self._field_stats_np(fields["UR"][r_index], fluid)
+            ut_stats = self._field_stats_np(fields["UT"][r_index], fluid)
+            uz_stats = self._field_stats_np(fields["UZ"][r_index], fluid)
+            p_stats = self._field_stats_np(fields["P"][r_index], fluid)
+            print(f"span={span:.2f} (i={r_index})")
+            print(f"  UR [mean/min/max] = {ur_stats[0]:.6g} / {ur_stats[1]:.6g} / {ur_stats[2]:.6g}")
+            print(f"  UT [mean/min/max] = {ut_stats[0]:.6g} / {ut_stats[1]:.6g} / {ut_stats[2]:.6g}")
+            print(f"  UZ [mean/min/max] = {uz_stats[0]:.6g} / {uz_stats[1]:.6g} / {uz_stats[2]:.6g}")
+            print(f"  P  [mean/min/max] = {p_stats[0]:.6g} / {p_stats[1]:.6g} / {p_stats[2]:.6g}")
+        print("===================================================\n")
+
+        fig, axes = plt.subplots(len(spans), 4, figsize=(18, 3.6 * len(spans)), squeeze=False)
+        field_names = ["UR", "UT", "UZ", "P"]
+        cmaps = {"UR": "coolwarm", "UT": "coolwarm", "UZ": "viridis", "P": "plasma"}
+        for row, span in enumerate(spans):
+            r_index = self._span_to_index(float(span), n)
+            blade_mask = blade_mask_3d[r_index].T
+            for col, name in enumerate(field_names):
+                data = np.ma.array(fields[name][r_index].T, mask=blade_mask)
+                image = axes[row, col].imshow(data, origin="lower", aspect="auto", cmap=cmaps[name])
+                if np.any(blade_mask):
+                    axes[row, col].contour(blade_mask.astype(float), levels=[0.5], colors="k", linewidths=0.8)
+                axes[row, col].set_title(f"{name} @ span={float(span):.2f} (physical)")
+                axes[row, col].set_xlabel("Theta index")
+                axes[row, col].set_ylabel("Z index")
+                fig.colorbar(image, ax=axes[row, col], fraction=0.046, pad=0.04)
+
+        fig.tight_layout()
+        if save_path is None:
+            save_path = Path("generated_flow_cases") / f"{self._output_stem()}_physical_spans.png"
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=160, bbox_inches="tight")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+        return save_path
+
+    def _trace_streamline_cylindrical(
+        self,
+        *,
+        fields_phy: dict[str, np.ndarray],
+        phi_field: np.ndarray,
+        seed_r: float,
+        seed_theta: float,
+        seed_z: float,
+        max_steps: int = 500,
+        step_scale: float = 0.75,
+        phi_stop: float = 0.25,
+    ) -> np.ndarray:
+        from SurrogateModelingUtils import interpolate_field_periodic
+
+        dr_cell = self.delta_r / max(self.n - 1, 1)
+        dz_cell = self.h / max(self.n - 1, 1)
+        dtheta_cell = self.rh * self.theta0 / max(self.n - 1, 1)
+        step_length = step_scale * min(dr_cell, dz_cell, dtheta_cell)
+
+        def eval_state(r_value: float, theta_value: float, z_value: float):
+            r_norm = (r_value - self.rh) / self.delta_r
+            theta_norm = (theta_value % self.theta0) / self.theta0
+            z_norm = (z_value - self.z0) / self.h
+            phi_value = interpolate_field_periodic(phi_field, r_norm, theta_norm, z_norm)
+            if not np.isfinite(phi_value) or phi_value < phi_stop:
+                return None
+            ur = interpolate_field_periodic(fields_phy["UR"], r_norm, theta_norm, z_norm)
+            ut = interpolate_field_periodic(fields_phy["UT"], r_norm, theta_norm, z_norm)
+            uz = interpolate_field_periodic(fields_phy["UZ"], r_norm, theta_norm, z_norm)
+            if not np.isfinite(ur + ut + uz):
+                return None
+            speed = float(np.sqrt(ur**2 + ut**2 + uz**2))
+            if speed < 1e-10:
+                return None
+            return np.array([ur, ut / max(r_value, 1e-10), uz], dtype=float), speed
+
+        state = np.array([seed_r, seed_theta, seed_z], dtype=float)
+        points: list[np.ndarray] = []
+        for _ in range(max_steps):
+            if state[0] < self.rh or state[0] > self.rs:
+                break
+            if state[2] < self.z0 or state[2] > self.z0 + self.h:
+                break
+            result = eval_state(float(state[0]), float(state[1]), float(state[2]))
+            if result is None:
+                break
+            rhs_1, speed_1 = result
+            dt = step_length / max(speed_1, 1e-10)
+            mid_state = state + 0.5 * dt * rhs_1
+            result_mid = eval_state(float(mid_state[0]), float(mid_state[1]), float(mid_state[2]))
+            if result_mid is None:
+                break
+            rhs_2, _ = result_mid
+            state = state + dt * rhs_2
+            points.append(np.array([state[0] * np.cos(state[1]), state[0] * np.sin(state[1]), state[2]], dtype=float))
+
+        if len(points) < 2:
+            return np.zeros((0, 3), dtype=float)
+        return np.vstack(points)
+
+    def plot_3d_streamlines(
+        self,
+        *,
+        show: bool = True,
+        save_path: str | Path | None = None,
+        seed_r_count: int = 10,
+        seed_theta_count: int = 10,
+        passages_to_plot: int | None = None,
+        max_streamline_steps: int = 1000,
+        streamline_step_scale: float = 0.9,
+        theme: str = "dark",
+    ) -> dict[str, Any]:
+        try:
+            import pyvista as pv
+            from SurrogateModelingUtils import make_pyvista_blade_surface_meshes, make_pyvista_passage_grid
+        except Exception as exc:
+            print(f"3D streamline plot skipped: {exc}")
+            return {"saved": False, "streamline_count": 0, "reason": str(exc)}
+
+        bg = "#0E1117" if theme == "dark" else "white"
+        blade_color = "#FFB000" if theme == "dark" else "#D55E00"
+        plotter = pv.Plotter(off_screen=not show, window_size=(1400, 950))
+        plotter.set_background(bg)
+        plotter.add_mesh(make_pyvista_passage_grid(self), color="lightgray", opacity=0.22, show_edges=True, line_width=0.6)
+
+        if self.boundary is not None:
+            for blade_mesh in make_pyvista_blade_surface_meshes(self.boundary, self):
+                plotter.add_mesh(
+                    blade_mesh,
+                    color=blade_color,
+                    show_edges=False,
+                    smooth_shading=True,
+                    ambient=0.20,
+                    diffuse=0.85,
+                    specular=0.18,
+                )
+
+        theta_ring = np.linspace(0.0, 2.0 * np.pi, 240, dtype=float)
+        for radius in [self.rh, self.rs]:
+            x_ring = radius * np.cos(theta_ring)
+            y_ring = radius * np.sin(theta_ring)
+            plotter.add_lines(np.column_stack([x_ring, y_ring, np.full_like(x_ring, self.z0)]), color="steelblue", width=2)
+            plotter.add_lines(
+                np.column_stack([x_ring, y_ring, np.full_like(x_ring, self.z0 + self.h)]),
+                color="seagreen",
+                width=2,
+            )
+
+        phi_field = self.phi.detach().cpu().numpy()
+        fields_phy = self._physical_field_arrays()
+        phi_inlet = phi_field[:, :, 1 if self.n > 1 else 0]
+        r_coords = self.R[:, 0, 0].detach().cpu().numpy()
+        theta_coords = self.Theta[0, :, 0].detach().cpu().numpy()
+        z_seed = self.z0 + self.h * float(self.Z[0, 0, 1 if self.n > 1 else 0].item())
+
+        r_candidates = np.linspace(1, max(len(r_coords) - 2, 1), num=max(seed_r_count, 1), dtype=int)
+        theta_candidates = np.linspace(1, max(len(theta_coords) - 2, 1), num=max(seed_theta_count, 1), dtype=int)
+        base_seeds: list[tuple[float, float, float]] = []
+        for i_index in r_candidates:
+            for j_index in theta_candidates:
+                if phi_inlet[i_index, j_index] > 0.75:
+                    seed_r = self.rh + float(r_coords[i_index]) * self.delta_r
+                    seed_theta = float(theta_coords[j_index]) * self.theta0
+                    base_seeds.append((seed_r, seed_theta, z_seed))
+
+        if passages_to_plot is None:
+            passages_to_plot = self.n_blade
+        passages_to_plot = max(1, min(int(passages_to_plot), self.n_blade))
+        colors = plt.cm.viridis(np.linspace(0.12, 0.95, max(len(base_seeds), 1)))[:, :3]
+        tube_radius = 0.0075 * self.delta_r
+        streamline_count = 0
+        for blade_id in range(passages_to_plot):
+            theta_shift = blade_id * self.theta0
+            for color, (seed_r, seed_theta, seed_z) in zip(colors, base_seeds):
+                streamline = self._trace_streamline_cylindrical(
+                    fields_phy=fields_phy,
+                    phi_field=phi_field,
+                    seed_r=seed_r,
+                    seed_theta=seed_theta + theta_shift,
+                    seed_z=seed_z,
+                    max_steps=max_streamline_steps,
+                    step_scale=streamline_step_scale,
+                )
+                if streamline.shape[0] >= 2:
+                    plotter.add_mesh(
+                        pv.Spline(streamline, max(streamline.shape[0], 2)).tube(radius=tube_radius),
+                        color=tuple(float(c) for c in color),
+                        smooth_shading=True,
+                        opacity=0.92,
+                    )
+                    streamline_count += 1
+
+        plotter.add_text(
+            f"DataGenerator Streamlines | n={self.n} | blades={self.n_blade} | solver={self.pressure_solver}",
+            position="upper_left",
+            font_size=10,
+            color="white" if theme == "dark" else "black",
+        )
+        plotter.add_axes()
+        plotter.camera_position = "iso"
+        plotter.camera.zoom(1.18)
+
+        saved = save_path is not None
+        if show and save_path is not None:
+            plotter.show(screenshot=str(save_path))
+        elif show:
+            plotter.show()
+        else:
+            if save_path is not None:
+                plotter.screenshot(str(save_path))
+            plotter.close()
+        return {"saved": saved, "streamline_count": streamline_count, "renderer": "pyvista"}
+
     def post(self) -> None:
         r = np.linspace(0.0, 1.0, self.n)
         theta = np.linspace(0.0, 1.0, self.n)
@@ -1169,20 +1656,26 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _write_debug_outputs(solver: BladeCalc, output_dir: Path, prefix: str) -> None:
-    field_path = solver.export_flow_field(output_dir, prefix=prefix)
-    momentum_path, continuity_path, combined_path = solver.plot_convergence(output_dir, prefix=prefix)
-    slices_path = solver.plot_flow_slices(output_dir, prefix=prefix)
-    print(f"3D flow field saved to: {field_path}")
-    print(f"Momentum residual curve saved to: {momentum_path}")
-    print(f"Continuity residual curve saved to: {continuity_path}")
-    print(f"Combined convergence curve saved to: {combined_path}")
-    print(f"Flow slices saved to: {slices_path}")
+def _write_debug_outputs(solver: BladeCalc, output_dir: Path, prefix: str, log: SolveLog | None = None) -> None:
+    paths = solver.export_dataset_case(
+        output_root=output_dir,
+        prefix=prefix,
+        log=log,
+        save_visualizations=True,
+        plot_3d=False,
+        show=False,
+    )
+    print(f"Case directory saved to: {paths['case_dir']}")
+    print(f"Flow field saved to: {paths['flow_field']}")
+    print(f"Condition parameters saved to: {paths['condition_parameters']}")
+    print(f"Shape parameters saved to: {paths['shape_parameters']}")
+    if "physical_spans" in paths:
+        print(f"Physical span plot saved to: {paths['physical_spans']}")
 
 
 def run_simple_main() -> SolveLog:
     seed_everything(10492)
-    output_dir = Path("surrogate_debug_outputs")
+    output_dir = Path("generated_flow_cases")
     solver = BladeCalc(
         n=48,
         rh=0.0605,
@@ -1216,14 +1709,14 @@ def run_simple_main() -> SolveLog:
     solver.gmg_levels = 5
     solver.rans_smoothing_steps = 2
     log = solver.solve(method="simple", max_outer=8, report_interval=20)
-    _write_debug_outputs(solver, output_dir, "simple")
+    _write_debug_outputs(solver, output_dir, "simple", log)
     return log
 
 
 # 主程序用这个GMG COUPLE Pseudo Transient
 def run_couple_gmg_main() -> SolveLog:
     seed_everything(10492)
-    output_dir = Path("surrogate_debug_outputs")
+    output_dir = Path("generated_flow_cases")
     solver = BladeCalc(
         n=256,
         rh=0.0605,
@@ -1269,7 +1762,7 @@ def run_couple_gmg_main() -> SolveLog:
     solver.couple_pressure_sweeps = 1
     solver.pressure_projection_relax = 0.25
     log = solver.solve(method="couple", report_interval=1)
-    _write_debug_outputs(solver, output_dir, "couple_gmg")
+    _write_debug_outputs(solver, output_dir, "couple_gmg", log)
     return log
 
 
