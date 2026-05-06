@@ -6,7 +6,9 @@ This filefolder facilitates an end-to-end mapping from the blade geometric defin
 
 - `BladeImport.py`: Converts the parametric blade geometry into the mask of the Immerse Boundary Method (IBM), which could be transfered into both CFD and surrogate modeling workflow.
 - `DataGenerator.py`: Generates CFD data in the dimensionless cylinderical coordinates via alternative traditional iteration schemes for validating and training surrogate models.
+- `DataGenerator3D.py`: Formal CFD data generator, used 3D SIMPLE algorithm to create training data for surrogate models. 
 - `PressureUpdaters.py`: Solvers of pressure correlation equation in CFD workflow.
+- `PressureUpdaters3D.py`: 3D version of `PressureUpdaters.py`, corresponding to `DataGenerator3D.py`.
 - `SurrogateModeling.py`: The main process of the current modeling methodology.
 - `SurrogateModelingUtils.py`: Necessary dependencies for `SurrogateModeling.py`.
 - `NeuralOperators.py`: Operator learning toolkit. 
@@ -27,3 +29,6 @@ Updated `SurrogateModeling.py`. The 2 constants in the IBM mask are set as learn
 
 ### May 5th, 2026
 Updated `DataGenerator.py` and its dependencies `PressureUpdaters.py`. We finally decided to apply a more stable COUPLE method with pseudo transient and geometric multigrid (GMG) pressure updater to substitute the SIMPLE algo we adopted before... and thanks to Codex, it converged now.
+
+### May 6th, 2026
+Updated `DataGenerator3D.py` and the corresponding dependencies `PressureUpdaters3D.py` which were decided as the formal data generators.
