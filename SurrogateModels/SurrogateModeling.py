@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 
 import NeuralOperators
 from BladeImport import PassageGeometry, build_blade_boundary
+from KKTProjectionOperators import CylindricalDivergenceKKTProjection, KKTProjectionConfig
 from SurrogateModelingUtils import (
     case_summary,
     d1_periodic_with_overlap,
@@ -57,6 +58,85 @@ def _to_tensor(x: Any, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     return torch.as_tensor(x, dtype=dtype)
 
 
+def _scalar_from_any(value: Any, default: float) -> float:
+    if value is None:
+        return float(default)
+    tensor = _to_tensor(value, dtype=torch.float32).reshape(-1)
+    if tensor.numel() == 0:
+        return float(default)
+    return float(torch.mean(tensor).item())
+
+
+def _span_profile_tensor(value: Any, n: int, default: float) -> torch.Tensor:
+    if value is None:
+        return torch.full((n,), float(default), dtype=torch.float32)
+
+    tensor = _to_tensor(value, dtype=torch.float32)
+    if tensor.numel() == 0:
+        return torch.full((n,), float(default), dtype=torch.float32)
+    if tensor.numel() == 1:
+        return torch.full((n,), float(tensor.reshape(-1)[0].item()), dtype=torch.float32)
+
+    if tensor.ndim > 1 and tensor.shape[0] == n:
+        return tensor.reshape(n, -1).mean(dim=1).to(torch.float32)
+
+    flat = tensor.reshape(1, 1, -1)
+    if flat.shape[-1] == n:
+        return flat.reshape(-1).to(torch.float32)
+
+    profile = F.interpolate(flat, size=n, mode="linear", align_corners=True)
+    return profile.reshape(-1).to(torch.float32)
+
+
+def _case_span_profile(
+    case: Mapping[str, Any],
+    keys: Sequence[str],
+    *,
+    n: int,
+    default: float,
+) -> torch.Tensor:
+    return _span_profile_tensor(_pick(case, *keys, default=None), n=n, default=default)
+
+
+def _expand_ibm_parameter(value: float | torch.Tensor, signed_distance: torch.Tensor) -> torch.Tensor:
+    if torch.is_tensor(value):
+        param = value.to(device=signed_distance.device, dtype=signed_distance.dtype)
+    else:
+        param = torch.tensor(float(value), device=signed_distance.device, dtype=signed_distance.dtype)
+
+    if param.ndim == 0 or param.ndim == signed_distance.ndim:
+        return param
+
+    if signed_distance.ndim == 3 and param.ndim == 1:
+        if param.numel() == signed_distance.shape[0]:
+            return param.view(-1, 1, 1)
+        return param.view(1, 1, 1)
+
+    if signed_distance.ndim == 4:
+        if param.ndim == 1:
+            if param.numel() == signed_distance.shape[1] and param.numel() != signed_distance.shape[0]:
+                return param.view(1, -1, 1, 1)
+            if param.numel() == signed_distance.shape[0]:
+                return param.view(-1, 1, 1, 1)
+            if param.numel() == signed_distance.shape[1]:
+                return param.view(1, -1, 1, 1)
+        if param.ndim == 2:
+            return param.view(param.shape[0], param.shape[1], 1, 1)
+
+    while param.ndim < signed_distance.ndim:
+        param = param.unsqueeze(-1)
+    return param
+
+
+def _profile_mean_min_max(value: torch.Tensor) -> tuple[float, float, float]:
+    profile = value.detach().float().reshape(-1)
+    return (
+        float(torch.mean(profile).item()),
+        float(torch.min(profile).item()),
+        float(torch.max(profile).item()),
+    )
+
+
 @dataclass
 class FlowCaseConfig:
     # 单个样本或单个工况需要的全部几何、物性与尺度参数。
@@ -92,8 +172,21 @@ class FlowCaseConfig:
             z0=float(_pick(case, "z0", default=0.0)),
             g=float(_pick(case, "g", default=9.8)),
             g_star=float(_pick(case, "g_star", default=0.0)),
-            ibm_C=float(_pick(case, "ibm_C", default=1.0)),
-            ibm_epsilon=float(_pick(case, "ibm_epsilon", default=0.025)),
+            ibm_C=_scalar_from_any(
+                _pick(case, "ibm_C_profile", "ibm_C_span", "ibm_C_r", "ibm_C", default=1.0),
+                default=1.0,
+            ),
+            ibm_epsilon=_scalar_from_any(
+                _pick(
+                    case,
+                    "ibm_epsilon_profile",
+                    "ibm_epsilon_span",
+                    "ibm_epsilon_r",
+                    "ibm_epsilon",
+                    default=0.025,
+                ),
+                default=0.025,
+            ),
             absolute_frame=bool(_pick(case, "absolute_frame", default=True)),
             use_absolute_omega_scale=bool(_pick(case, "use_absolute_omega_scale", default=True)),
         )
@@ -216,16 +309,8 @@ def build_phi_from_signed_distance(
 ) -> torch.Tensor:
     # 这里和 DataGenerator 中的浸没边界写法保持一致：
     # phi=1 近似纯流体，phi=0 近似纯固体，中间是平滑过渡层。
-    if torch.is_tensor(ibm_C):
-        c_value = ibm_C.to(device=signed_distance.device, dtype=signed_distance.dtype)
-    else:
-        c_value = torch.tensor(float(ibm_C), device=signed_distance.device, dtype=signed_distance.dtype)
-
-    if torch.is_tensor(ibm_epsilon):
-        epsilon_value = ibm_epsilon.to(device=signed_distance.device, dtype=signed_distance.dtype)
-    else:
-        epsilon_value = torch.tensor(float(ibm_epsilon), device=signed_distance.device, dtype=signed_distance.dtype)
-
+    c_value = _expand_ibm_parameter(ibm_C, signed_distance)
+    epsilon_value = _expand_ibm_parameter(ibm_epsilon, signed_distance)
     epsilon_value = torch.clamp(epsilon_value, min=1e-8)
     return 1.0 - torch.exp(-c_value * signed_distance ** 2 / (epsilon_value ** 2))
 
@@ -322,7 +407,24 @@ class BladeFlowDataset(Dataset):
     def _build_sample(self, case: Mapping[str, Any]) -> dict[str, torch.Tensor]:
         config = FlowCaseConfig.from_mapping(case)
         geometry = build_geometry_tensors(config)
-        blade_mask, phi, signed_distance = self._build_blade_channels(case, config)
+        ibm_c_profile = _case_span_profile(
+            case,
+            ("ibm_C_profile", "ibm_C_span", "ibm_C_r", "ibm_C"),
+            n=config.n,
+            default=config.ibm_C,
+        )
+        ibm_epsilon_profile = _case_span_profile(
+            case,
+            ("ibm_epsilon_profile", "ibm_epsilon_span", "ibm_epsilon_r", "ibm_epsilon"),
+            n=config.n,
+            default=config.ibm_epsilon,
+        )
+        blade_mask, phi, signed_distance = self._build_blade_channels(
+            case,
+            config,
+            ibm_c_profile=ibm_c_profile,
+            ibm_epsilon_profile=ibm_epsilon_profile,
+        )
         target, has_target = normalize_target_fields(case, config)
         has_true_signed_distance = bool(_pick(case, "signed_distance") is not None or _pick(case, "blade_params") is not None)
 
@@ -395,8 +497,8 @@ class BladeFlowDataset(Dataset):
             "qv_passage": torch.tensor(config.qv_passage, dtype=torch.float32),
             "qv_hat": torch.tensor(config.qv_hat, dtype=torch.float32),
             "g_star": torch.tensor(config.g_star, dtype=torch.float32),
-            "ibm_C": torch.tensor(config.ibm_C, dtype=torch.float32),
-            "ibm_epsilon": torch.tensor(config.ibm_epsilon, dtype=torch.float32),
+            "ibm_C": ibm_c_profile.to(torch.float32),
+            "ibm_epsilon": ibm_epsilon_profile.to(torch.float32),
             "absolute_frame": torch.tensor(1.0 if config.absolute_frame else 0.0, dtype=torch.float32),
         }
 
@@ -404,6 +506,9 @@ class BladeFlowDataset(Dataset):
         self,
         case: Mapping[str, Any],
         config: FlowCaseConfig,
+        *,
+        ibm_c_profile: torch.Tensor,
+        ibm_epsilon_profile: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         phi_in = _pick(case, "phi")
         mask_in = _pick(case, "blade_mask", "mask")
@@ -428,7 +533,7 @@ class BladeFlowDataset(Dataset):
             blade_mask = (phi < 0.5).to(torch.float32)
 
         if phi is None and signed_distance is not None:
-            phi = build_phi_from_signed_distance(signed_distance, config.ibm_C, config.ibm_epsilon)
+            phi = build_phi_from_signed_distance(signed_distance, ibm_c_profile, ibm_epsilon_profile)
 
         if phi is None:
             # 如果只有 sharp mask，就退化成最简单的 0/1 phi。
@@ -465,18 +570,44 @@ class SliceWiseFNOFlowModel(nn.Module):
         width: int = 16,
         depth: int = 4,
         z_padding: int = 8,
+        operator_variant: str = "hf_cfno",
+        high_modes: int | None = None,
+        fourier_feature_bands: Sequence[int] = (1, 2, 4, 8),
     ):
         super().__init__()
         self.z_padding = int(max(z_padding, 0))
-        # todo 在这里替换网络类型
-        self.core = NeuralOperators.CFNO2d_small(
-            modes=modes,
-            cheb_modes=(modes, modes),
-            width=width,
-            depth=depth,
-            input_features=input_channels,
-            output_features=4,
-        )
+        self.operator_variant = str(operator_variant).lower()
+        # todo 切换模型看这个
+        if self.operator_variant in {"fno", "legacy_fno"}:
+            self.core = NeuralOperators.FNO2d_small(
+                modes=modes,
+                width=width,
+                depth=depth,
+                input_features=input_channels,
+                output_features=4,
+            )
+        elif self.operator_variant in {"cfno", "legacy_cfno"}:
+            self.core = NeuralOperators.CFNO2d_small(
+                modes=modes,
+                cheb_modes=(modes, modes),
+                width=width,
+                depth=depth,
+                input_features=input_channels,
+                output_features=4,
+            )
+        elif self.operator_variant in {"hf_cfno", "high_frequency_cfno"}:
+            self.core = NeuralOperators.HF_CFNO2d_small(
+                modes=modes,
+                cheb_modes=(modes, modes),
+                high_modes=high_modes,
+                width=width,
+                depth=depth,
+                input_features=input_channels,
+                output_features=4,
+                fourier_feature_bands=tuple(int(v) for v in fourier_feature_bands),
+            )
+        else:
+            raise ValueError("operator_variant must be 'hf_cfno', 'cfno', or 'fno'.")
 
     def forward(
         self,
@@ -544,6 +675,7 @@ class SliceWiseFNOFlowModel(nn.Module):
 
 
 class AdaptiveIBMMaskController(nn.Module):
+    # Current version learns span-wise profiles C(r) and epsilon(r).
     # 这里不把 ibm_C 和 ibm_epsilon 当成完全写死的常数。
     # 做法是：给它们一个允许范围，然后根据当前样本的几何/工况特征，
     # 学出每个样本各自的一对“等效 IBM 过渡层参数”。
@@ -587,7 +719,7 @@ class AdaptiveIBMMaskController(nn.Module):
         self.base_logit = nn.Parameter(base_logit)
 
         self.mlp = nn.Sequential(
-            nn.Linear(8, self.hidden),
+            nn.Linear(9, self.hidden),
             nn.SiLU(),
             nn.Linear(self.hidden, self.hidden),
             nn.SiLU(),
@@ -604,19 +736,21 @@ class AdaptiveIBMMaskController(nn.Module):
 
     def extract_features(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
         # 用少量全局特征描述这个样本的“几何 + 流动尺度”。
-        blade_fraction = torch.mean(batch["blade_mask"], dim=(1, 2, 3))
+        blade_fraction = torch.mean(batch["blade_mask"], dim=(2, 3))
         signed_distance_abs = torch.abs(batch["signed_distance"])
-        signed_distance_mean = torch.mean(signed_distance_abs, dim=(1, 2, 3))
-        signed_distance_std = torch.std(signed_distance_abs, dim=(1, 2, 3), unbiased=False)
+        signed_distance_mean = torch.mean(signed_distance_abs, dim=(2, 3))
+        signed_distance_std = torch.std(signed_distance_abs, dim=(2, 3), unbiased=False)
+        span_r = batch["R"][:, :, 0, 0]
 
-        qv_hat = batch["qv_hat"].view(-1)
-        re_log = torch.log(torch.clamp(batch["Re_omega"].view(-1), min=1e-12))
-        eu_log = torch.log(torch.clamp(batch["Eu_omega"].view(-1), min=1e-12))
-        lambda_value = batch["Lambda"].view(-1)
-        delta_value = batch["delta"].view(-1)
+        qv_hat = batch["qv_hat"].view(-1, 1).expand_as(span_r)
+        re_log = torch.log(torch.clamp(batch["Re_omega"].view(-1, 1), min=1e-12)).expand_as(span_r)
+        eu_log = torch.log(torch.clamp(batch["Eu_omega"].view(-1, 1), min=1e-12)).expand_as(span_r)
+        lambda_value = batch["Lambda"].view(-1, 1).expand_as(span_r)
+        delta_value = batch["delta"].view(-1, 1).expand_as(span_r)
 
         return torch.stack(
             [
+                span_r,
                 blade_fraction,
                 signed_distance_mean,
                 signed_distance_std,
@@ -626,16 +760,20 @@ class AdaptiveIBMMaskController(nn.Module):
                 lambda_value,
                 delta_value,
             ],
-            dim=1,
+            dim=-1,
         )
 
     def forward(self, batch: Mapping[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.extract_features(batch)
         offset = 0.5 * torch.tanh(self.mlp(features))
-        raw_value = self.base_logit.view(1, 2) + offset
+        raw_value = self.base_logit.view(1, 1, 2) + offset
 
-        ibm_c = self._map_to_range(raw_value[:, 0], self.c_range[0], self.c_range[1]).view(-1, 1, 1, 1)
-        ibm_epsilon = self._map_to_range(raw_value[:, 1], self.epsilon_range[0], self.epsilon_range[1]).view(-1, 1, 1, 1)
+        ibm_c = self._map_to_range(raw_value[..., 0], self.c_range[0], self.c_range[1]).unsqueeze(-1).unsqueeze(-1)
+        ibm_epsilon = self._map_to_range(
+            raw_value[..., 1],
+            self.epsilon_range[0],
+            self.epsilon_range[1],
+        ).unsqueeze(-1).unsqueeze(-1)
         return ibm_c, ibm_epsilon
 
 
@@ -988,10 +1126,16 @@ class SurrogateModeling:
         width: int = 32,
         depth: int = 4,
         z_padding: int = 8,
+        operator_variant: str = "hf_cfno",
+        high_modes: int | None = None,
+        fourier_feature_bands: Sequence[int] = (1, 2, 4, 8),
         data_weight: float = 1.0,
         physics_weight: float = 0.1,
         warmup_epochs: int = 20,
         ramp_epochs: int = 30,
+        use_kkt_projection: bool = False,
+        kkt_projection_iters: int = 24,
+        kkt_projection_strength: float = 0.35,
         learn_ibm_params: bool = True,
         ibm_c_range: tuple[float, float] = (0.25, 4.0),
         ibm_epsilon_range: tuple[float, float] = (0.01, 0.08),
@@ -1012,6 +1156,9 @@ class SurrogateModeling:
             width=width,
             depth=depth,
             z_padding=z_padding,
+            operator_variant=operator_variant,
+            high_modes=high_modes,
+            fourier_feature_bands=fourier_feature_bands,
         ).to(self.device)
         self.model_config = {
             "input_channels": input_channels,
@@ -1019,10 +1166,17 @@ class SurrogateModeling:
             "width": width,
             "depth": depth,
             "z_padding": z_padding,
+            "operator_variant": str(operator_variant),
+            "high_modes": high_modes,
+            "fourier_feature_bands": tuple(int(v) for v in fourier_feature_bands),
             "output_channels": 4,
         }
-        default_ibm_c = float(np.mean([float(_pick(case, "ibm_C", default=1.0)) for case in train_cases]))
-        default_ibm_epsilon = float(np.mean([float(_pick(case, "ibm_epsilon", default=0.025)) for case in train_cases]))
+        default_ibm_c = float(
+            torch.stack([sample["ibm_C"].reshape(-1).mean() for sample in self.train_dataset.samples]).mean().item()
+        )
+        default_ibm_epsilon = float(
+            torch.stack([sample["ibm_epsilon"].reshape(-1).mean() for sample in self.train_dataset.samples]).mean().item()
+        )
         self.learn_ibm_params = bool(learn_ibm_params)
         self.ibm_mask_controller = (
             AdaptiveIBMMaskController(
@@ -1037,6 +1191,7 @@ class SurrogateModeling:
         )
         self.ibm_config = {
             "learn_ibm_params": self.learn_ibm_params,
+            "ibm_profile_mode": "span",
             "ibm_c_range": tuple(float(v) for v in ibm_c_range),
             "ibm_epsilon_range": tuple(float(v) for v in ibm_epsilon_range),
             "ibm_hidden": int(ibm_hidden),
@@ -1047,11 +1202,18 @@ class SurrogateModeling:
             "input_mode": input_mode,
             "batch_size": batch_size,
             "lr": lr,
+            "operator_variant": str(operator_variant),
+            "high_modes": high_modes,
+            "fourier_feature_bands": tuple(int(v) for v in fourier_feature_bands),
             "data_weight": data_weight,
             "physics_weight": physics_weight,
             "warmup_epochs": warmup_epochs,
             "ramp_epochs": ramp_epochs,
+            "use_kkt_projection": bool(use_kkt_projection),
+            "kkt_projection_iters": int(kkt_projection_iters),
+            "kkt_projection_strength": float(kkt_projection_strength),
             "learn_ibm_params": self.learn_ibm_params,
+            "ibm_profile_mode": "span",
             "ibm_c_range": tuple(float(v) for v in ibm_c_range),
             "ibm_epsilon_range": tuple(float(v) for v in ibm_epsilon_range),
             "ibm_hidden": int(ibm_hidden),
@@ -1059,6 +1221,16 @@ class SurrogateModeling:
         self.checkpoint_metadata: dict[str, Any] | None = None
 
         self.physics_loss = BladeFlowPhysicsLoss().to(self.device)
+        self.kkt_projection = (
+            CylindricalDivergenceKKTProjection(
+                KKTProjectionConfig(
+                    iterations=int(kkt_projection_iters),
+                    strength=float(kkt_projection_strength),
+                )
+            ).to(self.device)
+            if use_kkt_projection
+            else None
+        )
         optimizer_params: list[nn.Parameter] = list(self.model.parameters())
         if self.ibm_mask_controller is not None:
             optimizer_params.extend(list(self.ibm_mask_controller.parameters()))
@@ -1082,12 +1254,16 @@ class SurrogateModeling:
         total_cells = int(sample["blade_mask"].numel())
         fluid_ratio = float(sample["phi"].mean().item())
         has_target = bool(sample["has_target"].item() > 0.5)
+        ibm_c_mean, ibm_c_min, ibm_c_max = _profile_mean_min_max(sample["ibm_C"])
+        ibm_epsilon_mean, ibm_epsilon_min, ibm_epsilon_max = _profile_mean_min_max(sample["ibm_epsilon"])
 
         print("\n========== SurrogateModeling: 数据准备摘要 ==========")
         print(f"device                : {self.device}")
         print(f"train_cases / val_cases: {len(self.train_dataset)} / {len(self.val_dataset)}")
         print(f"train_blade_geometries: {blade_geometry_count}")
         print(f"input_mode            : {self.train_dataset.input_mode}")
+        print(f"operator_variant      : {self.model_config.get('operator_variant', 'cfno')}")
+        print(f"kkt_projection        : {self.kkt_projection is not None}")
         print(f"learn_ibm_params      : {self.learn_ibm_params}")
         print(
             f"ibm_range             : C in {self.ibm_config['ibm_c_range']}, "
@@ -1119,8 +1295,8 @@ class SurrogateModeling:
         )
         print(f"supervised_target     : {'yes' if has_target else 'no, pure physics debug'}")
         print(
-            f"default_ibm           : C={float(sample['ibm_C'].item()):.6g}, "
-            f"epsilon={float(sample['ibm_epsilon'].item()):.6g}"
+            f"default_ibm_profile   : C mean/min/max={ibm_c_mean:.6g}/{ibm_c_min:.6g}/{ibm_c_max:.6g}, "
+            f"epsilon mean/min/max={ibm_epsilon_mean:.6g}/{ibm_epsilon_min:.6g}/{ibm_epsilon_max:.6g}"
         )
         if "blade_params" in case:
             print(f"sample_blade_params   : {case['blade_params']}")
@@ -1130,8 +1306,8 @@ class SurrogateModeling:
         # 如果开启了自适应 IBM 参数，就按当前样本动态求一对 C / epsilon。
         # 否则退回到样本里保存的默认值。
         if self.ibm_mask_controller is None:
-            ibm_c = batch["ibm_C"].view(-1, 1, 1, 1)
-            ibm_epsilon = batch["ibm_epsilon"].view(-1, 1, 1, 1)
+            ibm_c = _expand_ibm_parameter(batch["ibm_C"], batch["signed_distance"])
+            ibm_epsilon = _expand_ibm_parameter(batch["ibm_epsilon"], batch["signed_distance"])
             return ibm_c, ibm_epsilon
         return self.ibm_mask_controller(batch)
 
@@ -1175,6 +1351,15 @@ class SurrogateModeling:
         x = torch.stack(channels, dim=1)
         return hard_project_theta_periodic(x, theta_dim=3)
 
+    def _apply_kkt_projection(
+        self,
+        pred: Mapping[str, torch.Tensor],
+        batch: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        if self.kkt_projection is None:
+            return dict(pred)
+        return self.kkt_projection(pred, batch)
+
     def _prepare_runtime_batch(self, batch: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         # 训练和部署阶段都使用“当前学习到的 IBM 参数”实时重建 phi 和 x。
         ibm_c, ibm_epsilon = self._current_ibm_params(batch)
@@ -1182,12 +1367,14 @@ class SurrogateModeling:
         learned_phi = torch.where(batch["blade_mask"] > 0.5, torch.zeros_like(learned_phi), learned_phi)
         if "has_true_signed_distance" in batch:
             true_distance_mask = batch["has_true_signed_distance"].view(-1, 1, 1, 1) > 0.5
+            case_ibm_c = _expand_ibm_parameter(batch["ibm_C"], batch["signed_distance"])
+            case_ibm_epsilon = _expand_ibm_parameter(batch["ibm_epsilon"], batch["signed_distance"])
             phi = torch.where(true_distance_mask, learned_phi, batch["phi"])
-            ibm_c = torch.where(true_distance_mask, ibm_c, batch["ibm_C"].view(-1, 1, 1, 1))
+            ibm_c = torch.where(true_distance_mask, ibm_c, case_ibm_c)
             ibm_epsilon = torch.where(
                 true_distance_mask,
                 ibm_epsilon,
-                batch["ibm_epsilon"].view(-1, 1, 1, 1),
+                case_ibm_epsilon,
             )
         else:
             phi = learned_phi
@@ -1197,8 +1384,8 @@ class SurrogateModeling:
         runtime_batch = dict(batch)
         runtime_batch["phi"] = phi
         runtime_batch["x"] = self._compose_model_input(runtime_batch, phi)
-        runtime_batch["ibm_C"] = ibm_c.view(-1)
-        runtime_batch["ibm_epsilon"] = ibm_epsilon.view(-1)
+        runtime_batch["ibm_C"] = ibm_c.squeeze(-1).squeeze(-1)
+        runtime_batch["ibm_epsilon"] = ibm_epsilon.squeeze(-1).squeeze(-1)
         return runtime_batch
 
     def _resolve_case_sample(
@@ -1241,6 +1428,7 @@ class SurrogateModeling:
         batch = {key: value.unsqueeze(0).to(self.device) for key, value in sample.items()}
         batch = self._prepare_runtime_batch(batch)
         pred = self.model(batch["x"], batch["phi"], batch["solid_ut"])
+        pred = self._apply_kkt_projection(pred, batch)
         pred_dim = {key: value[0].detach().cpu() for key, value in pred.items()}
         sample_runtime = dict(sample)
         sample_runtime["x"] = batch["x"][0].detach().cpu()
@@ -1367,8 +1555,8 @@ class SurrogateModeling:
         pred_phy = bundle["pred_phy"]
         boundary = bundle["boundary"]
         config = FlowCaseConfig.from_mapping(case_data)
-        ibm_c_value = float(sample["ibm_C"].item())
-        ibm_epsilon_value = float(sample["ibm_epsilon"].item())
+        ibm_c_mean, ibm_c_min, ibm_c_max = _profile_mean_min_max(sample["ibm_C"])
+        ibm_epsilon_mean, ibm_epsilon_min, ibm_epsilon_max = _profile_mean_min_max(sample["ibm_epsilon"])
 
         train_n = int(self.train_dataset[0]["x"].shape[-1])
         deploy_n = int(sample["x"].shape[-1])
@@ -1472,7 +1660,8 @@ class SurrogateModeling:
         # 在画面左下角保留一点文字信息，直接体现“粗网格训练、细网格部署”的部署特征。
         plotter.add_text(
             f"Rotor Streamlines | train_n={train_n} | deploy_n={deploy_n} | "
-            f"blades={config.n_blade} | C={ibm_c_value:.4g} | eps={ibm_epsilon_value:.4g}",
+            f"blades={config.n_blade} | C_mean={ibm_c_mean:.4g} [{ibm_c_min:.4g},{ibm_c_max:.4g}] | "
+            f"eps_mean={ibm_epsilon_mean:.4g} [{ibm_epsilon_min:.4g},{ibm_epsilon_max:.4g}]",
             position="upper_left",
             font_size=10,
             color="white" if theme == "dark" else "black",
@@ -1571,6 +1760,12 @@ class SurrogateModeling:
         width: int = 32,
         depth: int = 4,
         z_padding: int = 8,
+        operator_variant: str = "hf_cfno",
+        high_modes: int | None = None,
+        fourier_feature_bands: Sequence[int] = (1, 2, 4, 8),
+        use_kkt_projection: bool = False,
+        kkt_projection_iters: int = 24,
+        kkt_projection_strength: float = 0.35,
         learn_ibm_params: bool = True,
         ibm_c_range: tuple[float, float] = (0.25, 4.0),
         ibm_epsilon_range: tuple[float, float] = (0.01, 0.08),
@@ -1618,6 +1813,12 @@ class SurrogateModeling:
             width=width,
             depth=depth,
             z_padding=z_padding,
+            operator_variant=operator_variant,
+            high_modes=high_modes,
+            fourier_feature_bands=fourier_feature_bands,
+            use_kkt_projection=use_kkt_projection,
+            kkt_projection_iters=kkt_projection_iters,
+            kkt_projection_strength=kkt_projection_strength,
             data_weight=0.0,
             physics_weight=1.0,
             warmup_epochs=0,
@@ -1703,6 +1904,7 @@ class SurrogateModeling:
 
             with torch.set_grad_enabled(training):
                 pred = self.model(batch["x"], batch["phi"], batch["solid_ut"])
+                pred = self._apply_kkt_projection(pred, batch)
                 loss_data, log_data = self.supervised_loss(pred, batch)
                 loss_phys, log_phys = self.physics_loss(pred, batch)
                 loss = self.data_weight * loss_data + physics_factor * loss_phys
@@ -1718,6 +1920,9 @@ class SurrogateModeling:
                 "ibm_C": torch.mean(batch["ibm_C"]),
                 "ibm_epsilon": torch.mean(batch["ibm_epsilon"]),
             }
+            if "kkt_divergence_before" in pred:
+                merged["kkt_div_before"] = torch.mean(pred["kkt_divergence_before"])
+                merged["kkt_div_after"] = torch.mean(pred["kkt_divergence_after"])
             merged.update(log_data)
             merged.update(log_phys)
 
@@ -1848,6 +2053,7 @@ class SurrogateModeling:
         batch = self._to_device(batch)
         batch = self._prepare_runtime_batch(batch)
         pred = self.model(batch["x"], batch["phi"], batch["solid_ut"])
+        pred = self._apply_kkt_projection(pred, batch)
         loss_data, log_data = self.supervised_loss(pred, batch)
         loss_phys, log_phys = self.physics_loss(pred, batch)
         physics_factor = self.current_physics_factor(0)
@@ -1857,7 +2063,7 @@ class SurrogateModeling:
             self.optimizer.zero_grad()
             loss.backward()
 
-        return {
+        result = {
             "loss_total": float(loss.detach().cpu().item()),
             "loss_data": float(log_data["loss_data"].detach().cpu().item()),
             "loss_phys": float(log_phys["loss_phys"].detach().cpu().item()),
@@ -1873,6 +2079,10 @@ class SurrogateModeling:
             "input_channels": float(batch["x"].shape[1]),
             "grid_size": float(batch["x"].shape[-1]),
         }
+        if "kkt_divergence_before" in pred:
+            result["kkt_div_before"] = float(pred["kkt_divergence_before"].detach().cpu().mean().item())
+            result["kkt_div_after"] = float(pred["kkt_divergence_after"].detach().cpu().mean().item())
+        return result
 
     def fit_pure_physics_debug(
         self,
@@ -1955,15 +2165,20 @@ class SurrogateModeling:
         q_target = float(sample["qv_passage"].item())
         train_n = int(self.train_dataset[0]["x"].shape[-1])
         deploy_n = int(sample["x"].shape[-1])
-        ibm_c_value = float(sample["ibm_C"].item())
-        ibm_epsilon_value = float(sample["ibm_epsilon"].item())
+        ibm_c_profile = sample["ibm_C"].detach().cpu().reshape(-1)
+        ibm_epsilon_profile = sample["ibm_epsilon"].detach().cpu().reshape(-1)
+        ibm_c_mean, ibm_c_min, ibm_c_max = _profile_mean_min_max(ibm_c_profile)
+        ibm_epsilon_mean, ibm_epsilon_min, ibm_epsilon_max = _profile_mean_min_max(ibm_epsilon_profile)
 
         print("\n========== 训练后 Post 检查 ==========")
         print(f"grid transfer: train_n={train_n}, deploy_n={deploy_n}")
         if deploy_n > train_n:
             print("当前展示的是“粗网格训练 -> 更细网格部署”的直接推理结果。")
         print(f"出口单流道体积流量: pred={q_pred:.6g}, target={q_target:.6g}")
-        print(f"adaptive_ibm         : C={ibm_c_value:.6g}, epsilon={ibm_epsilon_value:.6g}")
+        print(
+            f"adaptive_ibm_profile : C mean/min/max={ibm_c_mean:.6g}/{ibm_c_min:.6g}/{ibm_c_max:.6g}, "
+            f"epsilon mean/min/max={ibm_epsilon_mean:.6g}/{ibm_epsilon_min:.6g}/{ibm_epsilon_max:.6g}"
+        )
         print("下面给出各个 span 处流体区域的 mean / min / max，单位已经回到物理空间(SI)。")
         mask = sample["blade_mask"] < 0.5
         n = mask.shape[0]
@@ -1974,8 +2189,10 @@ class SurrogateModeling:
             ut_stats = field_stats(pred_phy["UT"][r_index], fluid)
             uz_stats = field_stats(pred_phy["UZ"][r_index], fluid)
             p_stats = field_stats(pred_phy["P"][r_index], fluid)
+            c_at_span = float(ibm_c_profile[r_index].item())
+            epsilon_at_span = float(ibm_epsilon_profile[r_index].item())
 
-            print(f"span={span:.2f} (i={r_index})")
+            print(f"span={span:.2f} (i={r_index}) | C={c_at_span:.6g}, epsilon={epsilon_at_span:.6g}")
             print(f"  UR [mean/min/max] = {ur_stats[0]:.6g} / {ur_stats[1]:.6g} / {ur_stats[2]:.6g}")
             print(f"  UT [mean/min/max] = {ut_stats[0]:.6g} / {ut_stats[1]:.6g} / {ut_stats[2]:.6g}")
             print(f"  UZ [mean/min/max] = {uz_stats[0]:.6g} / {uz_stats[1]:.6g} / {uz_stats[2]:.6g}")
@@ -2025,8 +2242,10 @@ class SurrogateModeling:
             "pred_phy": pred_phy,
             "q_pred": q_pred,
             "q_target": q_target,
-            "ibm_C": ibm_c_value,
-            "ibm_epsilon": ibm_epsilon_value,
+            "ibm_C": ibm_c_profile,
+            "ibm_epsilon": ibm_epsilon_profile,
+            "ibm_C_mean": ibm_c_mean,
+            "ibm_epsilon_mean": ibm_epsilon_mean,
             "train_n": train_n,
             "deploy_n": deploy_n,
             "three_d_info": three_d_info,
@@ -2045,7 +2264,7 @@ class SurrogateModeling:
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
-                "checkpoint_version": 3,
+                "checkpoint_version": 5,
                 "model_state_dict": self.model.state_dict(),
                 "ibm_mask_controller_state_dict": self.ibm_mask_controller.state_dict() if self.ibm_mask_controller is not None else None,
                 "optimizer_state_dict": self.optimizer.state_dict() if save_optimizer else None,
@@ -2073,7 +2292,21 @@ class SurrogateModeling:
         self.model.load_state_dict(payload["model_state_dict"])
         ibm_state = payload.get("ibm_mask_controller_state_dict")
         if self.ibm_mask_controller is not None and ibm_state is not None:
-            self.ibm_mask_controller.load_state_dict(ibm_state)
+            try:
+                self.ibm_mask_controller.load_state_dict(ibm_state)
+            except RuntimeError:
+                current_state = self.ibm_mask_controller.state_dict()
+                compatible_state = {
+                    key: value
+                    for key, value in ibm_state.items()
+                    if key in current_state and tuple(current_state[key].shape) == tuple(value.shape)
+                }
+                skipped = sorted(set(ibm_state) - set(compatible_state))
+                self.ibm_mask_controller.load_state_dict(compatible_state, strict=False)
+                print(
+                    "IBM controller checkpoint partially loaded; "
+                    f"skipped incompatible span-profile weights: {skipped}"
+                )
         if load_optimizer and payload.get("optimizer_state_dict") is not None:
             self.optimizer.load_state_dict(payload["optimizer_state_dict"])
         if "ibm_config" in payload:
@@ -2100,6 +2333,12 @@ class SurrogateModeling:
         model_config = dict(payload.get("model_config", {}))
         trainer_config = dict(payload.get("trainer_config", {}))
         input_mode = payload.get("input_mode", trainer_config.get("input_mode", "both"))
+        if "operator_variant" not in model_config:
+            state_keys = set(payload.get("model_state_dict", {}).keys())
+            if any(key.startswith("core.blocks.") and key.endswith(".weights") for key in state_keys):
+                model_config["operator_variant"] = "fno"
+            else:
+                model_config["operator_variant"] = "cfno"
 
         trainer = cls(
             train_cases=case_list,
@@ -2111,10 +2350,16 @@ class SurrogateModeling:
             width=int(model_config.get("width", 16)),
             depth=int(model_config.get("depth", 4)),
             z_padding=int(model_config.get("z_padding", 8)),
+            operator_variant=str(model_config.get("operator_variant", "cfno")),
+            high_modes=model_config.get("high_modes", None),
+            fourier_feature_bands=tuple(model_config.get("fourier_feature_bands", (1, 2, 4, 8))),
             data_weight=float(trainer_config.get("data_weight", 0.0)),
             physics_weight=float(trainer_config.get("physics_weight", 1.0)),
             warmup_epochs=int(trainer_config.get("warmup_epochs", 0)),
             ramp_epochs=int(trainer_config.get("ramp_epochs", 0)),
+            use_kkt_projection=bool(trainer_config.get("use_kkt_projection", False)),
+            kkt_projection_iters=int(trainer_config.get("kkt_projection_iters", 24)),
+            kkt_projection_strength=float(trainer_config.get("kkt_projection_strength", 0.35)),
             learn_ibm_params=bool(trainer_config.get("learn_ibm_params", True)),
             ibm_c_range=tuple(trainer_config.get("ibm_c_range", (0.25, 4.0))),
             ibm_epsilon_range=tuple(trainer_config.get("ibm_epsilon_range", (0.01, 0.08))),
@@ -2189,6 +2434,14 @@ if __name__ == "__main__":
             lr=1e-3,   # 学习率
             learn_ibm_params=True,    # 是否将IBM参数也纳入学习范围
             ibm_c_range=(0.3, 3.0),
+            operator_variant="hf_cfno",    # 使用哪种模型
+            modes=12,
+            high_modes=8,    # hf_cfno独有，用来写高频的成分是多少
+            width=16,
+            depth=4,
+            use_kkt_projection=True,    # 使用KKT投影
+            kkt_projection_iters=24,
+            kkt_projection_strength=0.35,
             ibm_epsilon_range=(0.001, 0.05),
         )
         '''
