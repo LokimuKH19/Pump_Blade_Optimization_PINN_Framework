@@ -5,6 +5,8 @@ This filefolder facilitates an end-to-end mapping from the blade geometric defin
 ## Contents
 
 ### Codes
+- `AnnularCoette.py`: Original annular coette flow (2D) problem solved with dimensionless SIMPLE. (Example only, for running available version, see in [symphonic](https://github.com/LokimuKH19/SymPhONIC) repo.)
+- `AnnularCoetteSurrogate.py`: The surrogate version of `AnnularCoette.py` which tests the theoretical accuracy of each neural operators in `NeuralOperators.py`.
 - `BladeImport.py`: Converts the parametric blade geometry into the mask of the Immerse Boundary Method (IBM), which could be transfered into both CFD and surrogate modeling workflow.
 - `DataGenerator.py`: Generates CFD data in the dimensionless cylinderical coordinates via alternative traditional iteration schemes for validating and training surrogate models.
 - `DataGenerator3D.py`: Formal CFD data generator, used 3D SIMPLE algorithm to create training data for surrogate models. 
@@ -42,3 +44,6 @@ Updated `DataGenerator3D.py` and the corresponding dependencies `PressureUpdater
 ### May 7th, 2026
 Updated `KKTProjectionOperators.py` to enforce the KKT projection during the training of the surrogate model, ref:"Chen, H., Flores, G. E. C., & Li, C. (2024). Physics-informed neural networks with hard linear equality constraints. Computers & Chemical Engineering, 189, 108764."
 Updated `NeuralOperators.py`, trying to make the CFNO more sensitive to high-frequencied modes of the solution.
+
+### May 10th, 2026
+Updated `AnnularCoette.py` and its surrogate version `AnnularCoetteSurrogate.py` to show theoretical results. 3D versions of each neural operators are also implemented in `NeuralOperators.py`.
