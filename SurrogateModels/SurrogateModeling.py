@@ -573,14 +573,27 @@ class SliceWiseFNOFlowModel(nn.Module):
         operator_variant: str = "hf_cfno",
         high_modes: int | None = None,
         fourier_feature_bands: Sequence[int] = (1, 2, 4, 8),
+        hf_high_gate_init: float = -1.0,
+        hf_use_local_highpass: bool = True,
+        pressure_smoothing: float = 0.0,
     ):
         super().__init__()
         self.z_padding = int(max(z_padding, 0))
+        self.pressure_smoothing = float(np.clip(pressure_smoothing, 0.0, 1.0))
         self.operator_variant = str(operator_variant).lower()
+        self.is_3d_operator = False
         # todo 切换模型看这个
         if self.operator_variant in {"fno", "legacy_fno"}:
             self.core = NeuralOperators.FNO2d_small(
                 modes=modes,
+                width=width,
+                depth=depth,
+                input_features=input_channels,
+                output_features=4,
+            )
+        elif self.operator_variant in {"cno", "legacy_cno"}:
+            self.core = NeuralOperators.CNO2d_small(
+                cheb_modes=(modes, modes),
                 width=width,
                 depth=depth,
                 input_features=input_channels,
@@ -605,9 +618,66 @@ class SliceWiseFNOFlowModel(nn.Module):
                 input_features=input_channels,
                 output_features=4,
                 fourier_feature_bands=tuple(int(v) for v in fourier_feature_bands),
+                high_gate_init=hf_high_gate_init,
+                use_local_highpass=hf_use_local_highpass,
+            )
+        elif self.operator_variant in {"fno3d", "fno_3d", "3d_fno"}:
+            self.is_3d_operator = True
+            self.core = NeuralOperators.FNO3d_small(
+                modes=modes,
+                width=width,
+                depth=depth,
+                input_features=input_channels,
+                output_features=4,
+            )
+        elif self.operator_variant in {"cno3d", "cno_3d", "3d_cno"}:
+            self.is_3d_operator = True
+            self.core = NeuralOperators.CNO3d_small(
+                cheb_modes=(modes, modes, modes),
+                width=width,
+                depth=depth,
+                input_features=input_channels,
+                output_features=4,
+            )
+        elif self.operator_variant in {"cfno3d", "cfno_3d", "3d_cfno"}:
+            self.is_3d_operator = True
+            self.core = NeuralOperators.CFNO3d_small(
+                modes=modes,
+                cheb_modes=(modes, modes, modes),
+                width=width,
+                depth=depth,
+                input_features=input_channels,
+                output_features=4,
+            )
+        elif self.operator_variant in {"hf_cfno3d", "hf_cfno_3d", "high_frequency_cfno3d", "3d_hf_cfno"}:
+            self.is_3d_operator = True
+            self.core = NeuralOperators.HF_CFNO3d_small(
+                modes=modes,
+                cheb_modes=(modes, modes, modes),
+                high_modes=high_modes,
+                width=width,
+                depth=depth,
+                input_features=input_channels,
+                output_features=4,
+                fourier_feature_bands=tuple(int(v) for v in fourier_feature_bands),
+                high_gate_init=hf_high_gate_init,
+                use_local_highpass=hf_use_local_highpass,
             )
         else:
-            raise ValueError("operator_variant must be 'hf_cfno', 'cfno', or 'fno'.")
+            raise ValueError(
+                "operator_variant must be one of: "
+                "'fno', 'cno', 'cfno', 'hf_cfno', "
+                "'fno3d', 'cno3d', 'cfno3d', 'hf_cfno3d'."
+            )
+
+    def smooth_pressure(self, p: torch.Tensor) -> torch.Tensor:
+        r_plus = neighbor_plus(p, dim=1, periodic=False)
+        r_minus = neighbor_minus(p, dim=1, periodic=False)
+        theta_plus = neighbor_plus(p, dim=2, periodic=True)
+        theta_minus = neighbor_minus(p, dim=2, periodic=True)
+        z_plus = neighbor_plus(p, dim=3, periodic=False)
+        z_minus = neighbor_minus(p, dim=3, periodic=False)
+        return (p + r_plus + r_minus + theta_plus + theta_minus + z_plus + z_minus) / 7.0
 
     def forward(
         self,
@@ -622,17 +692,33 @@ class SliceWiseFNOFlowModel(nn.Module):
         x = hard_project_theta_periodic(x, theta_dim=3)
 
         # 每个半径层对应一个 Theta-Z 平面。
-        x_slice = x.permute(0, 2, 1, 3, 4).reshape(batch_size * n_r, in_channels, n_theta, n_z)
+        if self.is_3d_operator:
+            x_core = x
+            if self.z_padding > 0:
+                x_core = F.pad(x_core, (self.z_padding, self.z_padding, 0, 0, 0, 0), mode="replicate")
 
-        if self.z_padding > 0:
-            x_slice = F.pad(x_slice, (self.z_padding, self.z_padding, 0, 0), mode="replicate")
+            raw = self.core(x_core)
 
-        raw = self.core(x_slice)
+            if self.z_padding > 0:
+                raw = raw[..., self.z_padding:-self.z_padding]
+        else:
+            x_slice = x.permute(0, 2, 1, 3, 4).reshape(batch_size * n_r, in_channels, n_theta, n_z)
 
-        if self.z_padding > 0:
-            raw = raw[..., self.z_padding:-self.z_padding]
+            if self.z_padding > 0:
+                x_slice = F.pad(x_slice, (self.z_padding, self.z_padding, 0, 0), mode="replicate")
 
-        raw = raw.reshape(batch_size, n_r, 4, n_theta, n_z).permute(0, 2, 1, 3, 4)
+            raw = self.core(x_slice)
+
+            if self.z_padding > 0:
+                raw = raw[..., self.z_padding:-self.z_padding]
+
+            raw = raw.reshape(batch_size, n_r, 4, n_theta, n_z).permute(0, 2, 1, 3, 4)
+
+        if raw.shape != (batch_size, 4, n_r, n_theta, n_z):
+            raise RuntimeError(
+                "Neural operator returned an unexpected shape: "
+                f"expected {(batch_size, 4, n_r, n_theta, n_z)}, got {tuple(raw.shape)}."
+            )
 
         ur_raw = raw[:, 0]
         ut_raw = raw[:, 1]
@@ -647,6 +733,9 @@ class SliceWiseFNOFlowModel(nn.Module):
         ut = phi * ut_raw + solid * solid_ut
         uz = phi * uz_raw
         p = hard_project_theta_periodic(p_raw, theta_dim=2)
+        if self.pressure_smoothing > 0.0:
+            p = (1.0 - self.pressure_smoothing) * p + self.pressure_smoothing * self.smooth_pressure(p)
+            p = hard_project_theta_periodic(p, theta_dim=2)
 
         # hub / shroud 也做硬约束。
         ur[:, 0, :, :] = 0.0
@@ -790,8 +879,14 @@ class BladeFlowPhysicsLoss(nn.Module):
     # - 叶片无滑移误差
     #
     # 这两个诊断量默认不计入总损失，因为前向里已经做了硬约束。
-    def __init__(self):
+    def __init__(
+        self,
+        pressure_highpass_weight: float = 0.0,
+        pressure_highpass_normalized: bool = True,
+    ):
         super().__init__()
+        self.pressure_highpass_weight = float(max(pressure_highpass_weight, 0.0))
+        self.pressure_highpass_normalized = bool(pressure_highpass_normalized)
 
     def d1(
         self,
@@ -823,6 +918,16 @@ class BladeFlowPhysicsLoss(nn.Module):
 
     def weighted_mse(self, residual: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return torch.sum((residual ** 2) * weight) / torch.clamp(torch.sum(weight), min=1e-12)
+
+    def pressure_highpass(self, p: torch.Tensor) -> torch.Tensor:
+        r_plus = neighbor_plus(p, dim=1, periodic=False)
+        r_minus = neighbor_minus(p, dim=1, periodic=False)
+        theta_plus = neighbor_plus(p, dim=2, periodic=True)
+        theta_minus = neighbor_minus(p, dim=2, periodic=True)
+        z_plus = neighbor_plus(p, dim=3, periodic=False)
+        z_minus = neighbor_minus(p, dim=3, periodic=False)
+        smooth = (p + r_plus + r_minus + theta_plus + theta_minus + z_plus + z_minus) / 7.0
+        return p - smooth
 
     def build_pde_mask(self, phi: torch.Tensor) -> torch.Tensor:
         # 残差只在流体区内部统计：
@@ -995,6 +1100,12 @@ class BladeFlowPhysicsLoss(nn.Module):
         q_hat_pred = self.outlet_flow_rate_hat(uz, batch)
         q_hat_target = batch["qv_hat"]
         loss_qv = torch.mean((q_hat_pred - q_hat_target) ** 2)
+        pressure_highpass = self.pressure_highpass(p)
+        loss_p_highpass = self.weighted_mse(pressure_highpass, pde_mask)
+        p_mean = torch.sum(p * pde_mask) / torch.clamp(torch.sum(pde_mask), min=1e-12)
+        loss_p_energy = self.weighted_mse(p - p_mean, pde_mask)
+        loss_p_highpass_ratio = loss_p_highpass / torch.clamp(loss_p_energy, min=1e-12)
+        loss_p_highpass_penalty = loss_p_highpass_ratio if self.pressure_highpass_normalized else loss_p_highpass
 
         # 下面两个量只是用于检查边界条件是否真的被硬约束住。
         loss_bc_periodic = (
@@ -1006,12 +1117,16 @@ class BladeFlowPhysicsLoss(nn.Module):
         loss_bc_blade = self.blade_noslip_error(pred, batch)
 
         total = loss_c + loss_r + loss_theta + loss_z + loss_qv
+        total = total + self.pressure_highpass_weight * loss_p_highpass_penalty
         return total, {
             "loss_c": loss_c,
             "loss_r": loss_r,
             "loss_theta": loss_theta,
             "loss_z": loss_z,
             "loss_qv": loss_qv,
+            "loss_p_highpass": loss_p_highpass,
+            "loss_p_highpass_ratio": loss_p_highpass_ratio,
+            "loss_p_highpass_penalty": loss_p_highpass_penalty,
             "loss_bc_periodic": loss_bc_periodic,
             "loss_bc_blade": loss_bc_blade,
             "loss_phys": total,
@@ -1129,6 +1244,11 @@ class SurrogateModeling:
         operator_variant: str = "hf_cfno",
         high_modes: int | None = None,
         fourier_feature_bands: Sequence[int] = (1, 2, 4, 8),
+        hf_high_gate_init: float = -1.0,
+        hf_use_local_highpass: bool = True,
+        pressure_smoothing: float = 0.0,
+        pressure_highpass_weight: float = 0.0,
+        pressure_highpass_normalized: bool = True,
         data_weight: float = 1.0,
         physics_weight: float = 0.1,
         warmup_epochs: int = 20,
@@ -1159,6 +1279,9 @@ class SurrogateModeling:
             operator_variant=operator_variant,
             high_modes=high_modes,
             fourier_feature_bands=fourier_feature_bands,
+            hf_high_gate_init=hf_high_gate_init,
+            hf_use_local_highpass=hf_use_local_highpass,
+            pressure_smoothing=pressure_smoothing,
         ).to(self.device)
         self.model_config = {
             "input_channels": input_channels,
@@ -1169,6 +1292,9 @@ class SurrogateModeling:
             "operator_variant": str(operator_variant),
             "high_modes": high_modes,
             "fourier_feature_bands": tuple(int(v) for v in fourier_feature_bands),
+            "hf_high_gate_init": float(hf_high_gate_init),
+            "hf_use_local_highpass": bool(hf_use_local_highpass),
+            "pressure_smoothing": float(np.clip(pressure_smoothing, 0.0, 1.0)),
             "output_channels": 4,
         }
         default_ibm_c = float(
@@ -1205,6 +1331,11 @@ class SurrogateModeling:
             "operator_variant": str(operator_variant),
             "high_modes": high_modes,
             "fourier_feature_bands": tuple(int(v) for v in fourier_feature_bands),
+            "hf_high_gate_init": float(hf_high_gate_init),
+            "hf_use_local_highpass": bool(hf_use_local_highpass),
+            "pressure_smoothing": float(np.clip(pressure_smoothing, 0.0, 1.0)),
+            "pressure_highpass_weight": float(max(pressure_highpass_weight, 0.0)),
+            "pressure_highpass_normalized": bool(pressure_highpass_normalized),
             "data_weight": data_weight,
             "physics_weight": physics_weight,
             "warmup_epochs": warmup_epochs,
@@ -1220,7 +1351,10 @@ class SurrogateModeling:
         }
         self.checkpoint_metadata: dict[str, Any] | None = None
 
-        self.physics_loss = BladeFlowPhysicsLoss().to(self.device)
+        self.physics_loss = BladeFlowPhysicsLoss(
+            pressure_highpass_weight=pressure_highpass_weight,
+            pressure_highpass_normalized=pressure_highpass_normalized,
+        ).to(self.device)
         self.kkt_projection = (
             CylindricalDivergenceKKTProjection(
                 KKTProjectionConfig(
@@ -1763,6 +1897,11 @@ class SurrogateModeling:
         operator_variant: str = "hf_cfno",
         high_modes: int | None = None,
         fourier_feature_bands: Sequence[int] = (1, 2, 4, 8),
+        hf_high_gate_init: float = -1.0,
+        hf_use_local_highpass: bool = True,
+        pressure_smoothing: float = 0.0,
+        pressure_highpass_weight: float = 0.0,
+        pressure_highpass_normalized: bool = True,
         use_kkt_projection: bool = False,
         kkt_projection_iters: int = 24,
         kkt_projection_strength: float = 0.35,
@@ -1816,6 +1955,11 @@ class SurrogateModeling:
             operator_variant=operator_variant,
             high_modes=high_modes,
             fourier_feature_bands=fourier_feature_bands,
+            hf_high_gate_init=hf_high_gate_init,
+            hf_use_local_highpass=hf_use_local_highpass,
+            pressure_smoothing=pressure_smoothing,
+            pressure_highpass_weight=pressure_highpass_weight,
+            pressure_highpass_normalized=pressure_highpass_normalized,
             use_kkt_projection=use_kkt_projection,
             kkt_projection_iters=kkt_projection_iters,
             kkt_projection_strength=kkt_projection_strength,
@@ -2068,6 +2212,8 @@ class SurrogateModeling:
             "loss_data": float(log_data["loss_data"].detach().cpu().item()),
             "loss_phys": float(log_phys["loss_phys"].detach().cpu().item()),
             "loss_qv": float(log_phys["loss_qv"].detach().cpu().item()),
+            "loss_p_highpass": float(log_phys["loss_p_highpass"].detach().cpu().item()),
+            "loss_p_highpass_ratio": float(log_phys["loss_p_highpass_ratio"].detach().cpu().item()),
             "loss_bc_periodic": float(log_phys["loss_bc_periodic"].detach().cpu().item()),
             "loss_bc_blade": float(log_phys["loss_bc_blade"].detach().cpu().item()),
             "q_hat_pred": float(log_phys["q_hat_pred"].detach().cpu().item()),
@@ -2096,12 +2242,15 @@ class SurrogateModeling:
         save_checkpoint_path: str | Path | None = None,
         plot_3d: bool = True,
         save_history_plot_path: str | Path | None = None,
+        plot_frequency_energy: bool = True,
     ) -> list[dict[str, float]]:
         # 纯物理调试模式下，先看叶片导入，再训练，再看训练后的场。
         blade_plot_path = None
         post_plot_path = None
         post_3d_path = None
         history_plot_path = None
+        frequency_plot_path = None
+        frequency_summary_path = None
         if save_dir is not None:
             save_dir = Path(save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
@@ -2109,6 +2258,8 @@ class SurrogateModeling:
             post_plot_path = save_dir / "post_physical_spans.png"
             post_3d_path = save_dir / "post_3d_streamlines.png"
             history_plot_path = save_dir / "training_loss_log.png"
+            frequency_plot_path = save_dir / "frequency_energy_trends.png"
+            frequency_summary_path = save_dir / "frequency_energy_summary.json"
             if save_checkpoint_path is None:
                 save_checkpoint_path = save_dir / "surrogate_checkpoint.pt"
         if save_history_plot_path is not None:
@@ -2128,6 +2279,13 @@ class SurrogateModeling:
             plot_3d=plot_3d,
             save_path_3d=post_3d_path,
         )
+        if plot_frequency_energy and frequency_plot_path is not None:
+            self.plot_frequency_energy_trends(
+                case_index=0,
+                show=show_plots,
+                save_path=frequency_plot_path,
+                summary_path=frequency_summary_path,
+            )
         return history
 
     @torch.no_grad()
@@ -2138,6 +2296,179 @@ class SurrogateModeling:
     ) -> dict[str, torch.Tensor]:
         bundle = self._predict_case_bundle(case=case)
         return bundle["pred_phy"] if return_physical else bundle["pred_dim"]
+
+    @staticmethod
+    def _dct_along(x: torch.Tensor, dim: int) -> torch.Tensor:
+        x_last = torch.movedim(x, dim, -1)
+        coeff = NeuralOperators.dct_1d(x_last)
+        return torch.movedim(coeff, -1, dim)
+
+    @staticmethod
+    def _axis_spectrum_energy(
+        field: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        axis: int,
+        periodic: bool,
+        modes_cutoff: int,
+    ) -> dict[str, Any]:
+        if periodic and field.shape[axis] > 2:
+            slicer = [slice(None)] * field.ndim
+            slicer[axis] = slice(0, -1)
+            field = field[tuple(slicer)]
+            weight = weight[tuple(slicer)]
+
+        weight = torch.clamp(weight, min=0.0)
+        weight_sum = torch.clamp(torch.sum(weight), min=1e-12)
+        mean = torch.sum(field * weight) / weight_sum
+        signal = (field - mean) * torch.sqrt(weight)
+
+        if periodic:
+            coeff = torch.fft.rfft(signal, dim=axis, norm="ortho")
+            coeff_energy = torch.abs(coeff) ** 2
+        else:
+            coeff = SurrogateModeling._dct_along(signal, axis)
+            coeff_energy = coeff ** 2
+
+        reduce_dims = tuple(dim for dim in range(coeff_energy.ndim) if dim != axis)
+        energy = torch.sum(coeff_energy, dim=reduce_dims).detach().cpu().to(torch.float64)
+        total = torch.sum(energy)
+        if float(total.item()) <= 1e-30:
+            energy_fraction = torch.zeros_like(energy)
+            cumulative = torch.zeros_like(energy)
+            high_ratio = 0.0
+            k95 = 0
+        else:
+            energy_fraction = energy / total
+            cumulative = torch.cumsum(energy_fraction, dim=0)
+            keep = int(max(1, min(modes_cutoff, energy_fraction.numel())))
+            high_ratio = float(torch.sum(energy_fraction[keep:]).item())
+            k95 = int(torch.searchsorted(cumulative, torch.tensor(0.95, dtype=cumulative.dtype)).item()) + 1
+
+        return {
+            "energy_fraction": [float(v) for v in energy_fraction.tolist()],
+            "cumulative": [float(v) for v in cumulative.tolist()],
+            "high_ratio_after_modes": high_ratio,
+            "k95": k95,
+        }
+
+    def frequency_energy_diagnostics(
+        self,
+        *,
+        case_index: int = 0,
+        case: Mapping[str, Any] | None = None,
+        fields: Sequence[str] = ("UR", "UT", "UZ", "P"),
+        modes_cutoff: int | None = None,
+    ) -> dict[str, Any]:
+        bundle = self._predict_case_bundle(case_index=case_index, case=case)
+        pred_dim = bundle["pred_dim"]
+        phi = torch.clamp(bundle["sample"]["phi"].to(torch.float32), min=0.0, max=1.0)
+        cutoff = int(modes_cutoff if modes_cutoff is not None else self.model_config.get("modes", 8))
+
+        diagnostics: dict[str, Any] = {
+            "modes_cutoff": cutoff,
+            "operator_variant": self.model_config.get("operator_variant", "unknown"),
+            "grid_shape": list(phi.shape),
+            "fields": {},
+        }
+        axis_specs = [
+            ("R", 0, False),
+            ("Theta", 1, True),
+            ("Z", 2, False),
+        ]
+        for field_name in fields:
+            if field_name not in pred_dim:
+                continue
+            field = pred_dim[field_name].to(torch.float32)
+            if field_name == "P":
+                weight_sum = torch.clamp(torch.sum(phi), min=1e-12)
+                field = field - torch.sum(field * phi) / weight_sum
+            diagnostics["fields"][field_name] = {
+                axis_name: self._axis_spectrum_energy(
+                    field,
+                    phi,
+                    axis=axis,
+                    periodic=periodic,
+                    modes_cutoff=cutoff,
+                )
+                for axis_name, axis, periodic in axis_specs
+            }
+        return diagnostics
+
+    def plot_frequency_energy_trends(
+        self,
+        *,
+        case_index: int = 0,
+        case: Mapping[str, Any] | None = None,
+        fields: Sequence[str] = ("UR", "UT", "UZ", "P"),
+        modes_cutoff: int | None = None,
+        show: bool = True,
+        save_path: str | Path | None = None,
+        summary_path: str | Path | None = None,
+    ) -> dict[str, Any]:
+        diagnostics = self.frequency_energy_diagnostics(
+            case_index=case_index,
+            case=case,
+            fields=fields,
+            modes_cutoff=modes_cutoff,
+        )
+        field_names = list(diagnostics["fields"].keys())
+        axis_names = ["R", "Theta", "Z"]
+        if not field_names:
+            return diagnostics
+
+        fig, axes = plt.subplots(
+            len(field_names),
+            len(axis_names),
+            figsize=(4.8 * len(axis_names), 3.1 * len(field_names)),
+            squeeze=False,
+        )
+        cutoff = int(diagnostics["modes_cutoff"])
+        for row, field_name in enumerate(field_names):
+            for col, axis_name in enumerate(axis_names):
+                ax = axes[row, col]
+                axis_data = diagnostics["fields"][field_name][axis_name]
+                energy = np.asarray(axis_data["energy_fraction"], dtype=float)
+                cumulative = np.asarray(axis_data["cumulative"], dtype=float)
+                modes = np.arange(energy.shape[0], dtype=float)
+                ax.semilogy(modes, np.maximum(energy, 1e-14), color="tab:blue", linewidth=1.3, label="mode energy")
+                ax.set_xlabel("Mode index")
+                ax.set_ylabel("Energy fraction", color="tab:blue")
+                ax.tick_params(axis="y", labelcolor="tab:blue")
+                ax.grid(True, alpha=0.25)
+                ax.axvline(max(cutoff - 1, 0), color="0.35", linestyle=":", linewidth=1.1)
+
+                twin = ax.twinx()
+                twin.plot(modes, cumulative, color="tab:orange", linewidth=1.4, label="cumulative")
+                twin.set_ylim(0.0, 1.02)
+                twin.set_ylabel("Cumulative", color="tab:orange")
+                twin.tick_params(axis="y", labelcolor="tab:orange")
+
+                ax.set_title(
+                    f"{field_name} {axis_name}: "
+                    f"K95={axis_data['k95']}, high={axis_data['high_ratio_after_modes']:.2e}"
+                )
+
+        fig.suptitle(
+            f"Frequency Energy Trends ({diagnostics['operator_variant']}, cutoff modes={cutoff})",
+            y=1.005,
+        )
+        fig.tight_layout()
+        if save_path is not None:
+            save_path = Path(save_path)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(str(save_path), dpi=180, bbox_inches="tight")
+            print(f"频率能量趋势图已保存到: {save_path}")
+        if summary_path is not None:
+            summary_path = Path(summary_path)
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(json.dumps(diagnostics, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(f"频率能量诊断 JSON 已保存到: {summary_path}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+        return diagnostics
 
     @torch.no_grad()
     def post_process_case(
@@ -2353,6 +2684,15 @@ class SurrogateModeling:
             operator_variant=str(model_config.get("operator_variant", "cfno")),
             high_modes=model_config.get("high_modes", None),
             fourier_feature_bands=tuple(model_config.get("fourier_feature_bands", (1, 2, 4, 8))),
+            hf_high_gate_init=float(model_config.get("hf_high_gate_init", trainer_config.get("hf_high_gate_init", -1.0))),
+            hf_use_local_highpass=bool(
+                model_config.get("hf_use_local_highpass", trainer_config.get("hf_use_local_highpass", True))
+            ),
+            pressure_smoothing=float(
+                model_config.get("pressure_smoothing", trainer_config.get("pressure_smoothing", 0.0))
+            ),
+            pressure_highpass_weight=float(trainer_config.get("pressure_highpass_weight", 0.0)),
+            pressure_highpass_normalized=bool(trainer_config.get("pressure_highpass_normalized", True)),
             data_weight=float(trainer_config.get("data_weight", 0.0)),
             physics_weight=float(trainer_config.get("physics_weight", 1.0)),
             warmup_epochs=int(trainer_config.get("warmup_epochs", 0)),
@@ -2434,12 +2774,14 @@ if __name__ == "__main__":
             lr=1e-3,   # 学习率
             learn_ibm_params=True,    # 是否将IBM参数也纳入学习范围
             ibm_c_range=(0.3, 3.0),
-            operator_variant="hf_cfno",    # 使用哪种模型
-            modes=12,
-            high_modes=8,    # hf_cfno独有，用来写高频的成分是多少
+            operator_variant="cfno3d",    # 使用哪种模型的神经网络，这里用高频cfno，这样的话解中的高频成分会更多地得到关照，3d状态效果最好，但是也可能导致这台破电脑的破显卡完全跑不动
+            modes=16,
+            high_modes=20,    # hf_cfno系列独有，用来选择高频的成分是多少，而且我发现疑似高频成分越多收敛速度也越快，KKT投影反而会导致收敛变慢，或者我把强度改大一点试试：
             width=16,
             depth=4,
-            use_kkt_projection=True,    # 使用KKT投影
+            pressure_highpass_weight=1e8,    # 尝试压制棋盘格
+            pressure_highpass_normalized=True,
+            use_kkt_projection=False,    # todo 是否使用KKT投影，感觉用高频CFNO都够用了，加上KKT反而效果不那么好(怀疑codex写错，需推导)
             kkt_projection_iters=24,
             kkt_projection_strength=0.35,
             ibm_epsilon_range=(0.001, 0.05),

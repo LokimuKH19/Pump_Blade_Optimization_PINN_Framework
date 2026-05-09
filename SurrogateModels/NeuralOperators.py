@@ -82,6 +82,29 @@ def idct_2d(X):
     return z
 
 
+def _transform_along_dim(x, dim, transform):
+    x_perm = torch.movedim(x, dim, -1)
+    shape = x_perm.shape
+    y = transform(x_perm.reshape(-1, shape[-1])).reshape(shape)
+    return torch.movedim(y, -1, dim)
+
+
+def dct_3d(x):
+    # x: (..., D, H, W)
+    y = _transform_along_dim(x, -1, dct_1d)
+    y = _transform_along_dim(y, -2, dct_1d)
+    y = _transform_along_dim(y, -3, dct_1d)
+    return y
+
+
+def idct_3d(X):
+    # inverse 3D DCT in reverse order.
+    y = _transform_along_dim(X, -3, idct_1d)
+    y = _transform_along_dim(y, -2, idct_1d)
+    y = _transform_along_dim(y, -1, idct_1d)
+    return y
+
+
 # -------------------------
 # Chebyshev / Cosine spectral conv (real coefficients)
 # -------------------------
@@ -164,6 +187,82 @@ class SpectralConv2d(nn.Module):
         return x_out
 
 
+class ChebSpectralConv3d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes_r, modes_theta, modes_z):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.m_r = int(modes_r)
+        self.m_theta = int(modes_theta)
+        self.m_z = int(modes_z)
+        self.weight = nn.Parameter(
+            torch.randn(in_channels, out_channels, self.m_r, self.m_theta, self.m_z)
+            * (1.0 / max(in_channels * out_channels, 1) ** 0.5)
+        )
+
+    def forward(self, x):
+        # x: [B, C, R, Theta, Z]
+        B, _, R, T, Z = x.shape
+        mr = min(self.m_r, R)
+        mt = min(self.m_theta, T)
+        mz = min(self.m_z, Z)
+        x_dct = dct_3d(x)
+        x_modes = x_dct[:, :, :mr, :mt, :mz]
+        out_modes = torch.einsum(
+            "b c i j k, c o i j k -> b o i j k",
+            x_modes,
+            self.weight[:, :, :mr, :mt, :mz],
+        )
+        out_dct = torch.zeros(B, self.out_channels, R, T, Z, device=x.device, dtype=x.dtype)
+        out_dct[:, :, :mr, :mt, :mz] = out_modes
+        return idct_3d(out_dct)
+
+
+class SpectralConv3d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes = int(modes)
+        scale = 1 / max(in_channels * out_channels, 1)
+        shape = (in_channels, out_channels, self.modes, self.modes, self.modes)
+        self.weights_pp = nn.Parameter(scale * torch.randn(*shape, dtype=torch.cfloat))
+        self.weights_np = nn.Parameter(scale * torch.randn(*shape, dtype=torch.cfloat))
+        self.weights_pn = nn.Parameter(scale * torch.randn(*shape, dtype=torch.cfloat))
+        self.weights_nn = nn.Parameter(scale * torch.randn(*shape, dtype=torch.cfloat))
+
+    def compl_mul3d(self, input, weights):
+        return torch.einsum("bixyz,ioxyz->boxyz", input, weights)
+
+    def forward(self, x):
+        # x: [B, C, R, Theta, Z]
+        B, _, R, T, Z = x.shape
+        x_ft = torch.fft.rfftn(x, dim=(-3, -2, -1), norm="forward")
+        z_freq = Z // 2 + 1
+        out_ft = torch.zeros(B, self.out_channels, R, T, z_freq, device=x.device, dtype=torch.cfloat)
+
+        mr = min(self.modes, max(1, R // 2))
+        mt = min(self.modes, max(1, T // 2))
+        mz = min(self.modes, z_freq)
+        out_ft[:, :, :mr, :mt, :mz] = self.compl_mul3d(
+            x_ft[:, :, :mr, :mt, :mz],
+            self.weights_pp[:, :, :mr, :mt, :mz],
+        )
+        out_ft[:, :, -mr:, :mt, :mz] = self.compl_mul3d(
+            x_ft[:, :, -mr:, :mt, :mz],
+            self.weights_np[:, :, :mr, :mt, :mz],
+        )
+        out_ft[:, :, :mr, -mt:, :mz] = self.compl_mul3d(
+            x_ft[:, :, :mr, -mt:, :mz],
+            self.weights_pn[:, :, :mr, :mt, :mz],
+        )
+        out_ft[:, :, -mr:, -mt:, :mz] = self.compl_mul3d(
+            x_ft[:, :, -mr:, -mt:, :mz],
+            self.weights_nn[:, :, :mr, :mt, :mz],
+        )
+        return torch.fft.irfftn(out_ft, s=(R, T, Z), dim=(-3, -2, -1), norm="forward")
+
+
 def mixed_boundary_pad2d(x, pad_h, pad_w):
     # H is treated as periodic, W as non-periodic. This matches theta-z slices
     # after SurrogateModeling applies replicate padding in Z.
@@ -171,6 +270,16 @@ def mixed_boundary_pad2d(x, pad_h, pad_w):
         x = F.pad(x, (pad_w, pad_w, 0, 0), mode="replicate")
     if pad_h > 0:
         x = F.pad(x, (0, 0, pad_h, pad_h), mode="circular")
+    return x
+
+
+# 说白了就是我做了个带通滤波器：
+def mixed_boundary_pad3d(x, pad_r, pad_theta, pad_z):
+    # x: [B, C, R, Theta, Z]. R/Z are non-periodic, Theta is periodic.
+    if pad_r > 0 or pad_z > 0:
+        x = F.pad(x, (pad_z, pad_z, 0, 0, pad_r, pad_r), mode="replicate")
+    if pad_theta > 0:
+        x = F.pad(x, (0, 0, pad_theta, pad_theta, 0, 0), mode="circular")
     return x
 
 
@@ -185,12 +294,14 @@ class MultiBandSpectralConv2d(nn.Module):
         self.low_modes = int(low_modes)
         self.high_modes = int(max(high_modes, 0))
         scale = 1 / max(in_channels * out_channels, 1)
+        # 左上角低频成分
         self.weights_low_pos = nn.Parameter(
             scale * torch.randn(in_channels, out_channels, self.low_modes, self.low_modes, dtype=torch.cfloat)
         )
         self.weights_low_neg = nn.Parameter(
             scale * torch.randn(in_channels, out_channels, self.low_modes, self.low_modes, dtype=torch.cfloat)
         )
+        # high_modes added into the model structure，已经开始笑了
         if self.high_modes > 0:
             self.weights_high_pos = nn.Parameter(
                 scale * torch.randn(in_channels, out_channels, self.low_modes, self.high_modes, dtype=torch.cfloat)
@@ -263,6 +374,32 @@ class FourierFeatureGrid2d(nn.Module):
         return torch.cat([x, y_features, z_features], dim=1)
 
 
+class FourierFeatureGrid3d(nn.Module):
+    def __init__(self, bands=(1, 2, 4, 8)):
+        super().__init__()
+        self.register_buffer("bands", torch.tensor(list(bands), dtype=torch.float32), persistent=False)
+
+    @property
+    def extra_channels(self):
+        return int(self.bands.numel()) * 6
+
+    def forward(self, x):
+        if self.bands.numel() == 0:
+            return x
+        B, _, R, T, Z = x.shape
+        rr = torch.linspace(0.0, 1.0, R, device=x.device, dtype=x.dtype).view(1, 1, R, 1, 1)
+        tt = torch.linspace(0.0, 1.0, T, device=x.device, dtype=x.dtype).view(1, 1, 1, T, 1)
+        zz = torch.linspace(0.0, 1.0, Z, device=x.device, dtype=x.dtype).view(1, 1, 1, 1, Z)
+        bands = self.bands.to(device=x.device, dtype=x.dtype).view(1, -1, 1, 1, 1)
+        phase_r = 2.0 * math.pi * bands * rr
+        phase_t = 2.0 * math.pi * bands * tt
+        phase_z = 2.0 * math.pi * bands * zz
+        r_features = torch.cat([torch.sin(phase_r), torch.cos(phase_r)], dim=1).expand(B, -1, R, T, Z)
+        t_features = torch.cat([torch.sin(phase_t), torch.cos(phase_t)], dim=1).expand(B, -1, R, T, Z)
+        z_features = torch.cat([torch.sin(phase_z), torch.cos(phase_z)], dim=1).expand(B, -1, R, T, Z)
+        return torch.cat([x, r_features, t_features, z_features], dim=1)
+
+
 class LocalHighPassBlock2d(nn.Module):
     # A local branch catches edges and short-wavelength content that low-mode
     # spectral layers deliberately remove.
@@ -284,19 +421,48 @@ class LocalHighPassBlock2d(nn.Module):
         return self.mix(y)
 
 
+class LocalHighPassBlock3d(nn.Module):
+    def __init__(self, channels, kernel_size=3):
+        super().__init__()
+        kernel_size = int(kernel_size)
+        if kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be odd.")
+        self.pad = kernel_size // 2
+        self.depthwise = nn.Conv3d(channels, channels, kernel_size, groups=channels, padding=0)
+        self.pointwise = nn.Conv3d(channels, channels, 1)
+        self.mix = nn.Conv3d(channels, channels, 1)
+
+    def forward(self, x):
+        smooth = F.avg_pool3d(mixed_boundary_pad3d(x, 1, 1, 1), kernel_size=3, stride=1)
+        high = x - smooth
+        y = self.depthwise(mixed_boundary_pad3d(high, self.pad, self.pad, self.pad))
+        y = F.gelu(self.pointwise(y))
+        return self.mix(y)
+
+
 class HFCFNOBlock(nn.Module):
-    def __init__(self, channels, modes, cheb_modes, high_modes=4, alpha_init=0.5):
+    def __init__(
+        self,
+        channels,
+        modes,
+        cheb_modes,
+        high_modes=4,
+        alpha_init=0.5,
+        high_gate_init=-1.0,
+        use_local_highpass=True,
+    ):
         super().__init__()
         self.low_cfno = CFNOBlock(channels, channels, modes, cheb_modes, alpha_init=alpha_init)
         self.band_spectral = MultiBandSpectralConv2d(channels, channels, modes, high_modes=high_modes)
-        self.local_high = LocalHighPassBlock2d(channels)
+        self.use_local_highpass = bool(use_local_highpass)
+        self.local_high = LocalHighPassBlock2d(channels) if self.use_local_highpass else None
         self.fuse = nn.Conv2d(channels * 3, channels, 1)
-        self.high_gate = nn.Parameter(torch.tensor(-1.0))
+        self.high_gate = nn.Parameter(torch.tensor(float(high_gate_init)))
 
     def forward(self, x):
         low = self.low_cfno(x)
         band = self.band_spectral(x)
-        local = self.local_high(x)
+        local = self.local_high(x) if self.local_high is not None else torch.zeros_like(band)
         gate = torch.sigmoid(self.high_gate)
         fused = self.fuse(torch.cat([low, band, local], dim=1))
         return low + gate * (band + local) + fused
@@ -323,6 +489,54 @@ class CFNOBlock(nn.Module):
         y_cat = torch.cat([y_f, y_c], dim=1)
         y_fused = self.fuse(y_cat)
         return y_blend + y_fused
+
+
+class CFNOBlock3d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes, cheb_modes, alpha_init=0.5):
+        super().__init__()
+        self.fourier = SpectralConv3d(in_channels, out_channels, modes)
+        mr, mt, mz = cheb_modes
+        self.cheb = ChebSpectralConv3d(in_channels, out_channels, mr, mt, mz)
+        self.alpha = nn.Parameter(torch.tensor(alpha_init))
+        self.fuse = nn.Conv3d(out_channels * 2, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        y_f = self.fourier(x)
+        y_c = self.cheb(x)
+        a = torch.sigmoid(self.alpha)
+        y_blend = a * y_f + (1.0 - a) * y_c
+        y_cat = torch.cat([y_f, y_c], dim=1)
+        y_fused = self.fuse(y_cat)
+        return y_blend + y_fused
+
+
+class HFCFNOBlock3d(nn.Module):
+    def __init__(
+        self,
+        channels,
+        modes,
+        cheb_modes,
+        high_modes=4,
+        alpha_init=0.5,
+        high_gate_init=-1.0,
+        use_local_highpass=True,
+    ):
+        super().__init__()
+        high_modes = int(max(high_modes, 0))
+        self.low_cfno = CFNOBlock3d(channels, channels, modes, cheb_modes, alpha_init=alpha_init)
+        self.band_spectral = SpectralConv3d(channels, channels, int(modes) + high_modes)
+        self.use_local_highpass = bool(use_local_highpass)
+        self.local_high = LocalHighPassBlock3d(channels) if self.use_local_highpass else None
+        self.fuse = nn.Conv3d(channels * 3, channels, 1)
+        self.high_gate = nn.Parameter(torch.tensor(float(high_gate_init)))
+
+    def forward(self, x):
+        low = self.low_cfno(x)
+        band = self.band_spectral(x)
+        local = self.local_high(x) if self.local_high is not None else torch.zeros_like(band)
+        gate = torch.sigmoid(self.high_gate)
+        fused = self.fuse(torch.cat([low, band, local], dim=1))
+        return low + gate * (band + local) + fused
 
 
 # -------------------------
@@ -453,6 +667,8 @@ class HF_CFNO2d_small(nn.Module):
         input_features=1,
         output_features=1,
         fourier_feature_bands=(1, 2, 4, 8),
+        high_gate_init=-1.0,
+        use_local_highpass=True,
     ):
         super().__init__()
         if high_modes is None:
@@ -468,6 +684,8 @@ class HF_CFNO2d_small(nn.Module):
                     cheb_modes=cheb_modes,
                     high_modes=high_modes,
                     alpha_init=alpha_init,
+                    high_gate_init=high_gate_init,
+                    use_local_highpass=use_local_highpass,
                 )
                 for _ in range(depth)
             ]
@@ -490,6 +708,140 @@ class HF_CFNO2d_small(nn.Module):
         x = self.fc2(x)
         x = x.permute(0, 3, 1, 2)
         return x
+
+
+class FNO3d_small(nn.Module):
+    def __init__(self, modes=8, width=16, depth=3, input_features=1, output_features=1):
+        super().__init__()
+        self.fc0 = nn.Linear(input_features, width)
+        self.blocks = nn.ModuleList([SpectralConv3d(width, width, modes) for _ in range(depth)])
+        self.wconvs = nn.ModuleList([nn.Conv3d(width, width, 1) for _ in range(depth)])
+        self.fc1 = nn.Linear(width, 64)
+        self.fc2 = nn.Linear(64, output_features)
+
+    def forward(self, x):
+        # x: [B, C, R, Theta, Z]
+        x = x.permute(0, 2, 3, 4, 1)
+        x = self.fc0(x)
+        x = x.permute(0, 4, 1, 2, 3)
+        for blk, w in zip(self.blocks, self.wconvs):
+            y = blk(x)
+            x = y + w(x)
+        x = x.permute(0, 2, 3, 4, 1)
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x.permute(0, 4, 1, 2, 3)
+
+
+class CNO3d_small(nn.Module):
+    def __init__(self, cheb_modes=(8, 8, 8), width=16, depth=3, input_features=1, output_features=1):
+        super().__init__()
+        self.fc0 = nn.Linear(input_features, width)
+        self.blocks = nn.ModuleList(
+            [ChebSpectralConv3d(width, width, cheb_modes[0], cheb_modes[1], cheb_modes[2]) for _ in range(depth)]
+        )
+        self.wconvs = nn.ModuleList([nn.Conv3d(width, width, 1) for _ in range(depth)])
+        self.fc1 = nn.Linear(width, 64)
+        self.fc2 = nn.Linear(64, output_features)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 3, 4, 1)
+        x = self.fc0(x)
+        x = x.permute(0, 4, 1, 2, 3)
+        for blk, w in zip(self.blocks, self.wconvs):
+            y = blk(x)
+            x = y + w(x)
+        x = x.permute(0, 2, 3, 4, 1)
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x.permute(0, 4, 1, 2, 3)
+
+
+class CFNO3d_small(nn.Module):
+    def __init__(
+        self,
+        modes=8,
+        cheb_modes=(8, 8, 8),
+        width=16,
+        depth=3,
+        alpha_init=0.5,
+        input_features=1,
+        output_features=1,
+    ):
+        super().__init__()
+        self.fc0 = nn.Linear(input_features, width)
+        self.blocks = nn.ModuleList(
+            [CFNOBlock3d(width, width, modes, cheb_modes, alpha_init=alpha_init) for _ in range(depth)]
+        )
+        self.wconvs = nn.ModuleList([nn.Conv3d(width, width, 1) for _ in range(depth)])
+        self.fc1 = nn.Linear(width, 64)
+        self.fc2 = nn.Linear(64, output_features)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 3, 4, 1)
+        x = self.fc0(x)
+        x = x.permute(0, 4, 1, 2, 3)
+        for blk, w in zip(self.blocks, self.wconvs):
+            y = blk(x)
+            x = y + w(x)
+        x = x.permute(0, 2, 3, 4, 1)
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x.permute(0, 4, 1, 2, 3)
+
+
+class HF_CFNO3d_small(nn.Module):
+    def __init__(
+        self,
+        modes=8,
+        cheb_modes=(8, 8, 8),
+        high_modes=None,
+        width=16,
+        depth=3,
+        alpha_init=0.5,
+        input_features=1,
+        output_features=1,
+        fourier_feature_bands=(1, 2, 4, 8),
+        high_gate_init=-1.0,
+        use_local_highpass=True,
+    ):
+        super().__init__()
+        if high_modes is None:
+            high_modes = max(2, int(modes) // 2)
+        self.feature_grid = FourierFeatureGrid3d(fourier_feature_bands)
+        lifted_features = input_features + self.feature_grid.extra_channels
+        self.fc0 = nn.Linear(lifted_features, width)
+        self.blocks = nn.ModuleList(
+            [
+                HFCFNOBlock3d(
+                    width,
+                    modes=modes,
+                    cheb_modes=cheb_modes,
+                    high_modes=high_modes,
+                    alpha_init=alpha_init,
+                    high_gate_init=high_gate_init,
+                    use_local_highpass=use_local_highpass,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.wconvs = nn.ModuleList([nn.Conv3d(width, width, 1) for _ in range(depth)])
+        hidden = max(64, width * 2)
+        self.fc1 = nn.Linear(width, hidden)
+        self.fc2 = nn.Linear(hidden, output_features)
+
+    def forward(self, x):
+        x = self.feature_grid(x)
+        x = x.permute(0, 2, 3, 4, 1)
+        x = self.fc0(x)
+        x = x.permute(0, 4, 1, 2, 3)
+        for blk, w in zip(self.blocks, self.wconvs):
+            y = blk(x)
+            x = F.gelu(y + w(x))
+        x = x.permute(0, 2, 3, 4, 1)
+        x = F.gelu(self.fc1(x))
+        x = self.fc2(x)
+        return x.permute(0, 4, 1, 2, 3)
 
 
 # -------------------- Poisson dataset generation using Jacobi solver --------------------

@@ -1,0 +1,55 @@
+{
+  "config": {
+    "n": 64,
+    "rh": 2.0,
+    "rs": 4.0,
+    "mu": 1.0,
+    "rho": 1.0,
+    "omega_out": 1.0,
+    "n_blade": 1,
+    "modes": 12,
+    "width": 32,
+    "depth": 4,
+    "epochs": 1200,
+    "lr": 0.002,
+    "weight_decay": 1e-05,
+    "print_interval": 200,
+    "seed": 10492
+  },
+  "device": "cuda",
+  "metrics": {
+    "FNO": {
+      "UR_rmse": 9.895583934849128e-05,
+      "UR_max_abs": 0.0005616624839603901,
+      "UT_rmse": 0.0002440342796035111,
+      "UT_max_abs": 0.0008365511894226074,
+      "P_rmse": 0.00048652858822606504,
+      "P_max_abs": 0.004561185836791992,
+      "total_mse": 1.0201836175838253e-07
+    },
+    "CFNO": {
+      "UR_rmse": 6.464921170845628e-05,
+      "UR_max_abs": 0.00029072159668430686,
+      "UT_rmse": 0.00012197548494441435,
+      "UT_max_abs": 0.0004478972405195236,
+      "P_rmse": 0.00029852407169528306,
+      "P_max_abs": 0.0019870400428771973,
+      "total_mse": 3.6058057872878635e-08
+    },
+    "HF_CFNO": {
+      "UR_rmse": 9.472810052102432e-05,
+      "UR_max_abs": 0.00029816298047080636,
+      "UT_rmse": 0.0003087362856604159,
+      "UT_max_abs": 0.0013730525970458984,
+      "P_rmse": 0.00035819580079987645,
+      "P_max_abs": 0.0017639994621276855,
+      "total_mse": 7.75319151102849e-08
+    }
+  },
+  "outputs": {
+    "profiles": "annular_coette_profile_comparison.png",
+    "fields": "annular_coette_field_comparison.png",
+    "errors": "annular_coette_error_maps.png",
+    "history": "annular_coette_training_history.png"
+  }
+}
