@@ -1,0 +1,115 @@
+{
+  "workflow_action": "train",
+  "training_mode": "mixed",
+  "simulation_folders": [
+    "..\\BladeOptimizerLFR\\CQ_20260514_115826_SIMULATION"
+  ],
+  "checkpoint_to_load": null,
+  "checkpoint_to_save": "surrogate_formal\\train_cfno_mixed_n064_m8_pvalue_prefnone_pdataabsolute_discfvm_rhie_chow_rc0.35_convcentral_hm16_w16_d6_ep5000_cq_20260514_115826_simulation\\surrogate_checkpoint.pt",
+  "physics_config": {
+    "rpm": -210.0,
+    "mu": 0.006,
+    "rho": 10650.0,
+    "omega": -21.991148575128552,
+    "qv": 0.025,
+    "g": 9.8,
+    "g_star": 0.03739758750000002,
+    "P0": 119375.6158463647
+  },
+  "data_config": {
+    "n": 64,
+    "theta_sector_index": 0,
+    "interpolation_chunk_size": 250000
+  },
+  "model_config": {
+    "operator_variant": "cfno",
+    "input_mode": "both",
+    "modes": 8,
+    "high_modes": 16,
+    "width": 16,
+    "depth": 6,
+    "z_padding": 8,
+    "fourier_feature_bands": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "hf_high_gate_init": -1.0,
+    "hf_use_local_highpass": true,
+    "pressure_smoothing": 0.0,
+    "pressure_supervision_mode": "value",
+    "pressure_reference_mode": "none",
+    "pressure_data_reference": "absolute"
+  },
+  "training_config": {
+    "epochs": 5000,
+    "print_interval": 1,
+    "checkpoint_interval": 50,
+    "prefer_existing_run_checkpoint": true,
+    "batch_size": 1,
+    "lr": 0.001,
+    "pressure_highpass_weight": 0.0,
+    "pressure_highpass_normalized": true,
+    "physics_discretization": "fvm_rhie_chow",
+    "rhie_chow_strength": 0.35,
+    "momentum_diagonal_floor": 1.0,
+    "convection_interpolation": "central",
+    "use_kkt_projection": false,
+    "kkt_projection_iters": 24,
+    "kkt_projection_strength": 0.35,
+    "learn_ibm_params": true,
+    "ibm_c_range": [
+      0.3,
+      3.0
+    ],
+    "ibm_epsilon_range": [
+      0.001,
+      0.05
+    ],
+    "micro_batch_size": null,
+    "slice_batch_size": null,
+    "auto_cuda_batching": true,
+    "cuda_memory_fraction": 0.8,
+    "use_activation_checkpointing": true,
+    "device": "cuda",
+    "data_weight": 1.0,
+    "physics_weight": 0.1,
+    "warmup_epochs": 20,
+    "ramp_epochs": 30
+  },
+  "post_config": {
+    "spans": [
+      0.4,
+      0.6
+    ],
+    "show_matplotlib": false,
+    "show_pyvista_window": true,
+    "plot_3d": true,
+    "passages_to_plot_3d": null,
+    "cfd_pressure_reference": "absolute",
+    "interpolation_chunk_size": 250000
+  },
+  "case_summaries": [
+    {
+      "n": 64,
+      "rh": 0.0605,
+      "rs": 0.08,
+      "h": 0.125,
+      "mu": 0.006,
+      "rho": 10650.0,
+      "omega": -21.991148575128552,
+      "qv": 0.025,
+      "n_blade": 6,
+      "z0": -0.05054899305,
+      "g": 9.8,
+      "absolute_frame": true,
+      "blade_params": "..\\BladeOptimizerLFR\\CQ_20260514_115826_SIMULATION\\blade_params.json",
+      "simulation_csv": "..\\BladeOptimizerLFR\\CQ_20260514_115826_SIMULATION\\DataGenerator220.csv",
+      "csv_sector_index": 0,
+      "csv_points_in_sector": 25041,
+      "csv_radius_source": "shifted-to-z-axis",
+      "csv_velocity_source": "xyz-columns"
+    }
+  ]
+}
