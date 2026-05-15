@@ -673,10 +673,22 @@ class BladeFlowPhysicsLoss(nn.Module):
         self,
         pressure_highpass_weight: float = 0.0,
         pressure_highpass_normalized: bool = True,
+        physics_discretization: str = "fvm_rhie_chow",
+        rhie_chow_strength: float = 0.35,
+        momentum_diagonal_floor: float = 1.0,
+        convection_interpolation: str = "central",
     ):
         super().__init__()
         self.pressure_highpass_weight = float(max(pressure_highpass_weight, 0.0))
         self.pressure_highpass_normalized = bool(pressure_highpass_normalized)
+        self.physics_discretization = str(physics_discretization).lower()
+        if self.physics_discretization not in {"fvm_rhie_chow", "centered"}:
+            raise ValueError("physics_discretization must be 'fvm_rhie_chow' or 'centered'.")
+        self.rhie_chow_strength = float(max(rhie_chow_strength, 0.0))
+        self.momentum_diagonal_floor = float(max(momentum_diagonal_floor, 1e-8))
+        self.convection_interpolation = str(convection_interpolation).lower()
+        if self.convection_interpolation not in {"central", "upwind"}:
+            raise ValueError("convection_interpolation must be 'central' or 'upwind'.")
 
     def d1(
         self,
@@ -733,6 +745,327 @@ class BladeFlowPhysicsLoss(nn.Module):
         theta_weight = line_quadrature_weight(mask.shape[2], mask.device, mask.dtype)
         mask = mask * theta_weight.view(1, 1, -1, 1)
         return mask
+
+    def _neighbor_plus_overlap(self, x: torch.Tensor, dim: int, *, theta_overlap: bool) -> torch.Tensor:
+        if not theta_overlap:
+            return neighbor_plus(x, dim=dim, periodic=False)
+        x_perm = torch.movedim(x, dim, -1)
+        out = torch.empty_like(x_perm)
+        n = x_perm.shape[-1]
+        if n <= 1:
+            out.copy_(x_perm)
+        elif n == 2:
+            out[..., 0] = x_perm[..., 1]
+            out[..., 1] = x_perm[..., 0]
+        else:
+            out[..., :-1] = x_perm[..., 1:]
+            out[..., -1] = x_perm[..., 1]
+        return torch.movedim(out, -1, dim)
+
+    def _neighbor_minus_overlap(self, x: torch.Tensor, dim: int, *, theta_overlap: bool) -> torch.Tensor:
+        if not theta_overlap:
+            return neighbor_minus(x, dim=dim, periodic=False)
+        x_perm = torch.movedim(x, dim, -1)
+        out = torch.empty_like(x_perm)
+        n = x_perm.shape[-1]
+        if n <= 1:
+            out.copy_(x_perm)
+        elif n == 2:
+            out[..., 0] = x_perm[..., 1]
+            out[..., 1] = x_perm[..., 0]
+        else:
+            out[..., 1:] = x_perm[..., :-1]
+            out[..., 0] = x_perm[..., -2]
+        return torch.movedim(out, -1, dim)
+
+    def _face_plus(self, x: torch.Tensor, dim: int, *, theta_overlap: bool = False) -> torch.Tensor:
+        return 0.5 * (x + self._neighbor_plus_overlap(x, dim, theta_overlap=theta_overlap))
+
+    def _face_minus(self, x: torch.Tensor, dim: int, *, theta_overlap: bool = False) -> torch.Tensor:
+        return 0.5 * (self._neighbor_minus_overlap(x, dim, theta_overlap=theta_overlap) + x)
+
+    def _upwind_plus(
+        self,
+        transported: torch.Tensor,
+        normal_velocity: torch.Tensor,
+        dim: int,
+        *,
+        theta_overlap: bool = False,
+    ) -> torch.Tensor:
+        plus = self._neighbor_plus_overlap(transported, dim, theta_overlap=theta_overlap)
+        return torch.where(normal_velocity >= 0.0, transported, plus)
+
+    def _upwind_minus(
+        self,
+        transported: torch.Tensor,
+        normal_velocity: torch.Tensor,
+        dim: int,
+        *,
+        theta_overlap: bool = False,
+    ) -> torch.Tensor:
+        minus = self._neighbor_minus_overlap(transported, dim, theta_overlap=theta_overlap)
+        return torch.where(normal_velocity >= 0.0, minus, transported)
+
+    def _momentum_diagonal_inverse(
+        self,
+        ur: torch.Tensor,
+        ut: torch.Tensor,
+        uz: torch.Tensor,
+        batch: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor:
+        # Rhie-Chow 中的 a^{-1} 来自动量方程局部线性系统的对角尺度。
+        # 在 PINN 里没有显式 SIMPLE 线性求解器，因此用 FVM 对流/扩散系数
+        # 构造一个点态近似；作为插值阻尼系数 detach，避免训练时把该系数也当成
+        # 需要反传的额外非线性算子。
+        r_hat = batch["r_hat"]
+        k_theta = batch["K_theta"]
+        dR = expand_scalar(batch["dR"])
+        dTheta = expand_scalar(batch["dTheta"])
+        dZ = expand_scalar(batch["dZ"])
+        Re = expand_scalar(batch["Re_omega"])
+        Lambda = expand_scalar(batch["Lambda"])
+        Ku = expand_scalar(batch["Ku"])
+
+        ur_e = self._face_plus(ur, dim=1)
+        ur_w = self._face_minus(ur, dim=1)
+        ut_n = self._face_plus(ut, dim=2, theta_overlap=True)
+        ut_s = self._face_minus(ut, dim=2, theta_overlap=True)
+        uz_t = self._face_plus(uz, dim=3)
+        uz_b = self._face_minus(uz, dim=3)
+
+        conv_diag = (torch.abs(ur_e) + torch.abs(ur_w)) / torch.clamp(dR, min=1e-12)
+        conv_diag = conv_diag + (torch.abs(k_theta * ut_n) + torch.abs(k_theta * ut_s)) / torch.clamp(
+            dTheta,
+            min=1e-12,
+        )
+        conv_diag = conv_diag + (
+            torch.abs(Lambda * Ku * uz_t) + torch.abs(Lambda * Ku * uz_b)
+        ) / torch.clamp(dZ, min=1e-12)
+
+        r_e = self._face_plus(r_hat, dim=1)
+        r_w = self._face_minus(r_hat, dim=1)
+        diff_diag = (r_e + r_w) / (
+            torch.clamp(r_hat, min=1e-12) * torch.clamp(dR, min=1e-12) ** 2
+        )
+        diff_diag = diff_diag + 2.0 * (k_theta ** 2) / torch.clamp(dTheta, min=1e-12) ** 2
+        diff_diag = diff_diag + 2.0 * (Lambda ** 2) / torch.clamp(dZ, min=1e-12) ** 2
+
+        diagonal = conv_diag + diff_diag / torch.clamp(Re, min=1e-12) + self.momentum_diagonal_floor
+        return torch.reciprocal(torch.clamp(diagonal, min=1e-8)).detach()
+
+    def _rhie_chow_face_velocities(
+        self,
+        ur: torch.Tensor,
+        ut: torch.Tensor,
+        uz: torch.Tensor,
+        p: torch.Tensor,
+        batch: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        # 同位网格上使用 Rhie-Chow 面速度，抑制压力棋盘格。
+        # 面压力梯度 = 相邻节点直接差分；节点压力梯度均值 = 两端中心差分均值。
+        dR = expand_scalar(batch["dR"])
+        dTheta = expand_scalar(batch["dTheta"])
+        dZ = expand_scalar(batch["dZ"])
+        k_theta = batch["K_theta"]
+        Lambda = expand_scalar(batch["Lambda"])
+        Ku = expand_scalar(batch["Ku"])
+        Eu = expand_scalar(batch["Eu_omega"])
+
+        a_inv = self._momentum_diagonal_inverse(ur, ut, uz, batch)
+        coeff = self.rhie_chow_strength * Eu
+
+        p_e = self._neighbor_plus_overlap(p, dim=1, theta_overlap=False)
+        p_w = self._neighbor_minus_overlap(p, dim=1, theta_overlap=False)
+        p_n = self._neighbor_plus_overlap(p, dim=2, theta_overlap=True)
+        p_s = self._neighbor_minus_overlap(p, dim=2, theta_overlap=True)
+        p_t = self._neighbor_plus_overlap(p, dim=3, theta_overlap=False)
+        p_b = self._neighbor_minus_overlap(p, dim=3, theta_overlap=False)
+
+        grad_r = self.d1(p, dim=1, spacing=dR, periodic=False)
+        grad_theta = k_theta * self.d1(p, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
+        grad_z = (Lambda / torch.clamp(Ku, min=1e-12)) * self.d1(p, dim=3, spacing=dZ, periodic=False)
+
+        a_e = self._face_plus(a_inv, dim=1)
+        a_w = self._face_minus(a_inv, dim=1)
+        a_n = self._face_plus(a_inv, dim=2, theta_overlap=True)
+        a_s = self._face_minus(a_inv, dim=2, theta_overlap=True)
+        a_t = self._face_plus(a_inv, dim=3)
+        a_b = self._face_minus(a_inv, dim=3)
+
+        direct_e = (p_e - p) / torch.clamp(dR, min=1e-12)
+        direct_w = (p - p_w) / torch.clamp(dR, min=1e-12)
+        direct_n = k_theta * (p_n - p) / torch.clamp(dTheta, min=1e-12)
+        direct_s = k_theta * (p - p_s) / torch.clamp(dTheta, min=1e-12)
+        direct_t = (Lambda / torch.clamp(Ku, min=1e-12)) * (p_t - p) / torch.clamp(dZ, min=1e-12)
+        direct_b = (Lambda / torch.clamp(Ku, min=1e-12)) * (p - p_b) / torch.clamp(dZ, min=1e-12)
+
+        avg_e = self._face_plus(grad_r, dim=1)
+        avg_w = self._face_minus(grad_r, dim=1)
+        avg_n = self._face_plus(grad_theta, dim=2, theta_overlap=True)
+        avg_s = self._face_minus(grad_theta, dim=2, theta_overlap=True)
+        avg_t = self._face_plus(grad_z, dim=3)
+        avg_b = self._face_minus(grad_z, dim=3)
+
+        return {
+            "ur_e": self._face_plus(ur, dim=1) - coeff * a_e * (direct_e - avg_e),
+            "ur_w": self._face_minus(ur, dim=1) - coeff * a_w * (direct_w - avg_w),
+            "ut_n": self._face_plus(ut, dim=2, theta_overlap=True) - coeff * a_n * (direct_n - avg_n),
+            "ut_s": self._face_minus(ut, dim=2, theta_overlap=True) - coeff * a_s * (direct_s - avg_s),
+            "uz_t": self._face_plus(uz, dim=3) - coeff * a_t * (direct_t - avg_t),
+            "uz_b": self._face_minus(uz, dim=3) - coeff * a_b * (direct_b - avg_b),
+        }
+
+    def conservative_convection(
+        self,
+        transported: torch.Tensor,
+        face_velocity: Mapping[str, torch.Tensor],
+        batch: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor:
+        # PDF Eq. (2.60)-(2.61): 对流项按控制体面通量离散。
+        # 负责输运的速度使用 Rhie-Chow 面速度；被输运量用一阶迎风面值。
+        r_hat = batch["r_hat"]
+        k_theta = batch["K_theta"]
+        dR = expand_scalar(batch["dR"])
+        dTheta = expand_scalar(batch["dTheta"])
+        dZ = expand_scalar(batch["dZ"])
+        Lambda = expand_scalar(batch["Lambda"])
+        Ku = expand_scalar(batch["Ku"])
+        r_e = self._face_plus(r_hat, dim=1)
+        r_w = self._face_minus(r_hat, dim=1)
+
+        if self.convection_interpolation == "central":
+            phi_e = self._face_plus(transported, dim=1)
+            phi_w = self._face_minus(transported, dim=1)
+            phi_n = self._face_plus(transported, dim=2, theta_overlap=True)
+            phi_s = self._face_minus(transported, dim=2, theta_overlap=True)
+            phi_t = self._face_plus(transported, dim=3)
+            phi_b = self._face_minus(transported, dim=3)
+        else:
+            phi_e = self._upwind_plus(transported, face_velocity["ur_e"], dim=1)
+            phi_w = self._upwind_minus(transported, face_velocity["ur_w"], dim=1)
+            phi_n = self._upwind_plus(transported, face_velocity["ut_n"], dim=2, theta_overlap=True)
+            phi_s = self._upwind_minus(transported, face_velocity["ut_s"], dim=2, theta_overlap=True)
+            phi_t = self._upwind_plus(transported, face_velocity["uz_t"], dim=3)
+            phi_b = self._upwind_minus(transported, face_velocity["uz_b"], dim=3)
+
+        radial = (r_e * face_velocity["ur_e"] * phi_e - r_w * face_velocity["ur_w"] * phi_w) / (
+            torch.clamp(r_hat, min=1e-12) * torch.clamp(dR, min=1e-12)
+        )
+        theta = k_theta * (face_velocity["ut_n"] * phi_n - face_velocity["ut_s"] * phi_s) / torch.clamp(
+            dTheta,
+            min=1e-12,
+        )
+        axial = Lambda * Ku * (face_velocity["uz_t"] * phi_t - face_velocity["uz_b"] * phi_b) / torch.clamp(
+            dZ,
+            min=1e-12,
+        )
+        return radial + theta + axial
+
+    def fvm_laplacian(self, field: torch.Tensor, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        # PDF Eq. (2.66): 扩散项使用有限体积通量形式，而不是先拆成点态二阶中心差分。
+        r_hat = batch["r_hat"]
+        k_theta = batch["K_theta"]
+        dR = expand_scalar(batch["dR"])
+        dTheta = expand_scalar(batch["dTheta"])
+        dZ = expand_scalar(batch["dZ"])
+        Lambda = expand_scalar(batch["Lambda"])
+
+        field_e = self._neighbor_plus_overlap(field, dim=1, theta_overlap=False)
+        field_w = self._neighbor_minus_overlap(field, dim=1, theta_overlap=False)
+        field_n = self._neighbor_plus_overlap(field, dim=2, theta_overlap=True)
+        field_s = self._neighbor_minus_overlap(field, dim=2, theta_overlap=True)
+        field_t = self._neighbor_plus_overlap(field, dim=3, theta_overlap=False)
+        field_b = self._neighbor_minus_overlap(field, dim=3, theta_overlap=False)
+
+        r_e = self._face_plus(r_hat, dim=1)
+        r_w = self._face_minus(r_hat, dim=1)
+        grad_e = (field_e - field) / torch.clamp(dR, min=1e-12)
+        grad_w = (field - field_w) / torch.clamp(dR, min=1e-12)
+        grad_n = (field_n - field) / torch.clamp(dTheta, min=1e-12)
+        grad_s = (field - field_s) / torch.clamp(dTheta, min=1e-12)
+        grad_t = (field_t - field) / torch.clamp(dZ, min=1e-12)
+        grad_b = (field - field_b) / torch.clamp(dZ, min=1e-12)
+
+        radial = (r_e * grad_e - r_w * grad_w) / (torch.clamp(r_hat, min=1e-12) * torch.clamp(dR, min=1e-12))
+        theta = (k_theta ** 2) * (grad_n - grad_s) / torch.clamp(dTheta, min=1e-12)
+        axial = (Lambda ** 2) * (grad_t - grad_b) / torch.clamp(dZ, min=1e-12)
+        return radial + theta + axial
+
+    def fvm_rhie_chow_residuals(
+        self,
+        pred: Mapping[str, torch.Tensor],
+        batch: Mapping[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # PDF Eq. (2.53)-(2.66): 所有控制方程都在每个格点对应控制体上用净通量描述。
+        ur = pred["UR"]
+        ut = pred["UT"]
+        uz = pred["UZ"]
+        p = pred["P"]
+
+        r_hat = batch["r_hat"]
+        k_theta = batch["K_theta"]
+        dR = expand_scalar(batch["dR"])
+        dTheta = expand_scalar(batch["dTheta"])
+        dZ = expand_scalar(batch["dZ"])
+        Eu = expand_scalar(batch["Eu_omega"])
+        Re = expand_scalar(batch["Re_omega"])
+        Lambda = expand_scalar(batch["Lambda"])
+        Ku = expand_scalar(batch["Ku"])
+        delta = expand_scalar(batch["delta"])
+        sgn_omega = expand_scalar(batch["sgn_omega"])
+        g_star = expand_scalar(batch["g_star"])
+        absolute_frame = expand_scalar(batch["absolute_frame"])
+
+        face_velocity = self._rhie_chow_face_velocities(ur, ut, uz, p, batch)
+        r_e = self._face_plus(r_hat, dim=1)
+        r_w = self._face_minus(r_hat, dim=1)
+
+        residual_c = (r_e * face_velocity["ur_e"] - r_w * face_velocity["ur_w"]) / (
+            torch.clamp(r_hat, min=1e-12) * torch.clamp(dR, min=1e-12)
+        )
+        residual_c = residual_c + k_theta * (
+            face_velocity["ut_n"] - face_velocity["ut_s"]
+        ) / torch.clamp(dTheta, min=1e-12)
+        residual_c = residual_c + Lambda * Ku * (
+            face_velocity["uz_t"] - face_velocity["uz_b"]
+        ) / torch.clamp(dZ, min=1e-12)
+
+        dTheta_ur = self.d1(ur, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
+        dTheta_ut = self.d1(ut, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
+        dR_p = self.d1(p, dim=1, spacing=dR, periodic=False)
+        dTheta_p = self.d1(p, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
+        dZ_p = self.d1(p, dim=3, spacing=dZ, periodic=False)
+
+        lap_ur = self.fvm_laplacian(ur, batch)
+        lap_ut = self.fvm_laplacian(ut, batch)
+        lap_uz = self.fvm_laplacian(uz, batch)
+
+        residual_r = self.conservative_convection(ur, face_velocity, batch)
+        residual_r = residual_r - (ut ** 2) / torch.clamp(r_hat, min=1e-12)
+        residual_r = residual_r + Eu * dR_p
+        residual_r = residual_r - (
+            lap_ur
+            - ur / torch.clamp(r_hat ** 2, min=1e-12)
+            - (2.0 * k_theta / torch.clamp(r_hat, min=1e-12)) * dTheta_ut
+        ) / torch.clamp(Re, min=1e-12)
+
+        residual_theta = self.conservative_convection(ut, face_velocity, batch)
+        residual_theta = residual_theta + (ur * ut) / torch.clamp(r_hat, min=1e-12)
+        residual_theta = residual_theta + k_theta * Eu * dTheta_p
+        residual_theta = residual_theta - (
+            lap_ut
+            - ut / torch.clamp(r_hat ** 2, min=1e-12)
+            + (2.0 * k_theta / torch.clamp(r_hat, min=1e-12)) * dTheta_ur
+        ) / torch.clamp(Re, min=1e-12)
+
+        residual_z = self.conservative_convection(uz, face_velocity, batch)
+        residual_z = residual_z + (Lambda / torch.clamp(Ku, min=1e-12)) * Eu * dZ_p
+        residual_z = residual_z - lap_uz / torch.clamp(Re, min=1e-12) + g_star
+
+        rotating_weight = 1.0 - absolute_frame
+        residual_r = residual_r + rotating_weight * (-delta ** 2 * r_hat + 2.0 * sgn_omega * delta * ut)
+        residual_theta = residual_theta + rotating_weight * (-2.0 * sgn_omega * delta * ur)
+        return residual_c, residual_r, residual_theta, residual_z
 
     def dimensionless_laplacian(
         self,
@@ -824,62 +1157,65 @@ class BladeFlowPhysicsLoss(nn.Module):
         g_star = expand_scalar(batch["g_star"])
         absolute_frame = expand_scalar(batch["absolute_frame"])
 
-        # 所有 Theta 导数都必须使用“首尾重合网格”的专用差分。
-        dR_ur = self.d1(ur, dim=1, spacing=dR, periodic=False)
-        dTheta_ur = self.d1(ur, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
-        dZ_ur = self.d1(ur, dim=3, spacing=dZ, periodic=False)
+        if self.physics_discretization == "fvm_rhie_chow":
+            residual_c, residual_r, residual_theta, residual_z = self.fvm_rhie_chow_residuals(pred, batch)
+        else:
+            # 所有 Theta 导数都必须使用“首尾重合网格”的专用差分。
+            dR_ur = self.d1(ur, dim=1, spacing=dR, periodic=False)
+            dTheta_ur = self.d1(ur, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
+            dZ_ur = self.d1(ur, dim=3, spacing=dZ, periodic=False)
 
-        dR_ut = self.d1(ut, dim=1, spacing=dR, periodic=False)
-        dTheta_ut = self.d1(ut, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
-        dZ_ut = self.d1(ut, dim=3, spacing=dZ, periodic=False)
+            dR_ut = self.d1(ut, dim=1, spacing=dR, periodic=False)
+            dTheta_ut = self.d1(ut, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
+            dZ_ut = self.d1(ut, dim=3, spacing=dZ, periodic=False)
 
-        dR_uz = self.d1(uz, dim=1, spacing=dR, periodic=False)
-        dTheta_uz = self.d1(uz, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
-        dZ_uz = self.d1(uz, dim=3, spacing=dZ, periodic=False)
+            dR_uz = self.d1(uz, dim=1, spacing=dR, periodic=False)
+            dTheta_uz = self.d1(uz, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
+            dZ_uz = self.d1(uz, dim=3, spacing=dZ, periodic=False)
 
-        dR_p = self.d1(p, dim=1, spacing=dR, periodic=False)
-        dTheta_p = self.d1(p, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
-        dZ_p = self.d1(p, dim=3, spacing=dZ, periodic=False)
+            dR_p = self.d1(p, dim=1, spacing=dR, periodic=False)
+            dTheta_p = self.d1(p, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
+            dZ_p = self.d1(p, dim=3, spacing=dZ, periodic=False)
 
-        lap_ur = self.dimensionless_laplacian(ur, batch)
-        lap_ut = self.dimensionless_laplacian(ut, batch)
-        lap_uz = self.dimensionless_laplacian(uz, batch)
+            lap_ur = self.dimensionless_laplacian(ur, batch)
+            lap_ut = self.dimensionless_laplacian(ut, batch)
+            lap_uz = self.dimensionless_laplacian(uz, batch)
 
-        # 连续方程残差：
-        # Rc = 1/r_hat dR(r_hat UR) + K_theta dTheta UT + Lambda Ku dZ UZ
-        residual_c = self.d1(r_hat * ur, dim=1, spacing=dR, periodic=False) / torch.clamp(r_hat, min=1e-12)
-        residual_c = residual_c + k_theta * dTheta_ut + Lambda * Ku * dZ_uz
+            # 连续方程残差：
+            # Rc = 1/r_hat dR(r_hat UR) + K_theta dTheta UT + Lambda Ku dZ UZ
+            residual_c = self.d1(r_hat * ur, dim=1, spacing=dR, periodic=False) / torch.clamp(r_hat, min=1e-12)
+            residual_c = residual_c + k_theta * dTheta_ut + Lambda * Ku * dZ_uz
 
-        # 径向动量残差。
-        residual_r = ur * dR_ur + k_theta * ut * dTheta_ur + Lambda * Ku * uz * dZ_ur
-        residual_r = residual_r - (ut ** 2) / torch.clamp(r_hat, min=1e-12)
-        residual_r = residual_r + Eu * dR_p
-        residual_r = residual_r - (
-            lap_ur
-            - ur / torch.clamp(r_hat ** 2, min=1e-12)
-            - (2.0 * k_theta / torch.clamp(r_hat, min=1e-12)) * dTheta_ut
-        ) / Re
+            # 径向动量残差。
+            residual_r = ur * dR_ur + k_theta * ut * dTheta_ur + Lambda * Ku * uz * dZ_ur
+            residual_r = residual_r - (ut ** 2) / torch.clamp(r_hat, min=1e-12)
+            residual_r = residual_r + Eu * dR_p
+            residual_r = residual_r - (
+                lap_ur
+                - ur / torch.clamp(r_hat ** 2, min=1e-12)
+                - (2.0 * k_theta / torch.clamp(r_hat, min=1e-12)) * dTheta_ut
+            ) / Re
 
-        # 周向动量残差。
-        residual_theta = ur * dR_ut + k_theta * ut * dTheta_ut + Lambda * Ku * uz * dZ_ut
-        residual_theta = residual_theta + (ur * ut) / torch.clamp(r_hat, min=1e-12)
-        residual_theta = residual_theta + k_theta * Eu * dTheta_p
-        residual_theta = residual_theta - (
-            lap_ut
-            - ut / torch.clamp(r_hat ** 2, min=1e-12)
-            + (2.0 * k_theta / torch.clamp(r_hat, min=1e-12)) * dTheta_ur
-        ) / Re
+            # 周向动量残差。
+            residual_theta = ur * dR_ut + k_theta * ut * dTheta_ut + Lambda * Ku * uz * dZ_ut
+            residual_theta = residual_theta + (ur * ut) / torch.clamp(r_hat, min=1e-12)
+            residual_theta = residual_theta + k_theta * Eu * dTheta_p
+            residual_theta = residual_theta - (
+                lap_ut
+                - ut / torch.clamp(r_hat ** 2, min=1e-12)
+                + (2.0 * k_theta / torch.clamp(r_hat, min=1e-12)) * dTheta_ur
+            ) / Re
 
-        # 轴向动量残差。
-        residual_z = ur * dR_uz + k_theta * ut * dTheta_uz + Lambda * Ku * uz * dZ_uz
-        residual_z = residual_z + (Lambda / torch.clamp(Ku, min=1e-12)) * Eu * dZ_p
-        residual_z = residual_z - lap_uz / Re + g_star
+            # 轴向动量残差。
+            residual_z = ur * dR_uz + k_theta * ut * dTheta_uz + Lambda * Ku * uz * dZ_uz
+            residual_z = residual_z + (Lambda / torch.clamp(Ku, min=1e-12)) * Eu * dZ_p
+            residual_z = residual_z - lap_uz / Re + g_star
 
-        # 绝对参考系默认不需要旋转附加项。
-        # 如果切换到旋转参考系，就把对应项加回来。
-        rotating_weight = 1.0 - absolute_frame
-        residual_r = residual_r + rotating_weight * (-delta ** 2 * r_hat + 2.0 * sgn_omega * delta * ut)
-        residual_theta = residual_theta + rotating_weight * (-2.0 * sgn_omega * delta * ur)
+            # 绝对参考系默认不需要旋转附加项。
+            # 如果切换到旋转参考系，就把对应项加回来。
+            rotating_weight = 1.0 - absolute_frame
+            residual_r = residual_r + rotating_weight * (-delta ** 2 * r_hat + 2.0 * sgn_omega * delta * ut)
+            residual_theta = residual_theta + rotating_weight * (-2.0 * sgn_omega * delta * ur)
 
         loss_c = self.weighted_mse(residual_c, pde_mask)
         loss_r = self.weighted_mse(residual_r, pde_mask)
@@ -922,6 +1258,11 @@ class BladeFlowPhysicsLoss(nn.Module):
             "loss_phys": total,
             "q_hat_pred": torch.mean(q_hat_pred),
             "q_hat_target": torch.mean(q_hat_target),
+            "rhie_chow_strength": torch.tensor(
+                self.rhie_chow_strength,
+                device=total.device,
+                dtype=total.dtype,
+            ),
         }
 
 
@@ -954,6 +1295,10 @@ class SurrogateModeling:
         pressure_data_reference: str = "training_origin",
         pressure_highpass_weight: float = 0.0,
         pressure_highpass_normalized: bool = True,
+        physics_discretization: str = "fvm_rhie_chow",
+        rhie_chow_strength: float = 0.35,
+        momentum_diagonal_floor: float = 1.0,
+        convection_interpolation: str = "central",
         data_weight: float = 1.0,
         physics_weight: float = 0.1,
         warmup_epochs: int = 20,
@@ -1089,6 +1434,10 @@ class SurrogateModeling:
             "pressure_data_reference": self.pressure_data_reference,
             "pressure_highpass_weight": float(max(pressure_highpass_weight, 0.0)),
             "pressure_highpass_normalized": bool(pressure_highpass_normalized),
+            "physics_discretization": str(physics_discretization).lower(),
+            "rhie_chow_strength": float(max(rhie_chow_strength, 0.0)),
+            "momentum_diagonal_floor": float(max(momentum_diagonal_floor, 1e-8)),
+            "convection_interpolation": str(convection_interpolation).lower(),
             "data_weight": data_weight,
             "physics_weight": physics_weight,
             "warmup_epochs": warmup_epochs,
@@ -1107,6 +1456,10 @@ class SurrogateModeling:
         self.physics_loss = BladeFlowPhysicsLoss(
             pressure_highpass_weight=pressure_highpass_weight,
             pressure_highpass_normalized=pressure_highpass_normalized,
+            physics_discretization=physics_discretization,
+            rhie_chow_strength=rhie_chow_strength,
+            momentum_diagonal_floor=momentum_diagonal_floor,
+            convection_interpolation=convection_interpolation,
         ).to(self.device)
         self.kkt_projection = build_kkt_projection(
             enabled=bool(use_kkt_projection),
@@ -1158,6 +1511,13 @@ class SurrogateModeling:
         print(f"pressure_supervision  : {self.pressure_supervision_mode}")
         print(f"pressure_reference    : {self.pressure_reference_mode}")
         print(f"pressure_data_ref     : {self.pressure_data_reference}")
+        print(f"physics_discretization: {self.physics_loss.physics_discretization}")
+        print(
+            "rhie_chow            : "
+            f"strength={self.physics_loss.rhie_chow_strength:.6g}, "
+            f"diag_floor={self.physics_loss.momentum_diagonal_floor:.6g}"
+        )
+        print(f"convection_interp    : {self.physics_loss.convection_interpolation}")
         print(
             f"ibm_range             : C in {self.ibm_config['ibm_c_range']}, "
             f"epsilon in {self.ibm_config['ibm_epsilon_range']}"
@@ -1400,6 +1760,10 @@ class SurrogateModeling:
         pressure_smoothing: float = 0.0,
         pressure_highpass_weight: float = 0.0,
         pressure_highpass_normalized: bool = True,
+        physics_discretization: str = "fvm_rhie_chow",
+        rhie_chow_strength: float = 0.35,
+        momentum_diagonal_floor: float = 1.0,
+        convection_interpolation: str = "central",
         use_kkt_projection: bool = False,
         kkt_projection_iters: int = 24,
         kkt_projection_strength: float = 0.35,
@@ -1463,6 +1827,10 @@ class SurrogateModeling:
             pressure_smoothing=pressure_smoothing,
             pressure_highpass_weight=pressure_highpass_weight,
             pressure_highpass_normalized=pressure_highpass_normalized,
+            physics_discretization=physics_discretization,
+            rhie_chow_strength=rhie_chow_strength,
+            momentum_diagonal_floor=momentum_diagonal_floor,
+            convection_interpolation=convection_interpolation,
             use_kkt_projection=use_kkt_projection,
             kkt_projection_iters=kkt_projection_iters,
             kkt_projection_strength=kkt_projection_strength,
@@ -1873,6 +2241,10 @@ class SurrogateModeling:
         pressure_smoothing: float | None = None,
         pressure_highpass_weight: float | None = None,
         pressure_highpass_normalized: bool | None = None,
+        physics_discretization: str | None = None,
+        rhie_chow_strength: float | None = None,
+        momentum_diagonal_floor: float | None = None,
+        convection_interpolation: str | None = None,
     ) -> None:
         # checkpoint 续训时常常只想沿用网络权重，但重新指定混合训练策略。
         # 这个方法不改变网络层数/宽度，只覆盖损失权重和压力处理策略。
@@ -1921,6 +2293,26 @@ class SurrogateModeling:
             value = bool(pressure_highpass_normalized)
             self.physics_loss.pressure_highpass_normalized = value
             self.trainer_config["pressure_highpass_normalized"] = value
+        if physics_discretization is not None:
+            value = str(physics_discretization).lower()
+            if value not in {"fvm_rhie_chow", "centered"}:
+                raise ValueError("physics_discretization must be 'fvm_rhie_chow' or 'centered'.")
+            self.physics_loss.physics_discretization = value
+            self.trainer_config["physics_discretization"] = value
+        if rhie_chow_strength is not None:
+            value = float(max(rhie_chow_strength, 0.0))
+            self.physics_loss.rhie_chow_strength = value
+            self.trainer_config["rhie_chow_strength"] = value
+        if momentum_diagonal_floor is not None:
+            value = float(max(momentum_diagonal_floor, 1e-8))
+            self.physics_loss.momentum_diagonal_floor = value
+            self.trainer_config["momentum_diagonal_floor"] = value
+        if convection_interpolation is not None:
+            value = str(convection_interpolation).lower()
+            if value not in {"central", "upwind"}:
+                raise ValueError("convection_interpolation must be 'central' or 'upwind'.")
+            self.physics_loss.convection_interpolation = value
+            self.trainer_config["convection_interpolation"] = value
 
     def smoke_test(self, do_backward: bool = True) -> dict[str, float]:
         # 最小化检查，debug模式
@@ -2008,17 +2400,7 @@ class SurrogateModeling:
         bundle = self._predict_case_bundle(case=case)
         return bundle["pred_phy"] if return_physical else bundle["pred_dim"]
 
-    @staticmethod
-
-    @staticmethod
-
-
-
-
     @torch.no_grad()
-
-    @torch.no_grad()
-
     def save_checkpoint(
         self,
         path: str | Path,
@@ -2098,6 +2480,10 @@ class SurrogateModeling:
         pressure_smoothing: float | None = None,
         pressure_highpass_weight: float | None = None,
         pressure_highpass_normalized: bool | None = None,
+        physics_discretization: str | None = None,
+        rhie_chow_strength: float | None = None,
+        momentum_diagonal_floor: float | None = None,
+        convection_interpolation: str | None = None,
     ) -> "SurrogateModeling":
         # 用 checkpoint 重建一个可直接部署的新 trainer。
         path = Path(path)
@@ -2150,6 +2536,26 @@ class SurrogateModeling:
             if pressure_highpass_normalized is not None
             else bool(trainer_config.get("pressure_highpass_normalized", True))
         )
+        resolved_physics_discretization = str(
+            physics_discretization
+            if physics_discretization is not None
+            else trainer_config.get("physics_discretization", "fvm_rhie_chow")
+        )
+        resolved_rhie_chow_strength = (
+            float(rhie_chow_strength)
+            if rhie_chow_strength is not None
+            else float(trainer_config.get("rhie_chow_strength", 0.35))
+        )
+        resolved_momentum_diagonal_floor = (
+            float(momentum_diagonal_floor)
+            if momentum_diagonal_floor is not None
+            else float(trainer_config.get("momentum_diagonal_floor", 1.0))
+        )
+        resolved_convection_interpolation = str(
+            convection_interpolation
+            if convection_interpolation is not None
+            else trainer_config.get("convection_interpolation", "central")
+        )
 
         trainer = cls(
             train_cases=case_list,
@@ -2174,6 +2580,10 @@ class SurrogateModeling:
             pressure_data_reference=resolved_pressure_data_reference,
             pressure_highpass_weight=resolved_pressure_highpass_weight,
             pressure_highpass_normalized=resolved_pressure_highpass_normalized,
+            physics_discretization=resolved_physics_discretization,
+            rhie_chow_strength=resolved_rhie_chow_strength,
+            momentum_diagonal_floor=resolved_momentum_diagonal_floor,
+            convection_interpolation=resolved_convection_interpolation,
             data_weight=float(trainer_config.get("data_weight", 0.0)),
             physics_weight=float(trainer_config.get("physics_weight", 1.0)),
             warmup_epochs=int(trainer_config.get("warmup_epochs", 0)),
@@ -2287,6 +2697,9 @@ def build_formal_run_name(
     pressure_supervision = model_config.get("pressure_supervision_mode", None)
     pressure_reference = model_config.get("pressure_reference_mode", None)
     pressure_data_reference = model_config.get("pressure_data_reference", None)
+    physics_discretization = training_config.get("physics_discretization", None)
+    rhie_chow_strength = training_config.get("rhie_chow_strength", None)
+    convection_interpolation = training_config.get("convection_interpolation", None)
     parts = [
         _run_token(action),
         model_name,
@@ -2300,6 +2713,12 @@ def build_formal_run_name(
         parts.append("pref" + _run_token(pressure_reference))
     if pressure_data_reference is not None:
         parts.append("pdata" + _run_token(pressure_data_reference))
+    if physics_discretization is not None:
+        parts.append("disc" + _run_token(physics_discretization))
+    if rhie_chow_strength is not None and str(physics_discretization).lower() == "fvm_rhie_chow":
+        parts.append("rc" + _run_token(f"{float(rhie_chow_strength):.3g}"))
+    if convection_interpolation is not None:
+        parts.append("conv" + _run_token(convection_interpolation))
     if high_modes is not None:
         parts.append(f"hm{int(high_modes)}")
     parts.extend([f"w{width}", f"d{depth}", f"ep{epochs}"])
@@ -2340,9 +2759,9 @@ if __name__ == "__main__":
     # train        : 从头训练并保存 checkpoint。
     # resume_train : 读取 checkpoint 后继续训练；CHECKPOINT_TO_LOAD=None 时自动找 surrogate_formal 下最新模型。
     # deploy       : 读取 checkpoint 直接部署/后处理；不会再训练。
-    WORKFLOW_ACTION = "resume_train"
+    WORKFLOW_ACTION = "train"
     TRAINING_MODE = "mixed"  # mixed / data_only / physics_only
-    CHECKPOINT_TO_LOAD = "surrogate_formal/train_cfno_data_only_n064_m8_pvalue_prefnone_pdataabsolute_hm16_w16_d6_ep5000_cq_20260514_115826_simulation/surrogate_checkpoint.pt"  #  str|Path|None 也可以写成 "latest" 或某个 surrogate_checkpoint.pt
+    CHECKPOINT_TO_LOAD = None  #  str|Path|None 也可以写成 "latest" 或某个 surrogate_checkpoint.pt
 
     seed_everything(42)
     simulation_folders = [
@@ -2381,7 +2800,7 @@ if __name__ == "__main__":
         "z_padding": 8,
         "fourier_feature_bands": (1, 2, 4, 8),
         "hf_high_gate_init": -1.0,
-        "hf_use_local_highpass": True,    # 开启高通模式
+        "hf_use_local_highpass": True,    # 开启高通模式，只在HF_CFNO中有效
         "pressure_smoothing": 0.0,
         # pressure_supervision_mode:
         # value    : 回退到直接用 P 通道做数据监督。
@@ -2402,6 +2821,11 @@ if __name__ == "__main__":
         "lr": 1e-3,
         "pressure_highpass_weight": 1e8,
         "pressure_highpass_normalized": True,
+        # centered=旧点态差分；fvm_rhie_chow=控制体通量残差 + Rhie-Chow 面速度。
+        "physics_discretization": "fvm_rhie_chow",
+        "rhie_chow_strength": 0.35,
+        "momentum_diagonal_floor": 1.0,
+        "convection_interpolation": "upwind",    # central (2nd ordered) | upwind (1st ordered)
         "use_kkt_projection": False,
         "kkt_projection_iters": 24,
         "kkt_projection_strength": 0.35,
@@ -2567,6 +2991,16 @@ if __name__ == "__main__":
             pressure_highpass_normalized=(
                 training_config["pressure_highpass_normalized"] if WORKFLOW_ACTION == "resume_train" else None
             ),
+            physics_discretization=(
+                training_config["physics_discretization"] if WORKFLOW_ACTION == "resume_train" else None
+            ),
+            rhie_chow_strength=training_config["rhie_chow_strength"] if WORKFLOW_ACTION == "resume_train" else None,
+            momentum_diagonal_floor=(
+                training_config["momentum_diagonal_floor"] if WORKFLOW_ACTION == "resume_train" else None
+            ),
+            convection_interpolation=(
+                training_config["convection_interpolation"] if WORKFLOW_ACTION == "resume_train" else None
+            ),
         )
         loaded_history = list((trainer.checkpoint_metadata or {}).get("history") or [])
         if WORKFLOW_ACTION == "resume_train":
@@ -2581,6 +3015,10 @@ if __name__ == "__main__":
                 pressure_smoothing=model_config["pressure_smoothing"],
                 pressure_highpass_weight=training_config["pressure_highpass_weight"],
                 pressure_highpass_normalized=training_config["pressure_highpass_normalized"],
+                physics_discretization=training_config["physics_discretization"],
+                rhie_chow_strength=training_config["rhie_chow_strength"],
+                momentum_diagonal_floor=training_config["momentum_diagonal_floor"],
+                convection_interpolation=training_config["convection_interpolation"],
             )
     else:
         trainer = SurrogateModeling(
@@ -2604,6 +3042,10 @@ if __name__ == "__main__":
             pressure_data_reference=model_config["pressure_data_reference"],
             pressure_highpass_weight=training_config["pressure_highpass_weight"],
             pressure_highpass_normalized=training_config["pressure_highpass_normalized"],
+            physics_discretization=training_config["physics_discretization"],
+            rhie_chow_strength=training_config["rhie_chow_strength"],
+            momentum_diagonal_floor=training_config["momentum_diagonal_floor"],
+            convection_interpolation=training_config["convection_interpolation"],
             data_weight=training_config["data_weight"],
             physics_weight=training_config["physics_weight"],
             warmup_epochs=training_config["warmup_epochs"],
