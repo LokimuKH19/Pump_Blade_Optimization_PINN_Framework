@@ -16,6 +16,12 @@ This filefolder facilitates an end-to-end mapping from the blade geometric defin
 - `SurrogateModelingUtils.py`: Necessary dependencies for `SurrogateModeling.py`.
 - `NeuralOperators.py`: Operator learning toolkit.
 - `KKTProjectionOperators.py`: KKT projection toolkit for operator learning case.
+- `SurrogateModelingConfig.py`: FlowCaseConfig and the definition of the dimensionless coordinate system.
+- `SurrogateModelingData.py`: Physics case definition, CSV Fluent data import, interpolation and the interface to convert original data into the dimensionless grid.
+- `SurrogateModelingPlots.py`: all Matplotlib/PyVista image creation, post process, CFD comparison and spectrum analysis.
+- `SurrogateModelingKKT.py`: the creation and interface of `KKTProjectionOperators.py`
+- `SurrogateModelingLegacy.py`: old versions of main process and the pure physics debug workflow.
+
 ---
 ### Documents
 - `Dimensionless Document.pdf`: The current plan for data generator.
@@ -47,3 +53,6 @@ Updated `NeuralOperators.py`, trying to make the CFNO more sensitive to high-fre
 
 ### May 10th, 2026
 Updated `AnnularCoette.py` and its surrogate version `AnnularCoetteSurrogate.py` to show theoretical results. 3D versions of each neural operators are also implemented in `NeuralOperators.py`.
+
+### May 15th, 2026
+Updated the main programme, allowing the usage of CFD data (Fluent .csv solution file) as high-frequencied supervision now.
