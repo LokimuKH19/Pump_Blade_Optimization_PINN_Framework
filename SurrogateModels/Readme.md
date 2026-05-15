@@ -24,9 +24,13 @@ This filefolder facilitates an end-to-end mapping from the blade geometric defin
 
 ---
 ### Documents
-- `Dimensionless Document.pdf`: The current plan for data generator.
+- `Dimensionless Document.pdf`: The current plan for data generator (in Chinese).
 - `SurrogateModeling_Methodology.md`: Current workflow of the surrogate modeling.
 - `DataGenerator3D_simple.md`: Current workflow of the data generation method.
+
+---
+### FileFolders
+- `surrogate_formal`: running logs of the main program `SurrogateModeling.py`
   
 ------
 
@@ -56,3 +60,9 @@ Updated `AnnularCoette.py` and its surrogate version `AnnularCoetteSurrogate.py`
 
 ### May 15th, 2026
 Updated the main programme, allowing the usage of CFD data (Fluent .csv solution file) as high-frequencied supervision now.
+
+### May 16th, 2026
+Finally, I figured out how to keep the semantical consistency of CFD data and surrogate modeling: THE FVM DISCRETION SHOULD BE STRICTLY FULFILLED. By referencing the contents in `Dimensionless Document.pdf` I modified the main program `SurrogateModeling.py`, ensuring the Rhie-Chow interpolation and other settings are realized as originally designed, and finally obtained physically explainable results in the filefolder `surrogate_formal/CFNO-VeryGoodResult`, where the comparison of CFD data and NN prediction demonstrates the accuracy of this surrogate model, as shown below:
+
+![Comparison](./surrogate_formal/CFNO-VeryGoodResult/cfd_vs_nn_error_spans.png)
+
