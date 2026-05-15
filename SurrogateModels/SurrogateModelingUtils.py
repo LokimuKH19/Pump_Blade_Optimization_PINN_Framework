@@ -1,12 +1,219 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pyvista as pv
 import torch
+import torch.nn.functional as F
 
+import NeuralOperators
+
+
+def seed_everything(seed: int) -> None:
+    # 统一随机种子，便于复现实验和排查问题。
+    NeuralOperators.seed_everything(seed)
+
+
+def _pick(mapping: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
+    # 在多个候选键中取第一个存在的值。
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return default
+
+
+def _to_tensor(x: Any, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    return torch.as_tensor(x, dtype=dtype)
+
+
+def _scalar_from_any(value: Any, default: float) -> float:
+    if value is None:
+        return float(default)
+    tensor = _to_tensor(value, dtype=torch.float32).reshape(-1)
+    if tensor.numel() == 0:
+        return float(default)
+    return float(torch.mean(tensor).item())
+
+
+def _span_profile_tensor(value: Any, n: int, default: float) -> torch.Tensor:
+    if value is None:
+        return torch.full((n,), float(default), dtype=torch.float32)
+
+    tensor = _to_tensor(value, dtype=torch.float32)
+    if tensor.numel() == 0:
+        return torch.full((n,), float(default), dtype=torch.float32)
+    if tensor.numel() == 1:
+        return torch.full((n,), float(tensor.reshape(-1)[0].item()), dtype=torch.float32)
+
+    if tensor.ndim > 1 and tensor.shape[0] == n:
+        return tensor.reshape(n, -1).mean(dim=1).to(torch.float32)
+
+    flat = tensor.reshape(1, 1, -1)
+    if flat.shape[-1] == n:
+        return flat.reshape(-1).to(torch.float32)
+
+    profile = F.interpolate(flat, size=n, mode="linear", align_corners=True)
+    return profile.reshape(-1).to(torch.float32)
+
+
+def _case_span_profile(
+    case: Mapping[str, Any],
+    keys: Sequence[str],
+    *,
+    n: int,
+    default: float,
+) -> torch.Tensor:
+    return _span_profile_tensor(_pick(case, *keys, default=None), n=n, default=default)
+
+
+def _expand_ibm_parameter(value: float | torch.Tensor, signed_distance: torch.Tensor) -> torch.Tensor:
+    if torch.is_tensor(value):
+        param = value.to(device=signed_distance.device, dtype=signed_distance.dtype)
+    else:
+        param = torch.tensor(float(value), device=signed_distance.device, dtype=signed_distance.dtype)
+
+    if param.ndim == 0 or param.ndim == signed_distance.ndim:
+        return param
+
+    if signed_distance.ndim == 3 and param.ndim == 1:
+        if param.numel() == signed_distance.shape[0]:
+            return param.view(-1, 1, 1)
+        return param.view(1, 1, 1)
+
+    if signed_distance.ndim == 4:
+        if param.ndim == 1:
+            if param.numel() == signed_distance.shape[1] and param.numel() != signed_distance.shape[0]:
+                return param.view(1, -1, 1, 1)
+            if param.numel() == signed_distance.shape[0]:
+                return param.view(-1, 1, 1, 1)
+            if param.numel() == signed_distance.shape[1]:
+                return param.view(1, -1, 1, 1)
+        if param.ndim == 2:
+            return param.view(param.shape[0], param.shape[1], 1, 1)
+
+    while param.ndim < signed_distance.ndim:
+        param = param.unsqueeze(-1)
+    return param
+
+
+def _profile_mean_min_max(value: torch.Tensor) -> tuple[float, float, float]:
+    profile = value.detach().float().reshape(-1)
+    return (
+        float(torch.mean(profile).item()),
+        float(torch.min(profile).item()),
+        float(torch.max(profile).item()),
+    )
+
+def build_geometry_tensors(config: Any) -> dict[str, torch.Tensor]:
+    # 构造和网格一一对应的几何辅助场。
+    # Theta 方向保留首尾重合点，这样与 BladeImport 输出的 mask / phi 完全对齐。
+    r = torch.linspace(0.0, 1.0, config.n, dtype=torch.float32)
+    theta = torch.linspace(0.0, 1.0, config.n, dtype=torch.float32)
+    z = torch.linspace(0.0, 1.0, config.n, dtype=torch.float32)
+    rr, tt, zz = torch.meshgrid(r, theta, z, indexing="ij")
+
+    r_hat = rr + config.rh / config.delta_r
+    k_theta = 1.0 / (r_hat * config.theta0)
+    solid_ut = config.delta * r_hat
+    theta_phase = 2.0 * np.pi * tt
+    theta_sin = torch.sin(theta_phase)
+    theta_cos = torch.cos(theta_phase)
+
+    return {
+        "R": rr,
+        "Theta": tt,
+        "Z": zz,
+        "r_hat": r_hat,
+        "K_theta": k_theta,
+        "solid_ut": solid_ut,
+        "Theta_sin": theta_sin,
+        "Theta_cos": theta_cos,
+    }
+
+
+def build_phi_from_signed_distance(
+    signed_distance: torch.Tensor,
+    ibm_C: float | torch.Tensor,
+    ibm_epsilon: float | torch.Tensor,
+) -> torch.Tensor:
+    # 这里和 DataGenerator 中的浸没边界写法保持一致：
+    # phi=1 近似纯流体，phi=0 近似纯固体，中间是平滑过渡层。
+    c_value = _expand_ibm_parameter(ibm_C, signed_distance)
+    epsilon_value = _expand_ibm_parameter(ibm_epsilon, signed_distance)
+    epsilon_value = torch.clamp(epsilon_value, min=1e-8)
+    return 1.0 - torch.exp(-c_value * signed_distance ** 2 / (epsilon_value ** 2))
+
+
+def hard_project_theta_periodic(field: torch.Tensor, theta_dim: int) -> torch.Tensor:
+    # 当前 Theta 网格包含首尾两个重合点。
+    # 这里把首尾两个切片直接投影到同一个拼缝值上，保证数值上严格周期。
+    left_index = [slice(None)] * field.ndim
+    right_index = [slice(None)] * field.ndim
+    left_index[theta_dim] = 0
+    right_index[theta_dim] = -1
+
+    left = field[tuple(left_index)]
+    right = field[tuple(right_index)]
+    seam = 0.5 * (left + right)
+
+    out = field.clone()
+    out[tuple(left_index)] = seam
+    out[tuple(right_index)] = seam
+    return out
+
+
+def span_to_index(span: float, n: int) -> int:
+    span = float(np.clip(span, 0.0, 1.0))
+    return int(round(span * (n - 1)))
+
+
+def normalize_target_fields(
+    case: Mapping[str, Any],
+    config: Any,
+    *,
+    pressure_reference: str = "training_origin",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # 监督标签采用 [UR, UT, UZ, P] 四通道。
+    # 没有标签时允许走“纯物理调试模式”，此时返回零张量并置 has_target=0。
+    ur_raw = _pick(case, "UR", "Ur", "ur")
+    ut_raw = _pick(case, "UT", "Ut", "ut")
+    uz_raw = _pick(case, "UZ", "Uz", "uz")
+    p_raw = _pick(case, "P", "p")
+
+    has_any = any(item is not None for item in [ur_raw, ut_raw, uz_raw, p_raw])
+    has_all = all(item is not None for item in [ur_raw, ut_raw, uz_raw, p_raw])
+
+    if has_any and not has_all:
+        raise ValueError("UR, UT, UZ, P must be either all provided or all omitted.")
+
+    if not has_any:
+        zero = torch.zeros((config.n, config.n, config.n), dtype=torch.float32)
+        target = torch.stack([zero, zero, zero, zero], dim=0)
+        return target, torch.tensor(0.0, dtype=torch.float32)
+
+    ur = _to_tensor(ur_raw)
+    ut = _to_tensor(ut_raw)
+    uz = _to_tensor(uz_raw)
+    p = _to_tensor(p_raw)
+
+    fields_are_dimensionless = bool(_pick(case, "fields_are_dimensionless", default=True))
+    if not fields_are_dimensionless:
+        ur = ur / config.u_omega
+        ut = ut / config.u_omega
+        uz = uz / config.u_zo
+        p = p / config.P0
+
+    if pressure_reference == "training_origin":
+        # 旧训练逻辑：压力统一减去参考点，和固定压力零点的网络输出保持一致。
+        p = p - p[0, 0, 0]
+    elif pressure_reference == "absolute":
+        pass
+    else:
+        raise ValueError("pressure_reference must be 'training_origin' or 'absolute'.")
+    target = torch.stack([ur, ut, uz, p], dim=0).to(torch.float32)
+    return target, torch.tensor(1.0, dtype=torch.float32)
 
 def expand_scalar(x: torch.Tensor) -> torch.Tensor:
     # 把 batch 级标量扩成 [B, 1, 1, 1]，便于和三维场直接广播。
@@ -125,11 +332,17 @@ def case_summary(case: Mapping[str, Any]) -> dict[str, Any]:
         "n_blade",
         "n_blades",
         "z0",
+        "g",
         "g_star",
         "ibm_C",
         "ibm_epsilon",
         "absolute_frame",
         "blade_params",
+        "simulation_csv",
+        "csv_sector_index",
+        "csv_points_in_sector",
+        "csv_radius_source",
+        "csv_velocity_source",
     ]
     for key in keys:
         if key in case:

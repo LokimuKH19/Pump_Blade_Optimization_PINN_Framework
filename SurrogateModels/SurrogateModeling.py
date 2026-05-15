@@ -1,35 +1,59 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import matplotlib.pyplot as plt
 import numpy as np
-import pyvista as pv
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as checkpoint_forward
 from torch.utils.data import DataLoader, Dataset
 
 import NeuralOperators
-from BladeImport import PassageGeometry, build_blade_boundary
-from KKTProjectionOperators import CylindricalDivergenceKKTProjection, KKTProjectionConfig
+from BladeImport import build_blade_boundary
+from SurrogateModelingConfig import FlowCaseConfig
+from SurrogateModelingData import (
+    find_unique_simulation_csv,
+    make_pure_physics_debug_case,
+    make_pure_physics_debug_cases,
+    make_supervised_simulation_case,
+    make_supervised_simulation_cases,
+)
+from SurrogateModelingKKT import apply_kkt_projection, build_kkt_projection
+from SurrogateModelingPlots import (
+    _axis_spectrum_energy as _axis_spectrum_energy_impl,
+    _dct_along as _dct_along_impl,
+    _trace_streamline_cylindrical as _trace_streamline_cylindrical_impl,
+    compare_cfd_prediction_spans as _compare_cfd_prediction_spans_impl,
+    frequency_energy_diagnostics as _frequency_energy_diagnostics_impl,
+    plot_3d_streamlines as _plot_3d_streamlines_impl,
+    plot_blade_spans as _plot_blade_spans_impl,
+    plot_cfd_spans as _plot_cfd_spans_impl,
+    plot_frequency_energy_trends as _plot_frequency_energy_trends_impl,
+    plot_training_history as _plot_training_history_impl,
+    post_process_case as _post_process_case_impl,
+)
 from SurrogateModelingUtils import (
+    _case_span_profile,
+    _expand_ibm_parameter,
+    _pick,
+    _profile_mean_min_max,
+    _to_tensor,
+    build_geometry_tensors,
+    build_phi_from_signed_distance,
     case_summary,
     d1_periodic_with_overlap,
     d2_periodic_with_overlap,
     expand_scalar,
-    field_stats,
-    interpolate_field_periodic,
+    hard_project_theta_periodic,
     line_quadrature_weight,
-    make_pyvista_blade_surface_meshes,
-    make_pyvista_passage_grid,
     neighbor_minus,
     neighbor_plus,
+    normalize_target_fields,
+    seed_everything,
 )
-
 
 # 这个文件负责把“叶片场 -> 流场”的代理建模流程接起来。
 # 目前网络主体仍然调用 NeuralOperators.py 里的标准 2D FNO。
@@ -39,344 +63,6 @@ from SurrogateModelingUtils import (
 # 输入方面默认同时使用 blade_mask 和 phi：
 # 1. blade_mask 提供清晰的固体拓扑；
 # 2. phi 提供适合硬约束和物理损失加权的平滑浸没边界信息。
-
-
-def seed_everything(seed: int) -> None:
-    # 统一随机种子，便于复现实验和排查问题。
-    NeuralOperators.seed_everything(seed)
-
-
-def _pick(mapping: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
-    # 在多个候选键中取第一个存在的值。
-    for key in keys:
-        if key in mapping:
-            return mapping[key]
-    return default
-
-
-def _to_tensor(x: Any, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    return torch.as_tensor(x, dtype=dtype)
-
-
-def _scalar_from_any(value: Any, default: float) -> float:
-    if value is None:
-        return float(default)
-    tensor = _to_tensor(value, dtype=torch.float32).reshape(-1)
-    if tensor.numel() == 0:
-        return float(default)
-    return float(torch.mean(tensor).item())
-
-
-def _span_profile_tensor(value: Any, n: int, default: float) -> torch.Tensor:
-    if value is None:
-        return torch.full((n,), float(default), dtype=torch.float32)
-
-    tensor = _to_tensor(value, dtype=torch.float32)
-    if tensor.numel() == 0:
-        return torch.full((n,), float(default), dtype=torch.float32)
-    if tensor.numel() == 1:
-        return torch.full((n,), float(tensor.reshape(-1)[0].item()), dtype=torch.float32)
-
-    if tensor.ndim > 1 and tensor.shape[0] == n:
-        return tensor.reshape(n, -1).mean(dim=1).to(torch.float32)
-
-    flat = tensor.reshape(1, 1, -1)
-    if flat.shape[-1] == n:
-        return flat.reshape(-1).to(torch.float32)
-
-    profile = F.interpolate(flat, size=n, mode="linear", align_corners=True)
-    return profile.reshape(-1).to(torch.float32)
-
-
-def _case_span_profile(
-    case: Mapping[str, Any],
-    keys: Sequence[str],
-    *,
-    n: int,
-    default: float,
-) -> torch.Tensor:
-    return _span_profile_tensor(_pick(case, *keys, default=None), n=n, default=default)
-
-
-def _expand_ibm_parameter(value: float | torch.Tensor, signed_distance: torch.Tensor) -> torch.Tensor:
-    if torch.is_tensor(value):
-        param = value.to(device=signed_distance.device, dtype=signed_distance.dtype)
-    else:
-        param = torch.tensor(float(value), device=signed_distance.device, dtype=signed_distance.dtype)
-
-    if param.ndim == 0 or param.ndim == signed_distance.ndim:
-        return param
-
-    if signed_distance.ndim == 3 and param.ndim == 1:
-        if param.numel() == signed_distance.shape[0]:
-            return param.view(-1, 1, 1)
-        return param.view(1, 1, 1)
-
-    if signed_distance.ndim == 4:
-        if param.ndim == 1:
-            if param.numel() == signed_distance.shape[1] and param.numel() != signed_distance.shape[0]:
-                return param.view(1, -1, 1, 1)
-            if param.numel() == signed_distance.shape[0]:
-                return param.view(-1, 1, 1, 1)
-            if param.numel() == signed_distance.shape[1]:
-                return param.view(1, -1, 1, 1)
-        if param.ndim == 2:
-            return param.view(param.shape[0], param.shape[1], 1, 1)
-
-    while param.ndim < signed_distance.ndim:
-        param = param.unsqueeze(-1)
-    return param
-
-
-def _profile_mean_min_max(value: torch.Tensor) -> tuple[float, float, float]:
-    profile = value.detach().float().reshape(-1)
-    return (
-        float(torch.mean(profile).item()),
-        float(torch.min(profile).item()),
-        float(torch.max(profile).item()),
-    )
-
-
-@dataclass
-class FlowCaseConfig:
-    # 单个样本或单个工况需要的全部几何、物性与尺度参数。
-    n: int
-    rh: float
-    rs: float
-    h: float
-    mu: float
-    rho: float
-    omega: float
-    qv: float
-    n_blade: int
-    z0: float = 0.0
-    g: float = 9.8
-    g_star: float = 0.0
-    ibm_C: float = 1.0
-    ibm_epsilon: float = 0.025
-    absolute_frame: bool = True
-    use_absolute_omega_scale: bool = True
-
-    @classmethod
-    def from_mapping(cls, case: Mapping[str, Any]) -> "FlowCaseConfig":
-        return cls(
-            n=int(_pick(case, "n")),
-            rh=float(_pick(case, "rh")),
-            rs=float(_pick(case, "rs")),
-            h=float(_pick(case, "h")),
-            mu=float(_pick(case, "mu")),
-            rho=float(_pick(case, "rho")),
-            omega=float(_pick(case, "omega")),
-            qv=float(_pick(case, "qv")),
-            n_blade=int(_pick(case, "n_blade", "n_blades")),
-            z0=float(_pick(case, "z0", default=0.0)),
-            g=float(_pick(case, "g", default=9.8)),
-            g_star=float(_pick(case, "g_star", default=0.0)),
-            ibm_C=_scalar_from_any(
-                _pick(case, "ibm_C_profile", "ibm_C_span", "ibm_C_r", "ibm_C", default=1.0),
-                default=1.0,
-            ),
-            ibm_epsilon=_scalar_from_any(
-                _pick(
-                    case,
-                    "ibm_epsilon_profile",
-                    "ibm_epsilon_span",
-                    "ibm_epsilon_r",
-                    "ibm_epsilon",
-                    default=0.025,
-                ),
-                default=0.025,
-            ),
-            absolute_frame=bool(_pick(case, "absolute_frame", default=True)),
-            use_absolute_omega_scale=bool(_pick(case, "use_absolute_omega_scale", default=True)),
-        )
-
-    @property
-    def delta_r(self) -> float:
-        return self.rs - self.rh
-
-    @property
-    def theta0(self) -> float:
-        return 2.0 * np.pi / self.n_blade
-
-    @property
-    def dR(self) -> float:
-        return 1.0 / (self.n - 1)
-
-    @property
-    def dTheta(self) -> float:
-        # Theta 网格与 BladeImport 保持一致，首尾点重合，因此步长仍写作 1 / (n - 1)。
-        return 1.0 / (self.n - 1)
-
-    @property
-    def dZ(self) -> float:
-        return 1.0 / (self.n - 1)
-
-    @property
-    def u_omega(self) -> float:
-        # 周向尺度默认取叶顶圆周速度的绝对值。
-        tip_speed = self.rs * self.omega
-        if self.use_absolute_omega_scale:
-            return max(abs(tip_speed), 1e-12)
-        return tip_speed if abs(tip_speed) > 1e-12 else 1e-12
-
-    @property
-    def u_zo(self) -> float:
-        # 轴向尺度取整圈流道上的平均轴向速度。
-        return self.qv / (np.pi * (self.rs ** 2 - self.rh ** 2))
-
-    @property
-    def P0(self) -> float:
-        return self.rho * (self.u_omega ** 2 / 2.0 + self.u_zo ** 2 / 2.0 + self.g * self.h)
-
-    @property
-    def Re_omega(self) -> float:
-        return self.u_omega * self.delta_r / (self.mu / self.rho)
-
-    @property
-    def Eu_omega(self) -> float:
-        return self.P0 / (self.rho * self.u_omega ** 2)
-
-    @property
-    def Lambda(self) -> float:
-        return self.delta_r / self.h
-
-    @property
-    def Ku(self) -> float:
-        return self.u_zo / self.u_omega
-
-    @property
-    def delta(self) -> float:
-        return self.delta_r / self.rs
-
-    @property
-    def sgn_omega(self) -> float:
-        return 1.0 if self.omega >= 0 else -1.0
-
-    @property
-    def qv_passage(self) -> float:
-        # 总流量 qv 是整圈的，单个流道只承担 1 / n_blade。
-        return self.qv / self.n_blade
-
-    @property
-    def qv_hat(self) -> float:
-        # 对应单流道的无量纲流量：
-        # q_hat = q_passage / (u_zo * delta_r^2 * theta0)
-        return self.qv_passage / (max(abs(self.u_zo), 1e-12) * self.delta_r ** 2 * self.theta0)
-
-    def make_passage_geometry(self) -> PassageGeometry:
-        return PassageGeometry(
-            hub_radius=self.rh,
-            shroud_radius=self.rs,
-            passage_height=self.h,
-            blade_count=self.n_blade,
-            grid_size=self.n,
-            passage_z0=self.z0,
-        )
-
-
-def build_geometry_tensors(config: FlowCaseConfig) -> dict[str, torch.Tensor]:
-    # 构造和网格一一对应的几何辅助场。
-    # Theta 方向保留首尾重合点，这样与 BladeImport 输出的 mask / phi 完全对齐。
-    r = torch.linspace(0.0, 1.0, config.n, dtype=torch.float32)
-    theta = torch.linspace(0.0, 1.0, config.n, dtype=torch.float32)
-    z = torch.linspace(0.0, 1.0, config.n, dtype=torch.float32)
-    rr, tt, zz = torch.meshgrid(r, theta, z, indexing="ij")
-
-    r_hat = rr + config.rh / config.delta_r
-    k_theta = 1.0 / (r_hat * config.theta0)
-    solid_ut = config.delta * r_hat
-    theta_phase = 2.0 * np.pi * tt
-    theta_sin = torch.sin(theta_phase)
-    theta_cos = torch.cos(theta_phase)
-
-    return {
-        "R": rr,
-        "Theta": tt,
-        "Z": zz,
-        "r_hat": r_hat,
-        "K_theta": k_theta,
-        "solid_ut": solid_ut,
-        "Theta_sin": theta_sin,
-        "Theta_cos": theta_cos,
-    }
-
-
-def build_phi_from_signed_distance(
-    signed_distance: torch.Tensor,
-    ibm_C: float | torch.Tensor,
-    ibm_epsilon: float | torch.Tensor,
-) -> torch.Tensor:
-    # 这里和 DataGenerator 中的浸没边界写法保持一致：
-    # phi=1 近似纯流体，phi=0 近似纯固体，中间是平滑过渡层。
-    c_value = _expand_ibm_parameter(ibm_C, signed_distance)
-    epsilon_value = _expand_ibm_parameter(ibm_epsilon, signed_distance)
-    epsilon_value = torch.clamp(epsilon_value, min=1e-8)
-    return 1.0 - torch.exp(-c_value * signed_distance ** 2 / (epsilon_value ** 2))
-
-
-def hard_project_theta_periodic(field: torch.Tensor, theta_dim: int) -> torch.Tensor:
-    # 当前 Theta 网格包含首尾两个重合点。
-    # 这里把首尾两个切片直接投影到同一个拼缝值上，保证数值上严格周期。
-    left_index = [slice(None)] * field.ndim
-    right_index = [slice(None)] * field.ndim
-    left_index[theta_dim] = 0
-    right_index[theta_dim] = -1
-
-    left = field[tuple(left_index)]
-    right = field[tuple(right_index)]
-    seam = 0.5 * (left + right)
-
-    out = field.clone()
-    out[tuple(left_index)] = seam
-    out[tuple(right_index)] = seam
-    return out
-
-
-def span_to_index(span: float, n: int) -> int:
-    span = float(np.clip(span, 0.0, 1.0))
-    return int(round(span * (n - 1)))
-
-
-def normalize_target_fields(
-    case: Mapping[str, Any],
-    config: FlowCaseConfig,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # 监督标签采用 [UR, UT, UZ, P] 四通道。
-    # 没有标签时允许走“纯物理调试模式”，此时返回零张量并置 has_target=0。
-    ur_raw = _pick(case, "UR", "Ur", "ur")
-    ut_raw = _pick(case, "UT", "Ut", "ut")
-    uz_raw = _pick(case, "UZ", "Uz", "uz")
-    p_raw = _pick(case, "P", "p")
-
-    has_any = any(item is not None for item in [ur_raw, ut_raw, uz_raw, p_raw])
-    has_all = all(item is not None for item in [ur_raw, ut_raw, uz_raw, p_raw])
-
-    if has_any and not has_all:
-        raise ValueError("UR, UT, UZ, P must be either all provided or all omitted.")
-
-    if not has_any:
-        zero = torch.zeros((config.n, config.n, config.n), dtype=torch.float32)
-        target = torch.stack([zero, zero, zero, zero], dim=0)
-        return target, torch.tensor(0.0, dtype=torch.float32)
-
-    ur = _to_tensor(ur_raw)
-    ut = _to_tensor(ut_raw)
-    uz = _to_tensor(uz_raw)
-    p = _to_tensor(p_raw)
-
-    fields_are_dimensionless = bool(_pick(case, "fields_are_dimensionless", default=True))
-    if not fields_are_dimensionless:
-        ur = ur / config.u_omega
-        ut = ut / config.u_omega
-        uz = uz / config.u_zo
-        p = p / config.P0
-
-    # 压力统一减去参考点，和网络前向中的压力参考保持一致。
-    p = p - p[0, 0, 0]
-    target = torch.stack([ur, ut, uz, p], dim=0).to(torch.float32)
-    return target, torch.tensor(1.0, dtype=torch.float32)
-
 
 class BladeFlowDataset(Dataset):
     # 每个样本至少需要：
@@ -393,9 +79,13 @@ class BladeFlowDataset(Dataset):
         self,
         cases: Sequence[Mapping[str, Any]],
         input_mode: str = "both",
+        pressure_reference: str = "training_origin",
     ):
         self.cases = list(cases)
         self.input_mode = input_mode
+        self.pressure_reference = str(pressure_reference)
+        if self.pressure_reference not in {"training_origin", "absolute"}:
+            raise ValueError("pressure_reference must be 'training_origin' or 'absolute'.")
         self.samples = [self._build_sample(case) for case in self.cases]
 
     def __len__(self) -> int:
@@ -425,7 +115,7 @@ class BladeFlowDataset(Dataset):
             ibm_c_profile=ibm_c_profile,
             ibm_epsilon_profile=ibm_epsilon_profile,
         )
-        target, has_target = normalize_target_fields(case, config)
+        target, has_target = normalize_target_fields(case, config, pressure_reference=self.pressure_reference)
         has_true_signed_distance = bool(_pick(case, "signed_distance") is not None or _pick(case, "blade_params") is not None)
 
         # 输入通道分两部分：
@@ -576,12 +266,27 @@ class SliceWiseFNOFlowModel(nn.Module):
         hf_high_gate_init: float = -1.0,
         hf_use_local_highpass: bool = True,
         pressure_smoothing: float = 0.0,
+        pressure_reference_mode: str = "origin",
+        slice_batch_size: int | None = None,
+        auto_cuda_batching: bool = True,
+        cuda_memory_fraction: float = 0.65,
+        use_activation_checkpointing: bool = True,
     ):
         super().__init__()
         self.z_padding = int(max(z_padding, 0))
         self.pressure_smoothing = float(np.clip(pressure_smoothing, 0.0, 1.0))
+        self.pressure_reference_mode = str(pressure_reference_mode).lower()
+        if self.pressure_reference_mode not in {"origin", "none"}:
+            raise ValueError("pressure_reference_mode must be 'origin' or 'none'.")
         self.operator_variant = str(operator_variant).lower()
         self.is_3d_operator = False
+        self.width = int(width)
+        self.depth = int(depth)
+        self.slice_batch_size = None if slice_batch_size is None else max(1, int(slice_batch_size))
+        self.auto_cuda_batching = bool(auto_cuda_batching)
+        self.cuda_memory_fraction = float(np.clip(cuda_memory_fraction, 0.05, 0.95))
+        self.use_activation_checkpointing = bool(use_activation_checkpointing)
+        self._runtime_slice_batch_size: int | None = self.slice_batch_size
         # todo 切换模型看这个
         if self.operator_variant in {"fno", "legacy_fno"}:
             self.core = NeuralOperators.FNO2d_small(
@@ -594,6 +299,15 @@ class SliceWiseFNOFlowModel(nn.Module):
         elif self.operator_variant in {"cno", "legacy_cno"}:
             self.core = NeuralOperators.CNO2d_small(
                 cheb_modes=(modes, modes),
+                width=width,
+                depth=depth,
+                input_features=input_channels,
+                output_features=4,
+            )
+        elif self.operator_variant in {"wno", "wno2d", "wavelet", "wavelet2d"}:
+            self.core = NeuralOperators.WNO2d_small(
+                modes=modes,
+                wavelet_modes=(modes, modes),
                 width=width,
                 depth=depth,
                 input_features=input_channels,
@@ -639,6 +353,16 @@ class SliceWiseFNOFlowModel(nn.Module):
                 input_features=input_channels,
                 output_features=4,
             )
+        elif self.operator_variant in {"wno3d", "wno_3d", "3d_wno", "wavelet3d", "wavelet_3d"}:
+            self.is_3d_operator = True
+            self.core = NeuralOperators.WNO3d_small(
+                modes=modes,
+                wavelet_modes=(modes, modes, modes),
+                width=width,
+                depth=depth,
+                input_features=input_channels,
+                output_features=4,
+            )
         elif self.operator_variant in {"cfno3d", "cfno_3d", "3d_cfno"}:
             self.is_3d_operator = True
             self.core = NeuralOperators.CFNO3d_small(
@@ -666,9 +390,73 @@ class SliceWiseFNOFlowModel(nn.Module):
         else:
             raise ValueError(
                 "operator_variant must be one of: "
-                "'fno', 'cno', 'cfno', 'hf_cfno', "
-                "'fno3d', 'cno3d', 'cfno3d', 'hf_cfno3d'."
+                "'fno', 'cno', 'wno', 'cfno', 'hf_cfno', "
+                "'fno3d', 'cno3d', 'wno3d', 'cfno3d', 'hf_cfno3d'."
             )
+
+    @staticmethod
+    def _is_cuda_oom(exc: BaseException) -> bool:
+        if not isinstance(exc, RuntimeError):
+            return False
+        message = str(exc).lower()
+        return (
+            "cuda out of memory" in message
+            or "cublas_status_alloc_failed" in message
+            or "cudnn_status_alloc_failed" in message
+        )
+
+    @staticmethod
+    def _empty_cuda_cache_for(x: torch.Tensor) -> None:
+        if x.is_cuda:
+            torch.cuda.empty_cache()
+
+    def _call_core(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_activation_checkpointing and self.training and torch.is_grad_enabled():
+            return checkpoint_forward(self.core, x, use_reentrant=False)
+        return self.core(x)
+
+    def _estimate_slice_batch_size(self, x_slice: torch.Tensor) -> int:
+        total_slices, in_channels, n_theta, n_z = x_slice.shape
+        if total_slices <= 1:
+            return total_slices
+        if self._runtime_slice_batch_size is not None:
+            return min(total_slices, self._runtime_slice_batch_size)
+        if not (self.auto_cuda_batching and x_slice.is_cuda):
+            return total_slices
+
+        free_bytes, _ = torch.cuda.mem_get_info(x_slice.device)
+        budget = max(1, int(free_bytes * self.cuda_memory_fraction))
+        element_size = max(int(x_slice.element_size()), 1)
+        width = max(self.width, in_channels, 4)
+        activation_factor = max(18, 8 * self.depth)
+        bytes_per_slice = n_theta * n_z * element_size * (in_channels + 4 + activation_factor * width)
+        estimate = max(1, int(budget // max(bytes_per_slice, 1)))
+        return min(total_slices, estimate)
+
+    def _run_core_2d_batched(self, x_slice: torch.Tensor) -> torch.Tensor:
+        total_slices = int(x_slice.shape[0])
+        slice_batch = max(1, self._estimate_slice_batch_size(x_slice))
+        if slice_batch >= total_slices:
+            return self._call_core(x_slice)
+
+        outputs: list[torch.Tensor] = []
+        start = 0
+        while start < total_slices:
+            current = min(slice_batch, total_slices - start)
+            while True:
+                try:
+                    outputs.append(self._call_core(x_slice[start:start + current]))
+                    break
+                except RuntimeError as exc:
+                    if not (self.auto_cuda_batching and self._is_cuda_oom(exc) and current > 1):
+                        raise
+                    current = max(1, current // 2)
+                    self._runtime_slice_batch_size = current
+                    slice_batch = current
+                    self._empty_cuda_cache_for(x_slice)
+                    print(f"CUDA 显存不足：2D operator slice batch 自动降到 {current}。")
+            start += current
+        return torch.cat(outputs, dim=0)
 
     def smooth_pressure(self, p: torch.Tensor) -> torch.Tensor:
         r_plus = neighbor_plus(p, dim=1, periodic=False)
@@ -697,7 +485,7 @@ class SliceWiseFNOFlowModel(nn.Module):
             if self.z_padding > 0:
                 x_core = F.pad(x_core, (self.z_padding, self.z_padding, 0, 0, 0, 0), mode="replicate")
 
-            raw = self.core(x_core)
+            raw = self._call_core(x_core)
 
             if self.z_padding > 0:
                 raw = raw[..., self.z_padding:-self.z_padding]
@@ -707,7 +495,7 @@ class SliceWiseFNOFlowModel(nn.Module):
             if self.z_padding > 0:
                 x_slice = F.pad(x_slice, (self.z_padding, self.z_padding, 0, 0), mode="replicate")
 
-            raw = self.core(x_slice)
+            raw = self._run_core_2d_batched(x_slice)
 
             if self.z_padding > 0:
                 raw = raw[..., self.z_padding:-self.z_padding]
@@ -751,9 +539,11 @@ class SliceWiseFNOFlowModel(nn.Module):
         uz = hard_project_theta_periodic(uz, theta_dim=2)
         p = hard_project_theta_periodic(p, theta_dim=2)
 
-        # 压力参考点直接固定在 (0,0,0)。
-        p_ref = p[:, 0, 0, 0].view(batch_size, 1, 1, 1)
-        p = p - p_ref
+        # 压力参考点可选固定在 (0,0,0)。
+        # mixed 训练若直接用 CFD 的 P 值监督，可关闭这个 gauge fixing，让数据决定压力零点。
+        if self.pressure_reference_mode == "origin":
+            p_ref = p[:, 0, 0, 0].view(batch_size, 1, 1, 1)
+            p = p - p_ref
 
         return {
             "UR": ur,
@@ -1135,94 +925,6 @@ class BladeFlowPhysicsLoss(nn.Module):
         }
 
 
-def make_pure_physics_debug_case(
-    *,
-    blade_params: str | Path,
-    n: int = 64,
-    rh: float | None = None,
-    rs: float | None = None,
-    h: float | None = None,
-    mu: float = 0.006,
-    rho: float = 10650.0,
-    omega: float = -420.0 * np.pi / 60.0,
-    qv: float = 0.16,
-    n_blade: int | None = None,
-    z0: float | None = None,
-    g_star: float = 0.0,
-) -> dict[str, Any]:
-    # 纯物理调试模式下，数据标签可以没有，但几何和工况必须齐全。
-    blade_params = Path(blade_params)
-    with blade_params.open("r", encoding="utf-8") as handle:
-        params = json.load(handle)
-
-    global_params = params.get("global_parameters", {})
-    return {
-        "n": int(n),
-        "rh": float(rh if rh is not None else global_params.get("hub_radius")),
-        "rs": float(rs if rs is not None else global_params.get("shroud_radius")),
-        "h": float(h if h is not None else global_params.get("passage_height_H1")),
-        "mu": float(mu),
-        "rho": float(rho),
-        "omega": float(omega),
-        "qv": float(qv),
-        "n_blade": int(n_blade if n_blade is not None else global_params.get("blade_count_N")),
-        "z0": float(z0 if z0 is not None else global_params.get("z0", 0.0)),
-        "g_star": float(g_star),
-        "absolute_frame": True,
-        "blade_params": str(blade_params),
-    }
-
-
-def _normalize_blade_params_inputs(
-    blade_params: str | Path | Sequence[str | Path],
-) -> list[Path]:
-    # 训练时允许同时输入多个叶片几何文件。
-    # 这里统一展开成 Path 列表，后面的建 case 流程就可以完全复用。
-    if isinstance(blade_params, (str, Path)):
-        items = [Path(blade_params)]
-    else:
-        items = [Path(item) for item in blade_params]
-    if len(items) == 0:
-        raise ValueError("blade_params must contain at least one blade geometry file.")
-    return items
-
-
-def make_pure_physics_debug_cases(
-    *,
-    blade_params: str | Path | Sequence[str | Path],
-    n: int = 64,
-    rh: float | None = None,
-    rs: float | None = None,
-    h: float | None = None,
-    mu: float = 0.006,
-    rho: float = 10650.0,
-    omega: float = -420.0 * np.pi / 60.0,
-    qv: float = 0.16,
-    n_blade: int | None = None,
-    z0: float | None = None,
-    g_star: float = 0.0,
-) -> list[dict[str, Any]]:
-    # 这是“同一工况、多叶型训练”的直接入口。
-    # 除了 blade_params 可以是一组之外，其他工况和几何尺度参数都保持一致。
-    cases: list[dict[str, Any]] = []
-    for blade_path in _normalize_blade_params_inputs(blade_params):
-        cases.append(
-            make_pure_physics_debug_case(
-                blade_params=blade_path,
-                n=n,
-                rh=rh,
-                rs=rs,
-                h=h,
-                mu=mu,
-                rho=rho,
-                omega=omega,
-                qv=qv,
-                n_blade=n_blade,
-                z0=z0,
-                g_star=g_star,
-            )
-        )
-    return cases
 
 
 class SurrogateModeling:
@@ -1247,24 +949,55 @@ class SurrogateModeling:
         hf_high_gate_init: float = -1.0,
         hf_use_local_highpass: bool = True,
         pressure_smoothing: float = 0.0,
+        pressure_reference_mode: str = "origin",
+        pressure_supervision_mode: str = "gradient",
+        pressure_data_reference: str = "training_origin",
         pressure_highpass_weight: float = 0.0,
         pressure_highpass_normalized: bool = True,
         data_weight: float = 1.0,
         physics_weight: float = 0.1,
         warmup_epochs: int = 20,
         ramp_epochs: int = 30,
-        use_kkt_projection: bool = False,
+        use_kkt_projection: bool = False,    # KKT投影疑似没写对，就不放出来了
         kkt_projection_iters: int = 24,
         kkt_projection_strength: float = 0.35,
         learn_ibm_params: bool = True,
         ibm_c_range: tuple[float, float] = (0.25, 4.0),
         ibm_epsilon_range: tuple[float, float] = (0.01, 0.08),
         ibm_hidden: int = 16,
+        micro_batch_size: int | None = None,
+        slice_batch_size: int | None = None,
+        auto_cuda_batching: bool = True,
+        cuda_memory_fraction: float = 0.65,
+        use_activation_checkpointing: bool = True,
         device: str = "cuda",
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.train_dataset = BladeFlowDataset(train_cases, input_mode=input_mode)
-        self.val_dataset = BladeFlowDataset(val_cases if val_cases is not None else train_cases, input_mode=input_mode)
+        self.batch_size = int(batch_size)
+        self.micro_batch_size = None if micro_batch_size is None else max(1, int(micro_batch_size))
+        self.auto_cuda_batching = bool(auto_cuda_batching)
+        self.cuda_memory_fraction = float(np.clip(cuda_memory_fraction, 0.05, 0.95))
+        self.use_activation_checkpointing = bool(use_activation_checkpointing)
+        self._runtime_micro_batch_size: int | None = self.micro_batch_size
+        self.pressure_supervision_mode = str(pressure_supervision_mode).lower()
+        if self.pressure_supervision_mode not in {"gradient", "value", "none"}:
+            raise ValueError("pressure_supervision_mode must be 'gradient', 'value', or 'none'.")
+        self.pressure_reference_mode = str(pressure_reference_mode).lower()
+        if self.pressure_reference_mode not in {"origin", "none"}:
+            raise ValueError("pressure_reference_mode must be 'origin' or 'none'.")
+        self.pressure_data_reference = str(pressure_data_reference).lower()
+        if self.pressure_data_reference not in {"training_origin", "absolute"}:
+            raise ValueError("pressure_data_reference must be 'training_origin' or 'absolute'.")
+        self.train_dataset = BladeFlowDataset(
+            train_cases,
+            input_mode=input_mode,
+            pressure_reference=self.pressure_data_reference,
+        )
+        self.val_dataset = BladeFlowDataset(
+            val_cases if val_cases is not None else train_cases,
+            input_mode=input_mode,
+            pressure_reference=self.pressure_data_reference,
+        )
 
         self.train_loader = DataLoader(self.train_dataset, batch_size=batch_size, shuffle=True)
         self.val_loader = DataLoader(self.val_dataset, batch_size=batch_size, shuffle=False)
@@ -1282,6 +1015,11 @@ class SurrogateModeling:
             hf_high_gate_init=hf_high_gate_init,
             hf_use_local_highpass=hf_use_local_highpass,
             pressure_smoothing=pressure_smoothing,
+            pressure_reference_mode=self.pressure_reference_mode,
+            slice_batch_size=slice_batch_size,
+            auto_cuda_batching=auto_cuda_batching,
+            cuda_memory_fraction=cuda_memory_fraction,
+            use_activation_checkpointing=use_activation_checkpointing,
         ).to(self.device)
         self.model_config = {
             "input_channels": input_channels,
@@ -1295,6 +1033,13 @@ class SurrogateModeling:
             "hf_high_gate_init": float(hf_high_gate_init),
             "hf_use_local_highpass": bool(hf_use_local_highpass),
             "pressure_smoothing": float(np.clip(pressure_smoothing, 0.0, 1.0)),
+            "pressure_reference_mode": self.pressure_reference_mode,
+            "pressure_supervision_mode": self.pressure_supervision_mode,
+            "pressure_data_reference": self.pressure_data_reference,
+            "slice_batch_size": slice_batch_size,
+            "auto_cuda_batching": bool(auto_cuda_batching),
+            "cuda_memory_fraction": self.cuda_memory_fraction,
+            "use_activation_checkpointing": self.use_activation_checkpointing,
             "output_channels": 4,
         }
         default_ibm_c = float(
@@ -1327,6 +1072,11 @@ class SurrogateModeling:
         self.trainer_config = {
             "input_mode": input_mode,
             "batch_size": batch_size,
+            "micro_batch_size": micro_batch_size,
+            "slice_batch_size": slice_batch_size,
+            "auto_cuda_batching": bool(auto_cuda_batching),
+            "cuda_memory_fraction": self.cuda_memory_fraction,
+            "use_activation_checkpointing": self.use_activation_checkpointing,
             "lr": lr,
             "operator_variant": str(operator_variant),
             "high_modes": high_modes,
@@ -1334,6 +1084,9 @@ class SurrogateModeling:
             "hf_high_gate_init": float(hf_high_gate_init),
             "hf_use_local_highpass": bool(hf_use_local_highpass),
             "pressure_smoothing": float(np.clip(pressure_smoothing, 0.0, 1.0)),
+            "pressure_reference_mode": self.pressure_reference_mode,
+            "pressure_supervision_mode": self.pressure_supervision_mode,
+            "pressure_data_reference": self.pressure_data_reference,
             "pressure_highpass_weight": float(max(pressure_highpass_weight, 0.0)),
             "pressure_highpass_normalized": bool(pressure_highpass_normalized),
             "data_weight": data_weight,
@@ -1355,15 +1108,11 @@ class SurrogateModeling:
             pressure_highpass_weight=pressure_highpass_weight,
             pressure_highpass_normalized=pressure_highpass_normalized,
         ).to(self.device)
-        self.kkt_projection = (
-            CylindricalDivergenceKKTProjection(
-                KKTProjectionConfig(
-                    iterations=int(kkt_projection_iters),
-                    strength=float(kkt_projection_strength),
-                )
-            ).to(self.device)
-            if use_kkt_projection
-            else None
+        self.kkt_projection = build_kkt_projection(
+            enabled=bool(use_kkt_projection),
+            iterations=int(kkt_projection_iters),
+            strength=float(kkt_projection_strength),
+            device=self.device,
         )
         optimizer_params: list[nn.Parameter] = list(self.model.parameters())
         if self.ibm_mask_controller is not None:
@@ -1397,8 +1146,18 @@ class SurrogateModeling:
         print(f"train_blade_geometries: {blade_geometry_count}")
         print(f"input_mode            : {self.train_dataset.input_mode}")
         print(f"operator_variant      : {self.model_config.get('operator_variant', 'cfno')}")
+        print(
+            "cuda_batching         : "
+            f"auto={self.auto_cuda_batching}, "
+            f"micro={self.micro_batch_size or 'auto'}, "
+            f"slice={self.model.slice_batch_size or 'auto'}, "
+            f"checkpoint={self.use_activation_checkpointing}"
+        )
         print(f"kkt_projection        : {self.kkt_projection is not None}")
         print(f"learn_ibm_params      : {self.learn_ibm_params}")
+        print(f"pressure_supervision  : {self.pressure_supervision_mode}")
+        print(f"pressure_reference    : {self.pressure_reference_mode}")
+        print(f"pressure_data_ref     : {self.pressure_data_reference}")
         print(
             f"ibm_range             : C in {self.ibm_config['ibm_c_range']}, "
             f"epsilon in {self.ibm_config['ibm_epsilon_range']}"
@@ -1416,7 +1175,9 @@ class SurrogateModeling:
             f"work_condition        : omega={float(case['omega']):.6g}, "
             f"qv_total={float(case['qv']):.6g}, "
             f"qv_passage={float(sample['qv_passage'].item()):.6g}, "
-            f"qv_hat={float(sample['qv_hat'].item()):.6g}"
+            f"qv_hat={float(sample['qv_hat'].item()):.6g}, "
+            f"g={float(case.get('g', 9.8)):.6g}, "
+            f"g_star={float(sample['g_star'].item()):.6g}"
         )
         print(
             f"scales                : u_omega={float(sample['u_omega'].item()):.6g}, "
@@ -1490,9 +1251,7 @@ class SurrogateModeling:
         pred: Mapping[str, torch.Tensor],
         batch: Mapping[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
-        if self.kkt_projection is None:
-            return dict(pred)
-        return self.kkt_projection(pred, batch)
+        return apply_kkt_projection(self.kkt_projection, pred, batch)
 
     def _prepare_runtime_batch(self, batch: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         # 训练和部署阶段都使用“当前学习到的 IBM 参数”实时重建 phi 和 x。
@@ -1532,7 +1291,11 @@ class SurrogateModeling:
         if case is None:
             return self.train_dataset.cases[case_index], self.train_dataset[case_index]
 
-        dataset = BladeFlowDataset([case], input_mode=self.train_dataset.input_mode)
+        dataset = BladeFlowDataset(
+            [case],
+            input_mode=self.train_dataset.input_mode,
+            pressure_reference=self.pressure_data_reference,
+        )
         return case, dataset[0]
 
     def _build_boundary_for_case(
@@ -1590,286 +1353,21 @@ class SurrogateModeling:
             "boundary": boundary,
         }
 
-    def _trace_streamline_cylindrical(
-        self,
-        *,
-        fields_phy: Mapping[str, np.ndarray],
-        phi_field: np.ndarray,
-        config: FlowCaseConfig,
-        seed_r: float,
-        seed_theta: float,
-        seed_z: float,
-        max_steps: int = 500,
-        step_scale: float = 0.75,
-        phi_stop: float = 0.25,
-    ) -> np.ndarray:
-        # 在圆柱坐标下积分流线，然后再映射到三维笛卡尔坐标中画图。
-        # 暂时先确保稳定、可读、易调试，而不是特别高阶的积分精度。
-        dr_cell = config.delta_r / max(config.n - 1, 1)
-        dz_cell = config.h / max(config.n - 1, 1)
-        dtheta_cell = config.rh * config.theta0 / max(config.n - 1, 1)
-        step_length = step_scale * min(dr_cell, dz_cell, dtheta_cell)
+    _trace_streamline_cylindrical = _trace_streamline_cylindrical_impl
+    plot_3d_streamlines = _plot_3d_streamlines_impl
+    plot_blade_spans = _plot_blade_spans_impl
+    plot_training_history = _plot_training_history_impl
+    _dct_along = staticmethod(_dct_along_impl)
+    _axis_spectrum_energy = staticmethod(_axis_spectrum_energy_impl)
+    frequency_energy_diagnostics = _frequency_energy_diagnostics_impl
+    plot_frequency_energy_trends = _plot_frequency_energy_trends_impl
+    plot_cfd_spans = _plot_cfd_spans_impl
+    compare_cfd_prediction_spans = _compare_cfd_prediction_spans_impl
+    post_process_case = _post_process_case_impl
 
-        def eval_state(r_value: float, theta_value: float, z_value: float):
-            r_norm = (r_value - config.rh) / config.delta_r
-            theta_norm = (theta_value % config.theta0) / config.theta0
-            z_norm = (z_value - config.z0) / config.h
 
-            phi_value = interpolate_field_periodic(phi_field, r_norm, theta_norm, z_norm)
-            if not np.isfinite(phi_value) or phi_value < phi_stop:
-                return None
 
-            ur = interpolate_field_periodic(fields_phy["UR"], r_norm, theta_norm, z_norm)
-            ut = interpolate_field_periodic(fields_phy["UT"], r_norm, theta_norm, z_norm)
-            uz = interpolate_field_periodic(fields_phy["UZ"], r_norm, theta_norm, z_norm)
-            if not np.isfinite(ur + ut + uz):
-                return None
 
-            speed = float(np.sqrt(ur ** 2 + ut ** 2 + uz ** 2))
-            if speed < 1e-10:
-                return None
-
-            rhs = np.array([ur, ut / max(r_value, 1e-10), uz], dtype=float)
-            return rhs, speed
-
-        state = np.array([seed_r, seed_theta, seed_z], dtype=float)
-        points: list[np.ndarray] = []
-
-        for _ in range(max_steps):
-            if state[0] < config.rh or state[0] > config.rs:
-                break
-            if state[2] < config.z0 or state[2] > config.z0 + config.h:
-                break
-
-            result = eval_state(float(state[0]), float(state[1]), float(state[2]))
-            if result is None:
-                break
-
-            rhs_1, speed_1 = result
-            dt = step_length / max(speed_1, 1e-10)
-            mid_state = state + 0.5 * dt * rhs_1
-
-            result_mid = eval_state(float(mid_state[0]), float(mid_state[1]), float(mid_state[2]))
-            if result_mid is None:
-                break
-
-            rhs_2, _ = result_mid
-            state = state + dt * rhs_2
-
-            x_value = state[0] * np.cos(state[1])
-            y_value = state[0] * np.sin(state[1])
-            points.append(np.array([x_value, y_value, state[2]], dtype=float))
-
-        if len(points) < 2:
-            return np.zeros((0, 3), dtype=float)
-        return np.vstack(points)
-
-    def plot_3d_streamlines(
-        self,
-        *,
-        case_index: int = 0,
-        case: Mapping[str, Any] | None = None,
-        show: bool = True,
-        save_path: str | Path | None = None,
-        seed_r_count: int = 10,
-        seed_theta_count: int = 10,
-        passages_to_plot: int | None = None,
-        max_streamline_steps: int = 1000,
-        streamline_step_scale: float = 0.9,
-        theme: str = "dark",
-    ) -> dict[str, Any]:
-        # 三维后处理改为 PyVista 风格，组织方式参考 BladeGeneratorCAD.py 里的可视化：
-        # 1. 透明环形流道网格
-        # 2. 转子上下表面实体
-        # 3. hub / shroud 环线
-        # 4. 三维流线
-        bundle = self._predict_case_bundle(case_index=case_index, case=case)
-        case_data = bundle["case"]
-        sample = bundle["sample"]
-        pred_phy = bundle["pred_phy"]
-        boundary = bundle["boundary"]
-        config = FlowCaseConfig.from_mapping(case_data)
-        ibm_c_mean, ibm_c_min, ibm_c_max = _profile_mean_min_max(sample["ibm_C"])
-        ibm_epsilon_mean, ibm_epsilon_min, ibm_epsilon_max = _profile_mean_min_max(sample["ibm_epsilon"])
-
-        train_n = int(self.train_dataset[0]["x"].shape[-1])
-        deploy_n = int(sample["x"].shape[-1])
-        bg = "#0E1117" if theme == "dark" else "white"
-        blade_color = "#FFB000" if theme == "dark" else "#D55E00"
-        passage_color = "lightgray"
-        plotter = pv.Plotter(off_screen=not show, window_size=(1400, 950))
-        plotter.set_background(bg)
-
-        passage_grid = make_pyvista_passage_grid(config)
-        plotter.add_mesh(
-            passage_grid,
-            color=passage_color,
-            opacity=0.22,
-            show_edges=True,
-            line_width=0.6,
-        )
-
-        if boundary is not None:
-            for blade_mesh in make_pyvista_blade_surface_meshes(boundary, config):
-                plotter.add_mesh(
-                    blade_mesh,
-                    color=blade_color,
-                    show_edges=False,
-                    smooth_shading=True,
-                    ambient=0.20,
-                    diffuse=0.85,
-                    specular=0.18,
-                )
-
-        # hub / shroud 环线沿用参考程序的组织方式，帮助观察叶片上下边界。
-        theta_ring = np.linspace(0.0, 2.0 * np.pi, 240, dtype=float)
-        z_root = config.z0
-        z_tip = config.z0 + config.h
-        for radius in [config.rh, config.rs]:
-            x_ring = radius * np.cos(theta_ring)
-            y_ring = radius * np.sin(theta_ring)
-            root_line = np.column_stack([x_ring, y_ring, np.full_like(x_ring, z_root)])
-            tip_line = np.column_stack([x_ring, y_ring, np.full_like(x_ring, z_tip)])
-            plotter.add_lines(root_line, color="steelblue", width=2)
-            plotter.add_lines(tip_line, color="seagreen", width=2)
-
-        # 入口种子点默认取 z 的第二层，避开边界本身。
-        phi_inlet = sample["phi"][:, :, 1 if sample["phi"].shape[2] > 1 else 0].detach().cpu().numpy()
-        r_coords = sample["R"][:, 0, 0].detach().cpu().numpy()
-        theta_coords = sample["Theta"][0, :, 0].detach().cpu().numpy()
-        z_seed = config.z0 + config.h * float(sample["Z"][0, 0, 1 if sample["Z"].shape[2] > 1 else 0].item())
-
-        r_index_candidates = np.linspace(1, max(len(r_coords) - 2, 1), num=max(seed_r_count, 1), dtype=int)
-        theta_index_candidates = np.linspace(1, max(len(theta_coords) - 2, 1), num=max(seed_theta_count, 1), dtype=int)
-
-        base_seeds: list[tuple[float, float, float]] = []
-        for i_index in r_index_candidates:
-            for j_index in theta_index_candidates:
-                if phi_inlet[i_index, j_index] > 0.75:
-                    seed_r = config.rh + float(r_coords[i_index]) * config.delta_r
-                    seed_theta = float(theta_coords[j_index]) * config.theta0
-                    base_seeds.append((seed_r, seed_theta, z_seed))
-
-        if not base_seeds:
-            fluid_indices = np.argwhere(phi_inlet > 0.75)
-            for i_index, j_index in fluid_indices[:: max(1, len(fluid_indices) // 12)]:
-                seed_r = config.rh + float(r_coords[i_index]) * config.delta_r
-                seed_theta = float(theta_coords[j_index]) * config.theta0
-                base_seeds.append((seed_r, seed_theta, z_seed))
-
-        if passages_to_plot is None:
-            passages_to_plot = config.n_blade
-        passages_to_plot = max(1, min(passages_to_plot, config.n_blade))
-
-        colors = plt.cm.viridis(np.linspace(0.12, 0.95, max(len(base_seeds), 1)))[:, :3]
-        phi_field = sample["phi"].detach().cpu().numpy()
-        fields_phy_np = {name: tensor.detach().cpu().numpy() for name, tensor in pred_phy.items()}
-        tube_radius = 0.0075 * config.delta_r
-
-        streamline_count = 0
-        for blade_id in range(passages_to_plot):
-            theta_shift = blade_id * config.theta0
-            for color, (seed_r, seed_theta, seed_z) in zip(colors, base_seeds):
-                streamline = self._trace_streamline_cylindrical(
-                    fields_phy=fields_phy_np,
-                    phi_field=phi_field,
-                    config=config,
-                    seed_r=seed_r,
-                    seed_theta=seed_theta + theta_shift,
-                    seed_z=seed_z,
-                    max_steps=max_streamline_steps,
-                    step_scale=streamline_step_scale,
-                )
-                if streamline.shape[0] >= 2:
-                    spline = pv.Spline(streamline, max(streamline.shape[0], 2))
-                    streamline_mesh = spline.tube(radius=tube_radius)
-                    plotter.add_mesh(
-                        streamline_mesh,
-                        color=tuple(float(c) for c in color),
-                        smooth_shading=True,
-                        opacity=0.92,
-                    )
-                    streamline_count += 1
-
-        # 在画面左下角保留一点文字信息，直接体现“粗网格训练、细网格部署”的部署特征。
-        plotter.add_text(
-            f"Rotor Streamlines | train_n={train_n} | deploy_n={deploy_n} | "
-            f"blades={config.n_blade} | C_mean={ibm_c_mean:.4g} [{ibm_c_min:.4g},{ibm_c_max:.4g}] | "
-            f"eps_mean={ibm_epsilon_mean:.4g} [{ibm_epsilon_min:.4g},{ibm_epsilon_max:.4g}]",
-            position="upper_left",
-            font_size=10,
-            color="white" if theme == "dark" else "black",
-        )
-        plotter.add_axes()
-        plotter.camera_position = "iso"
-        plotter.camera.zoom(1.18)
-
-        if show and save_path is not None:
-            plotter.show(screenshot=str(save_path))
-            print(f"三维流线图已保存到: {save_path}")
-        elif show:
-            plotter.show()
-        else:
-            if save_path is not None:
-                plotter.screenshot(str(save_path))
-                print(f"三维流线图已保存到: {save_path}")
-            plotter.close()
-
-        return {
-            "streamline_count": streamline_count,
-            "train_n": train_n,
-            "deploy_n": deploy_n,
-            "boundary_available": boundary is not None,
-            "renderer": "pyvista",
-        }
-
-    def plot_blade_spans(
-        self,
-        case_index: int = 0,
-        spans: Sequence[float] = (0.2, 0.5, 0.8),
-        *,
-        show: bool = True,
-        save_path: str | Path | None = None,
-    ) -> None:
-        # 这个图首先用来确认叶片导入是否对齐。
-        sample = self.train_dataset[case_index]
-        batch = {key: value.unsqueeze(0).to(self.device) for key, value in sample.items()}
-        batch = self._prepare_runtime_batch(batch)
-        mask = sample["blade_mask"].detach().cpu().numpy()
-        phi = batch["phi"][0].detach().cpu().numpy()
-        signed_distance = sample["signed_distance"].detach().cpu().numpy()
-        n = mask.shape[0]
-
-        fig, axes = plt.subplots(len(spans), 3, figsize=(13, 3.6 * len(spans)), squeeze=False)
-        for row, span in enumerate(spans):
-            r_index = span_to_index(span, n)
-
-            im0 = axes[row, 0].imshow(mask[r_index].T, origin="lower", aspect="auto", cmap="gray_r")
-            axes[row, 0].set_title(f"Blade Mask @ span={span:.2f} (i={r_index})")
-            axes[row, 0].set_xlabel("Theta index")
-            axes[row, 0].set_ylabel("Z index")
-            fig.colorbar(im0, ax=axes[row, 0], fraction=0.046, pad=0.04)
-
-            im1 = axes[row, 1].imshow(signed_distance[r_index].T, origin="lower", aspect="auto", cmap="coolwarm")
-            axes[row, 1].set_title(f"Signed Distance @ span={span:.2f}")
-            axes[row, 1].set_xlabel("Theta index")
-            axes[row, 1].set_ylabel("Z index")
-            fig.colorbar(im1, ax=axes[row, 1], fraction=0.046, pad=0.04)
-
-            im2 = axes[row, 2].imshow(phi[r_index].T, origin="lower", aspect="auto", cmap="GnBu")
-            axes[row, 2].set_title(f"Phi @ span={span:.2f}")
-            axes[row, 2].set_xlabel("Theta index")
-            axes[row, 2].set_ylabel("Z index")
-            fig.colorbar(im2, ax=axes[row, 2], fraction=0.046, pad=0.04)
-
-        fig.tight_layout()
-        if save_path is not None:
-            plt.savefig(str(save_path), dpi=160, bbox_inches="tight")
-            print(f"叶片 span 调试图已保存到: {save_path}")
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
 
     @classmethod
     def build_pure_physics_debug_trainer(
@@ -1886,7 +1384,7 @@ class SurrogateModeling:
         qv: float = 0.16,
         n_blade: int | None = None,
         z0: float | None = None,
-        g_star: float = 0.0,
+        g: float = 9.8,
         input_mode: str = "both",
         batch_size: int = 1,
         lr: float = 1e-3,
@@ -1909,6 +1407,11 @@ class SurrogateModeling:
         ibm_c_range: tuple[float, float] = (0.25, 4.0),
         ibm_epsilon_range: tuple[float, float] = (0.01, 0.08),
         ibm_hidden: int = 16,
+        micro_batch_size: int | None = None,
+        slice_batch_size: int | None = None,
+        auto_cuda_batching: bool = True,
+        cuda_memory_fraction: float = 0.65,
+        use_activation_checkpointing: bool = True,
         device: str = "cuda",
         val_blade_params: str | Path | Sequence[str | Path] | None = None,
     ) -> "SurrogateModeling":
@@ -1924,7 +1427,7 @@ class SurrogateModeling:
             qv=qv,
             n_blade=n_blade,
             z0=z0,
-            g_star=g_star,
+            g=g,
         )
         val_cases = None
         if val_blade_params is not None:
@@ -1940,7 +1443,7 @@ class SurrogateModeling:
                 qv=qv,
                 n_blade=n_blade,
                 z0=z0,
-                g_star=g_star,
+                g=g,
             )
         return cls(
             train_cases=train_cases,
@@ -1971,11 +1474,62 @@ class SurrogateModeling:
             ibm_c_range=ibm_c_range,
             ibm_epsilon_range=ibm_epsilon_range,
             ibm_hidden=ibm_hidden,
+            micro_batch_size=micro_batch_size,
+            slice_batch_size=slice_batch_size,
+            auto_cuda_batching=auto_cuda_batching,
+            cuda_memory_fraction=cuda_memory_fraction,
+            use_activation_checkpointing=use_activation_checkpointing,
             device=device,
         )
 
     def _to_device(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {key: value.to(self.device) for key, value in batch.items()}
+
+    def supervised_pressure_gradient_loss(
+        self,
+        pred_p: torch.Tensor,
+        target_p: torch.Tensor,
+        batch: Mapping[str, torch.Tensor],
+        weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        # CFD 压力的绝对零点没有监督意义；这里只比较压力梯度。
+        # 梯度采用和物理残差一致的无量纲柱坐标缩放：
+        # dP/dR, K_theta*dP/dTheta, Lambda*dP/dZ。
+        dR = expand_scalar(batch["dR"])
+        dTheta = expand_scalar(batch["dTheta"])
+        dZ = expand_scalar(batch["dZ"])
+        k_theta = batch["K_theta"]
+        Lambda = expand_scalar(batch["Lambda"])
+
+        pred_dR = self.physics_loss.d1(pred_p, dim=1, spacing=dR, periodic=False)
+        target_dR = self.physics_loss.d1(target_p, dim=1, spacing=dR, periodic=False)
+        pred_dTheta = k_theta * self.physics_loss.d1(
+            pred_p,
+            dim=2,
+            spacing=dTheta,
+            periodic=True,
+            duplicate_endpoint=True,
+        )
+        target_dTheta = k_theta * self.physics_loss.d1(
+            target_p,
+            dim=2,
+            spacing=dTheta,
+            periodic=True,
+            duplicate_endpoint=True,
+        )
+        pred_dZ = Lambda * self.physics_loss.d1(pred_p, dim=3, spacing=dZ, periodic=False)
+        target_dZ = Lambda * self.physics_loss.d1(target_p, dim=3, spacing=dZ, periodic=False)
+
+        loss_p_r = self.physics_loss.weighted_mse(pred_dR - target_dR, weight)
+        loss_p_theta = self.physics_loss.weighted_mse(pred_dTheta - target_dTheta, weight)
+        loss_p_z = self.physics_loss.weighted_mse(pred_dZ - target_dZ, weight)
+        total = loss_p_r + loss_p_theta + loss_p_z
+        return total, {
+            "loss_p": total,
+            "loss_p_r": loss_p_r,
+            "loss_p_theta": loss_p_theta,
+            "loss_p_z": loss_p_z,
+        }
 
     def supervised_loss(
         self,
@@ -1999,22 +1553,42 @@ class SurrogateModeling:
         target_uz = target[:, 2]
         target_p = target[:, 3]
 
-        sample_weight = has_target.expand_as(pred["UR"])
-        p_weight = torch.clamp(batch["phi"], min=0.0, max=1.0) * has_target
+        fluid_weight = torch.clamp(batch["phi"], min=0.0, max=1.0) * has_target
+        sample_weight = fluid_weight.expand_as(pred["UR"])
+        p_grad_weight = self.physics_loss.build_pde_mask(torch.clamp(batch["phi"], min=0.0, max=1.0)) * has_target
 
         loss_ur = self.physics_loss.weighted_mse(pred["UR"] - target_ur, sample_weight)
         loss_ut = self.physics_loss.weighted_mse(pred["UT"] - target_ut, sample_weight)
         loss_uz = self.physics_loss.weighted_mse(pred["UZ"] - target_uz, sample_weight)
-        loss_p = self.physics_loss.weighted_mse(pred["P"] - target_p, p_weight)
+        zero = pred["P"].sum() * 0.0
+        if self.pressure_supervision_mode == "gradient":
+            loss_p, pressure_log = self.supervised_pressure_gradient_loss(pred["P"], target_p, batch, p_grad_weight)
+        elif self.pressure_supervision_mode == "value":
+            loss_p = self.physics_loss.weighted_mse(pred["P"] - target_p, fluid_weight)
+            pressure_log = {
+                "loss_p": loss_p,
+                "loss_p_r": zero,
+                "loss_p_theta": zero,
+                "loss_p_z": zero,
+            }
+        else:
+            loss_p = zero
+            pressure_log = {
+                "loss_p": zero,
+                "loss_p_r": zero,
+                "loss_p_theta": zero,
+                "loss_p_z": zero,
+            }
 
         total = loss_ur + loss_ut + loss_uz + loss_p
-        return total, {
+        log = {
             "loss_ur": loss_ur,
             "loss_ut": loss_ut,
             "loss_uz": loss_uz,
-            "loss_p": loss_p,
             "loss_data": total,
         }
+        log.update(pressure_log)
+        return total, log
 
     def current_physics_factor(self, epoch: int) -> float:
         # 先用少量纯数据 warmup，再逐步把物理损失权重拉起来。
@@ -2028,6 +1602,158 @@ class SurrogateModeling:
     def pure_physics_factor(self) -> float:
         return self.physics_weight
 
+    @staticmethod
+    def _is_cuda_oom(exc: BaseException) -> bool:
+        if not isinstance(exc, RuntimeError):
+            return False
+        message = str(exc).lower()
+        return (
+            "cuda out of memory" in message
+            or "cublas_status_alloc_failed" in message
+            or "cudnn_status_alloc_failed" in message
+        )
+
+    def _empty_cuda_cache(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    @staticmethod
+    def _raw_batch_size(batch: Mapping[str, torch.Tensor]) -> int:
+        for value in batch.values():
+            if torch.is_tensor(value) and value.ndim > 0:
+                return int(value.shape[0])
+        return 1
+
+    @staticmethod
+    def _slice_raw_batch(
+        batch: Mapping[str, torch.Tensor],
+        start: int,
+        end: int,
+        batch_size: int,
+    ) -> dict[str, torch.Tensor]:
+        sliced: dict[str, torch.Tensor] = {}
+        for key, value in batch.items():
+            if torch.is_tensor(value) and value.ndim > 0 and int(value.shape[0]) == batch_size:
+                sliced[key] = value[start:end]
+            else:
+                sliced[key] = value
+        return sliced
+
+    def _estimate_micro_batch_size(self, batch: Mapping[str, torch.Tensor]) -> int:
+        batch_size = self._raw_batch_size(batch)
+        if batch_size <= 1:
+            return batch_size
+        if self._runtime_micro_batch_size is not None:
+            return min(batch_size, self._runtime_micro_batch_size)
+        if not (self.auto_cuda_batching and self.device.type == "cuda"):
+            return batch_size
+
+        free_bytes, _ = torch.cuda.mem_get_info(self.device)
+        budget = max(1, int(free_bytes * self.cuda_memory_fraction))
+        bytes_per_sample = 0
+        for value in batch.values():
+            if torch.is_tensor(value) and value.ndim > 0 and int(value.shape[0]) == batch_size:
+                bytes_per_sample += int(value[0].numel()) * max(int(value.element_size()), 1)
+        grid_n = int(batch["x"].shape[-1]) if "x" in batch and torch.is_tensor(batch["x"]) else 1
+        operator_variant = str(self.model_config.get("operator_variant", "")).lower()
+        operator_factor = 18 if "3d" in operator_variant else 10
+        if grid_n >= 192:
+            operator_factor *= 2
+        elif grid_n >= 128:
+            operator_factor = int(operator_factor * 1.5)
+        estimate = max(1, int(budget // max(bytes_per_sample * operator_factor, 1)))
+        return min(batch_size, estimate)
+
+    def _compute_micro_batch_log(
+        self,
+        raw_batch: Mapping[str, torch.Tensor],
+        *,
+        epoch: int,
+        training: bool,
+        loss_scale: float,
+        do_backward: bool,
+    ) -> dict[str, float]:
+        batch = self._to_device(dict(raw_batch))
+        batch = self._prepare_runtime_batch(batch)
+
+        with torch.set_grad_enabled(training):
+            pred = self.model(batch["x"], batch["phi"], batch["solid_ut"])
+            pred = self._apply_kkt_projection(pred, batch)
+            loss_data, log_data = self.supervised_loss(pred, batch)
+            loss_phys, log_phys = self.physics_loss(pred, batch)
+            physics_factor = self.current_physics_factor(epoch)
+            loss = self.data_weight * loss_data + physics_factor * loss_phys
+
+            if do_backward:
+                (loss * float(loss_scale)).backward()
+
+        merged = {
+            "loss_total": loss,
+            "physics_factor": torch.tensor(physics_factor, device=loss.device),
+            "ibm_C": torch.mean(batch["ibm_C"]),
+            "ibm_epsilon": torch.mean(batch["ibm_epsilon"]),
+            "has_target": torch.mean(batch["has_target"].to(loss.device)),
+            "input_channels": torch.tensor(float(batch["x"].shape[1]), device=loss.device),
+            "grid_size": torch.tensor(float(batch["x"].shape[-1]), device=loss.device),
+        }
+        if "kkt_divergence_before" in pred:
+            merged["kkt_div_before"] = torch.mean(pred["kkt_divergence_before"])
+            merged["kkt_div_after"] = torch.mean(pred["kkt_divergence_after"])
+        merged.update(log_data)
+        merged.update(log_phys)
+
+        result = {key: float(value.detach().cpu().item()) for key, value in merged.items()}
+        del pred, batch, loss, loss_data, loss_phys
+        return result
+
+    def _run_batch_with_auto_split(
+        self,
+        raw_batch: Mapping[str, torch.Tensor],
+        *,
+        epoch: int,
+        training: bool,
+        do_backward: bool,
+        step_optimizer: bool,
+    ) -> dict[str, float]:
+        batch_size = self._raw_batch_size(raw_batch)
+        micro_size = max(1, self._estimate_micro_batch_size(raw_batch))
+
+        while True:
+            try:
+                if do_backward:
+                    self.optimizer.zero_grad(set_to_none=True)
+
+                logs: dict[str, float] = {}
+                processed = 0
+                for start in range(0, batch_size, micro_size):
+                    end = min(start + micro_size, batch_size)
+                    current = end - start
+                    micro_batch = self._slice_raw_batch(raw_batch, start, end, batch_size)
+                    micro_log = self._compute_micro_batch_log(
+                        micro_batch,
+                        epoch=epoch,
+                        training=training,
+                        loss_scale=current / max(batch_size, 1),
+                        do_backward=do_backward,
+                    )
+                    for key, value in micro_log.items():
+                        logs[key] = logs.get(key, 0.0) + value * current
+                    processed += current
+
+                if step_optimizer:
+                    self.optimizer.step()
+                return {key: value / max(processed, 1) for key, value in logs.items()}
+
+            except RuntimeError as exc:
+                if not (self.auto_cuda_batching and self._is_cuda_oom(exc) and micro_size > 1):
+                    raise
+                if do_backward:
+                    self.optimizer.zero_grad(set_to_none=True)
+                micro_size = max(1, micro_size // 2)
+                self._runtime_micro_batch_size = micro_size
+                self._empty_cuda_cache()
+                print(f"CUDA 显存不足：训练 micro-batch 自动降到 {micro_size}。")
+
     def run_epoch(self, loader: DataLoader, epoch: int, training: bool) -> dict[str, float]:
         if training:
             self.model.train()
@@ -2038,151 +1764,163 @@ class SurrogateModeling:
             if self.ibm_mask_controller is not None:
                 self.ibm_mask_controller.eval()
 
-        physics_factor = self.current_physics_factor(epoch)
         logs: dict[str, float] = {}
         count = 0
 
         for batch in loader:
-            batch = self._to_device(batch)
-            batch = self._prepare_runtime_batch(batch)
-
-            with torch.set_grad_enabled(training):
-                pred = self.model(batch["x"], batch["phi"], batch["solid_ut"])
-                pred = self._apply_kkt_projection(pred, batch)
-                loss_data, log_data = self.supervised_loss(pred, batch)
-                loss_phys, log_phys = self.physics_loss(pred, batch)
-                loss = self.data_weight * loss_data + physics_factor * loss_phys
-
-                if training:
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    self.optimizer.step()
-
-            merged = {
-                "loss_total": loss,
-                "physics_factor": torch.tensor(physics_factor, device=loss.device),
-                "ibm_C": torch.mean(batch["ibm_C"]),
-                "ibm_epsilon": torch.mean(batch["ibm_epsilon"]),
-            }
-            if "kkt_divergence_before" in pred:
-                merged["kkt_div_before"] = torch.mean(pred["kkt_divergence_before"])
-                merged["kkt_div_after"] = torch.mean(pred["kkt_divergence_after"])
-            merged.update(log_data)
-            merged.update(log_phys)
-
-            for key, value in merged.items():
-                logs[key] = logs.get(key, 0.0) + float(value.detach().cpu().item())
-            count += 1
+            raw_count = self._raw_batch_size(batch)
+            batch_log = self._run_batch_with_auto_split(
+                batch,
+                epoch=epoch,
+                training=training,
+                do_backward=training,
+                step_optimizer=training,
+            )
+            for key, value in batch_log.items():
+                logs[key] = logs.get(key, 0.0) + value * raw_count
+            count += raw_count
 
         return {key: value / max(count, 1) for key, value in logs.items()}
 
-    def fit(self, epochs: int = 200, print_interval: int = 10) -> list[dict[str, float]]:
+    def fit(
+        self,
+        epochs: int = 200,
+        print_interval: int = 10,
+        *,
+        start_epoch: int = 0,
+        checkpoint_path: str | Path | None = None,
+        checkpoint_interval: int = 0,
+        history_prefix: Sequence[Mapping[str, float]] | None = None,
+        history_plot_path: str | Path | None = None,
+        show_history_plot: bool = False,
+        checkpoint_metadata: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, float]]:
         history: list[dict[str, float]] = []
+        history_prefix_list = list(history_prefix or [])
+        checkpoint_interval = int(max(checkpoint_interval, 0))
 
-        for epoch in range(epochs):
-            train_log = self.run_epoch(self.train_loader, epoch, True)
-            val_log = self.run_epoch(self.val_loader, epoch, False)
-
-            record: dict[str, float] = {}
-            for key, value in train_log.items():
-                record[f"train_{key}"] = value
-            for key, value in val_log.items():
-                record[f"val_{key}"] = value
-            history.append(record)
-
-            if epoch == 0 or (epoch + 1) % print_interval == 0:
-                print(
-                    f"Epoch {epoch + 1:04d} | "
-                    f"train_total={train_log['loss_total']:.6e} | "
-                    f"train_data={train_log['loss_data']:.6e} | "
-                    f"train_phys={train_log['loss_phys']:.6e} | "
-                    f"train_qv={train_log['loss_qv']:.6e} | "
-                    f"train_ibm_C={train_log['ibm_C']:.6g} | "
-                    f"train_ibm_eps={train_log['ibm_epsilon']:.6g} | "
-                    f"train_bc_periodic={train_log['loss_bc_periodic']:.6e} | "
-                    f"train_bc_blade={train_log['loss_bc_blade']:.6e} | "
-                    f"val_total={val_log['loss_total']:.6e} | "
-                    f"phys_factor={train_log['physics_factor']:.3e}"
+        def save_progress(reason: str) -> None:
+            if checkpoint_path is None:
+                return
+            combined_history = [*history_prefix_list, *history]
+            metadata = {
+                "checkpoint_reason": reason,
+                "completed_new_epochs": len(history),
+                "start_epoch": int(start_epoch),
+                **dict(checkpoint_metadata or {}),
+            }
+            self.save_checkpoint(checkpoint_path, history=combined_history, extra_metadata=metadata)
+            if history_plot_path is not None and combined_history:
+                self.plot_training_history(
+                    combined_history,
+                    show=show_history_plot,
+                    save_path=history_plot_path,
                 )
+
+        try:
+            for local_epoch in range(int(epochs)):
+                epoch = int(start_epoch) + local_epoch
+                train_log = self.run_epoch(self.train_loader, epoch, True)
+                val_log = self.run_epoch(self.val_loader, epoch, False)
+
+                record: dict[str, float] = {}
+                for key, value in train_log.items():
+                    record[f"train_{key}"] = value
+                for key, value in val_log.items():
+                    record[f"val_{key}"] = value
+                history.append(record)
+
+                if local_epoch == 0 or (local_epoch + 1) % print_interval == 0:
+                    print(
+                        f"Epoch {epoch + 1:04d} | "
+                        f"train_total={train_log['loss_total']:.6e} | "
+                        f"train_data={train_log['loss_data']:.6e} | "
+                        f"train_phys={train_log['loss_phys']:.6e} | "
+                        f"train_qv={train_log['loss_qv']:.6e} | "
+                        f"train_ibm_C={train_log['ibm_C']:.6g} | "
+                        f"train_ibm_eps={train_log['ibm_epsilon']:.6g} | "
+                        f"train_bc_periodic={train_log['loss_bc_periodic']:.6e} | "
+                        f"train_bc_blade={train_log['loss_bc_blade']:.6e} | "
+                        f"val_total={val_log['loss_total']:.6e} | "
+                        f"phys_factor={train_log['physics_factor']:.3e}"
+                    )
+
+                if checkpoint_interval > 0 and (local_epoch + 1) % checkpoint_interval == 0:
+                    save_progress("periodic")
+        except KeyboardInterrupt:
+            print("\n训练被中断，正在保存当前进度。")
+            save_progress("keyboard_interrupt")
+            raise
+        except BaseException:
+            save_progress("exception")
+            raise
+
+        save_progress("completed")
 
         return history
 
-    def plot_training_history(
+
+    def configure_training_schedule(
         self,
-        history: Sequence[Mapping[str, float]],
         *,
-        show: bool = True,
-        save_path: str | Path | None = None,
+        lr: float | None = None,
+        data_weight: float | None = None,
+        physics_weight: float | None = None,
+        warmup_epochs: int | None = None,
+        ramp_epochs: int | None = None,
+        pressure_supervision_mode: str | None = None,
+        pressure_reference_mode: str | None = None,
+        pressure_smoothing: float | None = None,
+        pressure_highpass_weight: float | None = None,
+        pressure_highpass_normalized: bool | None = None,
     ) -> None:
-        # 训练损失曲线统一用对数纵轴来画。
-        # 默认关心五条线：
-        # 1. Data 损失
-        # 2. 连续方程残差
-        # 3. 径向动量残差
-        # 4. 周向动量残差
-        # 5. 轴向动量残差
-        #
-        # 如果当前数据集没有监督标签，就自动跳过 Data 曲线。
-        if len(history) == 0:
-            return
-
-        has_supervised_target = any(sample["has_target"].item() > 0.5 for sample in self.train_dataset.samples)
-        epochs = np.arange(1, len(history) + 1, dtype=float)
-
-        curve_specs: list[tuple[str, str]] = []
-        if has_supervised_target:
-            curve_specs.append(("loss_data", "Data"))
-        curve_specs.extend(
-            [
-                ("loss_c", "R_c"),
-                ("loss_r", "R_r"),
-                ("loss_theta", "R_theta"),
-                ("loss_z", "R_z"),
-            ]
-        )
-
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5), squeeze=False)
-        panel_specs = [
-            ("train_", "Training Loss History"),
-            ("val_", "Validation Loss History"),
-        ]
-
-        for ax, (prefix, title) in zip(axes[0], panel_specs):
-            plotted = False
-            for key, label in curve_specs:
-                full_key = f"{prefix}{key}"
-                if full_key not in history[0]:
-                    continue
-
-                values = np.array([float(item.get(full_key, np.nan)) for item in history], dtype=float)
-                if not np.any(np.isfinite(values)):
-                    continue
-
-                # 对数坐标不能直接画 0，这里只在绘图时做极小截断。
-                values = np.where(np.isfinite(values), np.maximum(values, 1e-30), np.nan)
-                ax.plot(epochs, values, linewidth=1.6, label=label)
-                plotted = True
-
-            ax.set_title(title)
-            ax.set_xlabel("Epoch")
-            ax.set_ylabel("Loss")
-            ax.set_yscale("log")
-            ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.4)
-            if plotted:
-                ax.legend()
-            else:
-                ax.text(0.5, 0.5, "No curves", transform=ax.transAxes, ha="center", va="center")
-
-        fig.tight_layout()
-        if save_path is not None:
-            save_path = Path(save_path)
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            plt.savefig(str(save_path), dpi=180, bbox_inches="tight")
-            print(f"训练损失对数曲线已保存到: {save_path}")
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
+        # checkpoint 续训时常常只想沿用网络权重，但重新指定混合训练策略。
+        # 这个方法不改变网络层数/宽度，只覆盖损失权重和压力处理策略。
+        if lr is not None:
+            lr = float(lr)
+            for group in self.optimizer.param_groups:
+                group["lr"] = lr
+            self.trainer_config["lr"] = lr
+        if data_weight is not None:
+            self.data_weight = float(data_weight)
+            self.trainer_config["data_weight"] = self.data_weight
+        if physics_weight is not None:
+            self.physics_weight = float(physics_weight)
+            self.trainer_config["physics_weight"] = self.physics_weight
+        if warmup_epochs is not None:
+            self.warmup_epochs = int(warmup_epochs)
+            self.trainer_config["warmup_epochs"] = self.warmup_epochs
+        if ramp_epochs is not None:
+            self.ramp_epochs = int(ramp_epochs)
+            self.trainer_config["ramp_epochs"] = self.ramp_epochs
+        if pressure_supervision_mode is not None:
+            mode = str(pressure_supervision_mode).lower()
+            if mode not in {"gradient", "value", "none"}:
+                raise ValueError("pressure_supervision_mode must be 'gradient', 'value', or 'none'.")
+            self.pressure_supervision_mode = mode
+            self.model_config["pressure_supervision_mode"] = mode
+            self.trainer_config["pressure_supervision_mode"] = mode
+        if pressure_reference_mode is not None:
+            mode = str(pressure_reference_mode).lower()
+            if mode not in {"origin", "none"}:
+                raise ValueError("pressure_reference_mode must be 'origin' or 'none'.")
+            self.pressure_reference_mode = mode
+            self.model.pressure_reference_mode = mode
+            self.model_config["pressure_reference_mode"] = mode
+            self.trainer_config["pressure_reference_mode"] = mode
+        if pressure_smoothing is not None:
+            value = float(np.clip(pressure_smoothing, 0.0, 1.0))
+            self.model.pressure_smoothing = value
+            self.model_config["pressure_smoothing"] = value
+            self.trainer_config["pressure_smoothing"] = value
+        if pressure_highpass_weight is not None:
+            value = float(max(pressure_highpass_weight, 0.0))
+            self.physics_loss.pressure_highpass_weight = value
+            self.trainer_config["pressure_highpass_weight"] = value
+        if pressure_highpass_normalized is not None:
+            value = bool(pressure_highpass_normalized)
+            self.physics_loss.pressure_highpass_normalized = value
+            self.trainer_config["pressure_highpass_normalized"] = value
 
     def smoke_test(self, do_backward: bool = True) -> dict[str, float]:
         # 最小化检查，debug模式
@@ -2194,40 +1932,13 @@ class SurrogateModeling:
         if self.ibm_mask_controller is not None:
             self.ibm_mask_controller.train()
         batch = next(iter(self.train_loader))
-        batch = self._to_device(batch)
-        batch = self._prepare_runtime_batch(batch)
-        pred = self.model(batch["x"], batch["phi"], batch["solid_ut"])
-        pred = self._apply_kkt_projection(pred, batch)
-        loss_data, log_data = self.supervised_loss(pred, batch)
-        loss_phys, log_phys = self.physics_loss(pred, batch)
-        physics_factor = self.current_physics_factor(0)
-        loss = self.data_weight * loss_data + physics_factor * loss_phys
-
-        if do_backward:
-            self.optimizer.zero_grad()
-            loss.backward()
-
-        result = {
-            "loss_total": float(loss.detach().cpu().item()),
-            "loss_data": float(log_data["loss_data"].detach().cpu().item()),
-            "loss_phys": float(log_phys["loss_phys"].detach().cpu().item()),
-            "loss_qv": float(log_phys["loss_qv"].detach().cpu().item()),
-            "loss_p_highpass": float(log_phys["loss_p_highpass"].detach().cpu().item()),
-            "loss_p_highpass_ratio": float(log_phys["loss_p_highpass_ratio"].detach().cpu().item()),
-            "loss_bc_periodic": float(log_phys["loss_bc_periodic"].detach().cpu().item()),
-            "loss_bc_blade": float(log_phys["loss_bc_blade"].detach().cpu().item()),
-            "q_hat_pred": float(log_phys["q_hat_pred"].detach().cpu().item()),
-            "q_hat_target": float(log_phys["q_hat_target"].detach().cpu().item()),
-            "physics_factor": float(physics_factor),
-            "ibm_C": float(batch["ibm_C"].detach().cpu().mean().item()),
-            "ibm_epsilon": float(batch["ibm_epsilon"].detach().cpu().mean().item()),
-            "has_target": float(batch["has_target"][0].detach().cpu().item()),
-            "input_channels": float(batch["x"].shape[1]),
-            "grid_size": float(batch["x"].shape[-1]),
-        }
-        if "kkt_divergence_before" in pred:
-            result["kkt_div_before"] = float(pred["kkt_divergence_before"].detach().cpu().mean().item())
-            result["kkt_div_after"] = float(pred["kkt_divergence_after"].detach().cpu().mean().item())
+        result = self._run_batch_with_auto_split(
+            batch,
+            epoch=0,
+            training=do_backward,
+            do_backward=do_backward,
+            step_optimizer=False,
+        )
         return result
 
     def fit_pure_physics_debug(
@@ -2298,289 +2009,15 @@ class SurrogateModeling:
         return bundle["pred_phy"] if return_physical else bundle["pred_dim"]
 
     @staticmethod
-    def _dct_along(x: torch.Tensor, dim: int) -> torch.Tensor:
-        x_last = torch.movedim(x, dim, -1)
-        coeff = NeuralOperators.dct_1d(x_last)
-        return torch.movedim(coeff, -1, dim)
 
     @staticmethod
-    def _axis_spectrum_energy(
-        field: torch.Tensor,
-        weight: torch.Tensor,
-        *,
-        axis: int,
-        periodic: bool,
-        modes_cutoff: int,
-    ) -> dict[str, Any]:
-        if periodic and field.shape[axis] > 2:
-            slicer = [slice(None)] * field.ndim
-            slicer[axis] = slice(0, -1)
-            field = field[tuple(slicer)]
-            weight = weight[tuple(slicer)]
 
-        weight = torch.clamp(weight, min=0.0)
-        weight_sum = torch.clamp(torch.sum(weight), min=1e-12)
-        mean = torch.sum(field * weight) / weight_sum
-        signal = (field - mean) * torch.sqrt(weight)
 
-        if periodic:
-            coeff = torch.fft.rfft(signal, dim=axis, norm="ortho")
-            coeff_energy = torch.abs(coeff) ** 2
-        else:
-            coeff = SurrogateModeling._dct_along(signal, axis)
-            coeff_energy = coeff ** 2
 
-        reduce_dims = tuple(dim for dim in range(coeff_energy.ndim) if dim != axis)
-        energy = torch.sum(coeff_energy, dim=reduce_dims).detach().cpu().to(torch.float64)
-        total = torch.sum(energy)
-        if float(total.item()) <= 1e-30:
-            energy_fraction = torch.zeros_like(energy)
-            cumulative = torch.zeros_like(energy)
-            high_ratio = 0.0
-            k95 = 0
-        else:
-            energy_fraction = energy / total
-            cumulative = torch.cumsum(energy_fraction, dim=0)
-            keep = int(max(1, min(modes_cutoff, energy_fraction.numel())))
-            high_ratio = float(torch.sum(energy_fraction[keep:]).item())
-            k95 = int(torch.searchsorted(cumulative, torch.tensor(0.95, dtype=cumulative.dtype)).item()) + 1
-
-        return {
-            "energy_fraction": [float(v) for v in energy_fraction.tolist()],
-            "cumulative": [float(v) for v in cumulative.tolist()],
-            "high_ratio_after_modes": high_ratio,
-            "k95": k95,
-        }
-
-    def frequency_energy_diagnostics(
-        self,
-        *,
-        case_index: int = 0,
-        case: Mapping[str, Any] | None = None,
-        fields: Sequence[str] = ("UR", "UT", "UZ", "P"),
-        modes_cutoff: int | None = None,
-    ) -> dict[str, Any]:
-        bundle = self._predict_case_bundle(case_index=case_index, case=case)
-        pred_dim = bundle["pred_dim"]
-        phi = torch.clamp(bundle["sample"]["phi"].to(torch.float32), min=0.0, max=1.0)
-        cutoff = int(modes_cutoff if modes_cutoff is not None else self.model_config.get("modes", 8))
-
-        diagnostics: dict[str, Any] = {
-            "modes_cutoff": cutoff,
-            "operator_variant": self.model_config.get("operator_variant", "unknown"),
-            "grid_shape": list(phi.shape),
-            "fields": {},
-        }
-        axis_specs = [
-            ("R", 0, False),
-            ("Theta", 1, True),
-            ("Z", 2, False),
-        ]
-        for field_name in fields:
-            if field_name not in pred_dim:
-                continue
-            field = pred_dim[field_name].to(torch.float32)
-            if field_name == "P":
-                weight_sum = torch.clamp(torch.sum(phi), min=1e-12)
-                field = field - torch.sum(field * phi) / weight_sum
-            diagnostics["fields"][field_name] = {
-                axis_name: self._axis_spectrum_energy(
-                    field,
-                    phi,
-                    axis=axis,
-                    periodic=periodic,
-                    modes_cutoff=cutoff,
-                )
-                for axis_name, axis, periodic in axis_specs
-            }
-        return diagnostics
-
-    def plot_frequency_energy_trends(
-        self,
-        *,
-        case_index: int = 0,
-        case: Mapping[str, Any] | None = None,
-        fields: Sequence[str] = ("UR", "UT", "UZ", "P"),
-        modes_cutoff: int | None = None,
-        show: bool = True,
-        save_path: str | Path | None = None,
-        summary_path: str | Path | None = None,
-    ) -> dict[str, Any]:
-        diagnostics = self.frequency_energy_diagnostics(
-            case_index=case_index,
-            case=case,
-            fields=fields,
-            modes_cutoff=modes_cutoff,
-        )
-        field_names = list(diagnostics["fields"].keys())
-        axis_names = ["R", "Theta", "Z"]
-        if not field_names:
-            return diagnostics
-
-        fig, axes = plt.subplots(
-            len(field_names),
-            len(axis_names),
-            figsize=(4.8 * len(axis_names), 3.1 * len(field_names)),
-            squeeze=False,
-        )
-        cutoff = int(diagnostics["modes_cutoff"])
-        for row, field_name in enumerate(field_names):
-            for col, axis_name in enumerate(axis_names):
-                ax = axes[row, col]
-                axis_data = diagnostics["fields"][field_name][axis_name]
-                energy = np.asarray(axis_data["energy_fraction"], dtype=float)
-                cumulative = np.asarray(axis_data["cumulative"], dtype=float)
-                modes = np.arange(energy.shape[0], dtype=float)
-                ax.semilogy(modes, np.maximum(energy, 1e-14), color="tab:blue", linewidth=1.3, label="mode energy")
-                ax.set_xlabel("Mode index")
-                ax.set_ylabel("Energy fraction", color="tab:blue")
-                ax.tick_params(axis="y", labelcolor="tab:blue")
-                ax.grid(True, alpha=0.25)
-                ax.axvline(max(cutoff - 1, 0), color="0.35", linestyle=":", linewidth=1.1)
-
-                twin = ax.twinx()
-                twin.plot(modes, cumulative, color="tab:orange", linewidth=1.4, label="cumulative")
-                twin.set_ylim(0.0, 1.02)
-                twin.set_ylabel("Cumulative", color="tab:orange")
-                twin.tick_params(axis="y", labelcolor="tab:orange")
-
-                ax.set_title(
-                    f"{field_name} {axis_name}: "
-                    f"K95={axis_data['k95']}, high={axis_data['high_ratio_after_modes']:.2e}"
-                )
-
-        fig.suptitle(
-            f"Frequency Energy Trends ({diagnostics['operator_variant']}, cutoff modes={cutoff})",
-            y=1.005,
-        )
-        fig.tight_layout()
-        if save_path is not None:
-            save_path = Path(save_path)
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(str(save_path), dpi=180, bbox_inches="tight")
-            print(f"频率能量趋势图已保存到: {save_path}")
-        if summary_path is not None:
-            summary_path = Path(summary_path)
-            summary_path.parent.mkdir(parents=True, exist_ok=True)
-            summary_path.write_text(json.dumps(diagnostics, indent=2, ensure_ascii=False), encoding="utf-8")
-            print(f"频率能量诊断 JSON 已保存到: {summary_path}")
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
-        return diagnostics
 
     @torch.no_grad()
-    def post_process_case(
-        self,
-        case_index: int = 0,
-        case: Mapping[str, Any] | None = None,
-        spans: Sequence[float] = (0.2, 0.5, 0.8),
-        *,
-        show: bool = True,
-        save_path: str | Path | None = None,
-        plot_3d: bool = False,
-        save_path_3d: str | Path | None = None,
-        passages_to_plot_3d: int | None = None,
-    ) -> dict[str, Any]:
-        # 这个 post 既能看训练样本，也能看一个全新的部署样本。
-        bundle = self._predict_case_bundle(case_index=case_index, case=case)
-        case_data = bundle["case"]
-        sample = bundle["sample"]
-        pred_dim = bundle["pred_dim"]
-        pred_phy = bundle["pred_phy"]
-        batch = bundle["batch"]
 
-        pred_batch = {key: value.unsqueeze(0).to(self.device) for key, value in pred_dim.items()}
-        q_pred = float(self.physics_loss.outlet_flow_rate(pred_batch["UZ"], batch).detach().cpu().view(-1)[0].item())
-        q_target = float(sample["qv_passage"].item())
-        train_n = int(self.train_dataset[0]["x"].shape[-1])
-        deploy_n = int(sample["x"].shape[-1])
-        ibm_c_profile = sample["ibm_C"].detach().cpu().reshape(-1)
-        ibm_epsilon_profile = sample["ibm_epsilon"].detach().cpu().reshape(-1)
-        ibm_c_mean, ibm_c_min, ibm_c_max = _profile_mean_min_max(ibm_c_profile)
-        ibm_epsilon_mean, ibm_epsilon_min, ibm_epsilon_max = _profile_mean_min_max(ibm_epsilon_profile)
-
-        print("\n========== 训练后 Post 检查 ==========")
-        print(f"grid transfer: train_n={train_n}, deploy_n={deploy_n}")
-        if deploy_n > train_n:
-            print("当前展示的是“粗网格训练 -> 更细网格部署”的直接推理结果。")
-        print(f"出口单流道体积流量: pred={q_pred:.6g}, target={q_target:.6g}")
-        print(
-            f"adaptive_ibm_profile : C mean/min/max={ibm_c_mean:.6g}/{ibm_c_min:.6g}/{ibm_c_max:.6g}, "
-            f"epsilon mean/min/max={ibm_epsilon_mean:.6g}/{ibm_epsilon_min:.6g}/{ibm_epsilon_max:.6g}"
-        )
-        print("下面给出各个 span 处流体区域的 mean / min / max，单位已经回到物理空间(SI)。")
-        mask = sample["blade_mask"] < 0.5
-        n = mask.shape[0]
-        for span in spans:
-            r_index = span_to_index(span, n)
-            fluid = mask[r_index]
-            ur_stats = field_stats(pred_phy["UR"][r_index], fluid)
-            ut_stats = field_stats(pred_phy["UT"][r_index], fluid)
-            uz_stats = field_stats(pred_phy["UZ"][r_index], fluid)
-            p_stats = field_stats(pred_phy["P"][r_index], fluid)
-            c_at_span = float(ibm_c_profile[r_index].item())
-            epsilon_at_span = float(ibm_epsilon_profile[r_index].item())
-
-            print(f"span={span:.2f} (i={r_index}) | C={c_at_span:.6g}, epsilon={epsilon_at_span:.6g}")
-            print(f"  UR [mean/min/max] = {ur_stats[0]:.6g} / {ur_stats[1]:.6g} / {ur_stats[2]:.6g}")
-            print(f"  UT [mean/min/max] = {ut_stats[0]:.6g} / {ut_stats[1]:.6g} / {ut_stats[2]:.6g}")
-            print(f"  UZ [mean/min/max] = {uz_stats[0]:.6g} / {uz_stats[1]:.6g} / {uz_stats[2]:.6g}")
-            print(f"  P  [mean/min/max] = {p_stats[0]:.6g} / {p_stats[1]:.6g} / {p_stats[2]:.6g}")
-        print("=====================================\n")
-
-        fig, axes = plt.subplots(len(spans), 4, figsize=(18, 3.6 * len(spans)), squeeze=False)
-        field_names = ["UR", "UT", "UZ", "P"]
-        cmaps = {"UR": "coolwarm", "UT": "coolwarm", "UZ": "viridis", "P": "plasma"}
-
-        for row, span in enumerate(spans):
-            r_index = span_to_index(span, n)
-            blade_mask = sample["blade_mask"][r_index].detach().cpu().numpy().T > 0.5
-            for col, name in enumerate(field_names):
-                data = pred_phy[name][r_index].detach().cpu().numpy().T
-                data = np.ma.array(data, mask=blade_mask)
-                image = axes[row, col].imshow(data, origin="lower", aspect="auto", cmap=cmaps[name])
-                axes[row, col].contour(blade_mask.astype(float), levels=[0.5], colors="k", linewidths=0.8)
-                axes[row, col].set_title(f"{name} @ span={span:.2f} (physical)")
-                axes[row, col].set_xlabel("Theta index")
-                axes[row, col].set_ylabel("Z index")
-                fig.colorbar(image, ax=axes[row, col], fraction=0.046, pad=0.04)
-
-        fig.tight_layout()
-        if save_path is not None:
-            plt.savefig(str(save_path), dpi=160, bbox_inches="tight")
-            print(f"后处理图已保存到: {save_path}")
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
-
-        three_d_info = None
-        if plot_3d:
-            three_d_info = self.plot_3d_streamlines(
-                case_index=case_index,
-                case=case_data,
-                show=show,
-                save_path=save_path_3d,
-                passages_to_plot=passages_to_plot_3d,
-            )
-
-        return {
-            "case": case_data,
-            "sample": sample,
-            "pred_dim": pred_dim,
-            "pred_phy": pred_phy,
-            "q_pred": q_pred,
-            "q_target": q_target,
-            "ibm_C": ibm_c_profile,
-            "ibm_epsilon": ibm_epsilon_profile,
-            "ibm_C_mean": ibm_c_mean,
-            "ibm_epsilon_mean": ibm_epsilon_mean,
-            "train_n": train_n,
-            "deploy_n": deploy_n,
-            "three_d_info": three_d_info,
-        }
+    @torch.no_grad()
 
     def save_checkpoint(
         self,
@@ -2655,6 +2092,12 @@ class SurrogateModeling:
         device: str = "cuda",
         batch_size: int = 1,
         load_optimizer: bool = False,
+        pressure_reference_mode: str | None = None,
+        pressure_supervision_mode: str | None = None,
+        pressure_data_reference: str | None = None,
+        pressure_smoothing: float | None = None,
+        pressure_highpass_weight: float | None = None,
+        pressure_highpass_normalized: bool | None = None,
     ) -> "SurrogateModeling":
         # 用 checkpoint 重建一个可直接部署的新 trainer。
         path = Path(path)
@@ -2670,6 +2113,43 @@ class SurrogateModeling:
                 model_config["operator_variant"] = "fno"
             else:
                 model_config["operator_variant"] = "cfno"
+
+        resolved_pressure_smoothing = (
+            float(pressure_smoothing)
+            if pressure_smoothing is not None
+            else float(model_config.get("pressure_smoothing", trainer_config.get("pressure_smoothing", 0.0)))
+        )
+        resolved_pressure_reference_mode = str(
+            pressure_reference_mode
+            if pressure_reference_mode is not None
+            else model_config.get("pressure_reference_mode", trainer_config.get("pressure_reference_mode", "origin"))
+        )
+        resolved_pressure_supervision_mode = str(
+            pressure_supervision_mode
+            if pressure_supervision_mode is not None
+            else trainer_config.get(
+                "pressure_supervision_mode",
+                model_config.get("pressure_supervision_mode", "gradient"),
+            )
+        )
+        resolved_pressure_data_reference = str(
+            pressure_data_reference
+            if pressure_data_reference is not None
+            else trainer_config.get(
+                "pressure_data_reference",
+                model_config.get("pressure_data_reference", "training_origin"),
+            )
+        )
+        resolved_pressure_highpass_weight = (
+            float(pressure_highpass_weight)
+            if pressure_highpass_weight is not None
+            else float(trainer_config.get("pressure_highpass_weight", 0.0))
+        )
+        resolved_pressure_highpass_normalized = (
+            bool(pressure_highpass_normalized)
+            if pressure_highpass_normalized is not None
+            else bool(trainer_config.get("pressure_highpass_normalized", True))
+        )
 
         trainer = cls(
             train_cases=case_list,
@@ -2688,11 +2168,12 @@ class SurrogateModeling:
             hf_use_local_highpass=bool(
                 model_config.get("hf_use_local_highpass", trainer_config.get("hf_use_local_highpass", True))
             ),
-            pressure_smoothing=float(
-                model_config.get("pressure_smoothing", trainer_config.get("pressure_smoothing", 0.0))
-            ),
-            pressure_highpass_weight=float(trainer_config.get("pressure_highpass_weight", 0.0)),
-            pressure_highpass_normalized=bool(trainer_config.get("pressure_highpass_normalized", True)),
+            pressure_smoothing=resolved_pressure_smoothing,
+            pressure_reference_mode=resolved_pressure_reference_mode,
+            pressure_supervision_mode=resolved_pressure_supervision_mode,
+            pressure_data_reference=resolved_pressure_data_reference,
+            pressure_highpass_weight=resolved_pressure_highpass_weight,
+            pressure_highpass_normalized=resolved_pressure_highpass_normalized,
             data_weight=float(trainer_config.get("data_weight", 0.0)),
             physics_weight=float(trainer_config.get("physics_weight", 1.0)),
             warmup_epochs=int(trainer_config.get("warmup_epochs", 0)),
@@ -2704,6 +2185,18 @@ class SurrogateModeling:
             ibm_c_range=tuple(trainer_config.get("ibm_c_range", (0.25, 4.0))),
             ibm_epsilon_range=tuple(trainer_config.get("ibm_epsilon_range", (0.01, 0.08))),
             ibm_hidden=int(trainer_config.get("ibm_hidden", 16)),
+            micro_batch_size=trainer_config.get("micro_batch_size", None),
+            slice_batch_size=model_config.get("slice_batch_size", trainer_config.get("slice_batch_size", None)),
+            auto_cuda_batching=bool(trainer_config.get("auto_cuda_batching", model_config.get("auto_cuda_batching", True))),
+            cuda_memory_fraction=float(
+                trainer_config.get("cuda_memory_fraction", model_config.get("cuda_memory_fraction", 0.65))
+            ),
+            use_activation_checkpointing=bool(
+                trainer_config.get(
+                    "use_activation_checkpointing",
+                    model_config.get("use_activation_checkpointing", True),
+                )
+            ),
             device=device,
         )
         trainer.load_checkpoint(path, load_optimizer=load_optimizer)
@@ -2722,6 +2215,7 @@ class SurrogateModeling:
         spans: Sequence[float] = (0.2, 0.5, 0.8),
         plot_3d: bool = True,
         passages_to_plot_3d: int | None = None,
+        show_3d: bool | None = None,
     ) -> dict[str, Any]:
         # 这是最直接的部署入口：
         # 读模型 -> 输入新工况与新叶片参数 -> 输出二维 span 图和三维流线图。
@@ -2734,6 +2228,7 @@ class SurrogateModeling:
             plot_3d=plot_3d,
             save_path_3d=save_path_3d,
             passages_to_plot_3d=passages_to_plot_3d,
+            show_3d=show_3d,
         )
 
 
@@ -2757,77 +2252,480 @@ def find_first_blade_params(root: str | Path = ".") -> Path | None:
     return None
 
 
-if __name__ == "__main__":
-    # 这里保留一个最直接的纯物理调试入口：
-    # 自动寻找 blade_params.json，找到就跑 smoke test 和纯物理训练。
-    seed_everything(42)
-    blade_params = find_first_blade_params("../BladeOptimizerLFR/CQ_20260327_232449_RealExp_Calc")
-    if blade_params is not None:
-        trainer = SurrogateModeling.build_pure_physics_debug_trainer(
-            blade_params=blade_params,
-            n=48,
-            batch_size=1,
-            mu=0.006,   # LBE动力粘度
-            rho=10650.0,   # LBE密度
-            omega=-210.0 * 2 * np.pi / 60.0,  # 转速210rpm
-            qv=0.16,   # 出口体积流量0.16m3/s
-            lr=1e-3,   # 学习率
-            learn_ibm_params=True,    # 是否将IBM参数也纳入学习范围
-            ibm_c_range=(0.3, 3.0),
-            operator_variant="cfno3d",    # 使用哪种模型的神经网络，这里用高频cfno，这样的话解中的高频成分会更多地得到关照，3d状态效果最好，但是也可能导致这台破电脑的破显卡完全跑不动
-            modes=16,
-            high_modes=20,    # hf_cfno系列独有，用来选择高频的成分是多少，而且我发现疑似高频成分越多收敛速度也越快，KKT投影反而会导致收敛变慢，或者我把强度改大一点试试：
-            width=16,
-            depth=4,
-            pressure_highpass_weight=1e8,    # 尝试压制棋盘格
-            pressure_highpass_normalized=True,
-            use_kkt_projection=False,    # todo 是否使用KKT投影，感觉用高频CFNO都够用了，加上KKT反而效果不那么好(怀疑codex写错，需推导)
-            kkt_projection_iters=24,
-            kkt_projection_strength=0.35,
-            ibm_epsilon_range=(0.001, 0.05),
-        )
-        '''
-        可以传入列表blade_params（训练集），val_blades为测试集
-        trainer = SurrogateModeling.build_pure_physics_debug_trainer(
-            blade_params=train_blades,
-            val_blade_params=val_blades,
-            n=48,
-            mu=0.006,
-            rho=10650.0,
-            omega=-210.0 * 2 * np.pi / 60.0,
-            qv=0.16,
-        )
-        '''
-        smoke = trainer.smoke_test(do_backward=True)
-        print("Smoke test:", smoke)
-        trainer.fit_pure_physics_debug(
-            epochs=10000,
-            print_interval=1,
-            preview_spans=(0.4, 0.6, ),
-            post_spans=(0.4, 0.6, ),
-            show_plots=True,
-            save_dir="surrogate_debug_outputs",
-            save_checkpoint_path="surrogate_debug_outputs/surrogate_checkpoint.pt",
-            plot_3d=True,
-        )
+def _run_token(value: Any) -> str:
+    text = str(value).strip().lower()
+    allowed = []
+    for char in text:
+        if char.isalnum():
+            allowed.append(char)
+        elif char in {"-", "_", "."}:
+            allowed.append(char)
+        else:
+            allowed.append("-")
+    token = "".join(allowed).strip("-")
+    while "--" in token:
+        token = token.replace("--", "-")
+    return token or "run"
 
-        # 体现“粗网格训练、细网格部署”，直接再构一个更细网格的部署工况：
-        fine_case = make_pure_physics_debug_case(
-            blade_params=blade_params,
-            n=96,
-            mu=0.006,
-            rho=10650.0,
-            omega=-210.0 * 2 * np.pi / 60.0,   # 转速210rpm
-            qv=0.16,
-        )
-        SurrogateModeling.deploy_from_checkpoint(
-            "surrogate_debug_outputs/surrogate_checkpoint.pt",
-            fine_case,
-            show=True,
-            save_path_2d="surrogate_debug_outputs/fine_grid_spans.png",
-            save_path_3d="surrogate_debug_outputs/fine_grid_3d_streamlines.png",
-            spans=(0.4, 0.6),
-            plot_3d=True,
+
+def build_formal_run_name(
+    *,
+    action: str,
+    training_mode: str,
+    model_config: Mapping[str, Any],
+    data_config: Mapping[str, Any],
+    training_config: Mapping[str, Any],
+    run_suffix: str | None = None,
+) -> str:
+    model_name = _run_token(model_config.get("operator_variant", "model"))
+    n = int(data_config.get("n", 0))
+    width = int(model_config.get("width", 0))
+    depth = int(model_config.get("depth", 0))
+    modes = int(model_config.get("modes", 0))
+    high_modes = model_config.get("high_modes", None)
+    epochs = int(training_config.get("epochs", 0))
+    pressure_supervision = model_config.get("pressure_supervision_mode", None)
+    pressure_reference = model_config.get("pressure_reference_mode", None)
+    pressure_data_reference = model_config.get("pressure_data_reference", None)
+    parts = [
+        _run_token(action),
+        model_name,
+        _run_token(training_mode),
+        f"n{n:03d}",
+        f"m{modes}",
+    ]
+    if pressure_supervision is not None:
+        parts.append("p" + _run_token(pressure_supervision))
+    if pressure_reference is not None:
+        parts.append("pref" + _run_token(pressure_reference))
+    if pressure_data_reference is not None:
+        parts.append("pdata" + _run_token(pressure_data_reference))
+    if high_modes is not None:
+        parts.append(f"hm{int(high_modes)}")
+    parts.extend([f"w{width}", f"d{depth}", f"ep{epochs}"])
+    if run_suffix:
+        parts.append(_run_token(run_suffix))
+    return "_".join(parts)
+
+
+def find_latest_checkpoint(root: str | Path = "surrogate_formal") -> Path | None:
+    root = Path(root)
+    if not root.exists():
+        return None
+    matches = sorted(root.rglob("surrogate_checkpoint.pt"), key=lambda path: path.stat().st_mtime, reverse=True)
+    return matches[0] if matches else None
+
+
+def resolve_checkpoint_path(path: str | Path | None, *, search_root: str | Path = "surrogate_formal") -> Path | None:
+    if path is None or str(path).strip() == "":
+        return None
+    if str(path).lower() == "latest":
+        latest = find_latest_checkpoint(search_root)
+        if latest is None:
+            raise FileNotFoundError(f"No surrogate_checkpoint.pt found under {search_root}.")
+        return latest
+    checkpoint_path = Path(path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
+    return checkpoint_path
+
+
+
+
+if __name__ == "__main__":
+    # ============================================================
+    # 0. 正式运行入口
+    # ============================================================
+    # WORKFLOW_ACTION:
+    # train        : 从头训练并保存 checkpoint。
+    # resume_train : 读取 checkpoint 后继续训练；CHECKPOINT_TO_LOAD=None 时自动找 surrogate_formal 下最新模型。
+    # deploy       : 读取 checkpoint 直接部署/后处理；不会再训练。
+    WORKFLOW_ACTION = "resume_train"
+    TRAINING_MODE = "mixed"  # mixed / data_only / physics_only
+    CHECKPOINT_TO_LOAD = "surrogate_formal/train_cfno_data_only_n064_m8_pvalue_prefnone_pdataabsolute_hm16_w16_d6_ep5000_cq_20260514_115826_simulation/surrogate_checkpoint.pt"  #  str|Path|None 也可以写成 "latest" 或某个 surrogate_checkpoint.pt
+
+    seed_everything(42)
+    simulation_folders = [
+        Path("../BladeOptimizerLFR/CQ_20260514_115826_SIMULATION"),
+        # 后续多叶片数据集继续追加同构文件夹：UI中需要允许用户添加
+        # Path("../BladeOptimizerLFR/CQ_xxxxx_SIMULATION"),
+    ]
+
+    # ============================================================
+    # 1. 物理定义
+    # ============================================================
+    rpm = -210.0
+    physics_config = {
+        "mu": 0.006,
+        "rho": 10650.0,
+        "omega": float(rpm * 2.0 * np.pi / 60.0),
+        "qv": 0.025,
+        "g": 9.8,
+    }
+
+    # ============================================================
+    # 2. 网格、模型、训练策略
+    # ============================================================
+    data_config = {
+        "n": 64,
+        "theta_sector_index": 0,
+        "interpolation_chunk_size": 250_000,
+    }
+    model_config = {
+        "operator_variant": "cfno",
+        "input_mode": "both",
+        "modes": 8,
+        "high_modes": 16,
+        "width": 16,
+        "depth": 6,
+        "z_padding": 8,
+        "fourier_feature_bands": (1, 2, 4, 8),
+        "hf_high_gate_init": -1.0,
+        "hf_use_local_highpass": True,    # 开启高通模式
+        "pressure_smoothing": 0.0,
+        # pressure_supervision_mode:
+        # value    : 回退到直接用 P 通道做数据监督。
+        # gradient : 只用压力梯度做数据监督，适合压力零点不可信的 CSV。
+        # none     : 数据损失只监督速度。
+        "pressure_supervision_mode": "value",
+        # origin 会在网络输出端强制 P(0,0,0)=0；混合训练会在下面自动改成 none。
+        "pressure_reference_mode": "origin",
+        # value 模式下用 absolute 才能学习并绘制 Fluent 原始 P；gradient 模式可改回 training_origin。
+        "pressure_data_reference": "absolute",
+    }
+    training_config = {
+        "epochs": 5000,  # train=总训练轮数；resume_train=本次追加轮数；deploy 会自动置 0。
+        "print_interval": 1,
+        "checkpoint_interval": 50,  # 长训练时每隔若干 epoch 保存一次，异常/手动中断也会保存。
+        "prefer_existing_run_checkpoint": True,  # 同一输出目录已有 checkpoint 时，resume_train 优先接着它跑。
+        "batch_size": 1,
+        "lr": 1e-3,
+        "pressure_highpass_weight": 1e8,
+        "pressure_highpass_normalized": True,
+        "use_kkt_projection": False,
+        "kkt_projection_iters": 24,
+        "kkt_projection_strength": 0.35,
+        "learn_ibm_params": True,
+        "ibm_c_range": (0.3, 3.0),
+        "ibm_epsilon_range": (0.001, 0.05),
+        "micro_batch_size": None,
+        "slice_batch_size": None,
+        "auto_cuda_batching": True,
+        "cuda_memory_fraction": 0.80,
+        "use_activation_checkpointing": True,
+        "device": "cuda",
+    }
+    mode_presets = {
+        "mixed": {"data_weight": 1.0, "physics_weight": 0.1, "warmup_epochs": 20, "ramp_epochs": 30},
+        "data_only": {"data_weight": 1.0, "physics_weight": 0.0, "warmup_epochs": 0, "ramp_epochs": 0},
+        "physics_only": {"data_weight": 0.0, "physics_weight": 1.0, "warmup_epochs": 0, "ramp_epochs": 0},
+    }
+    if WORKFLOW_ACTION not in {"train", "resume_train", "deploy"}:
+        raise ValueError("WORKFLOW_ACTION must be 'train', 'resume_train', or 'deploy'.")
+    if TRAINING_MODE not in mode_presets:
+        raise ValueError(f"Unknown TRAINING_MODE={TRAINING_MODE!r}; choose from {sorted(mode_presets)}.")
+    training_config.update(mode_presets[TRAINING_MODE])
+    if (
+        model_config["pressure_supervision_mode"] == "value"
+        and model_config["pressure_data_reference"] == "absolute"
+    ):
+        # 直接学习 Fluent 原始 P 时，不能再从模型输出端扣掉一个固定压力零点。
+        model_config["pressure_reference_mode"] = "none"
+    if TRAINING_MODE == "mixed":
+        # 混合训练时，P 应由数据项决定；这里关闭会额外“规定压力形态”的物理/模型约束。
+        training_config["pressure_highpass_weight"] = 0.0
+        model_config["pressure_smoothing"] = 0.0
+        model_config["pressure_reference_mode"] = "none"
+    if WORKFLOW_ACTION == "deploy":
+        training_config["epochs"] = 0
+
+    # ============================================================
+    # 3. 正式输出目录
+    # ============================================================
+    output_root = Path("surrogate_formal")
+    checkpoint_request = CHECKPOINT_TO_LOAD
+    if WORKFLOW_ACTION in {"resume_train", "deploy"} and checkpoint_request is None:
+        checkpoint_request = "latest"
+    checkpoint_to_load = resolve_checkpoint_path(checkpoint_request, search_root=output_root)
+
+    naming_model_config = dict(model_config)
+    if checkpoint_to_load is not None:
+        checkpoint_payload_for_name = torch.load(str(checkpoint_to_load), map_location="cpu")
+        naming_model_config.update(dict(checkpoint_payload_for_name.get("model_config", {})))
+        if WORKFLOW_ACTION == "resume_train":
+            # 架构信息可沿用 checkpoint；续训显式选择的压力策略必须以主程序配置为准。
+            for key in (
+                "pressure_supervision_mode",
+                "pressure_reference_mode",
+                "pressure_data_reference",
+                "pressure_smoothing",
+            ):
+                naming_model_config[key] = model_config[key]
+    run_suffix = simulation_folders[0].name if len(simulation_folders) == 1 else f"{len(simulation_folders)}cases"
+    run_name = build_formal_run_name(
+        action=WORKFLOW_ACTION,
+        training_mode=TRAINING_MODE,
+        model_config=naming_model_config,
+        data_config=data_config,
+        training_config=training_config,
+        run_suffix=run_suffix,
+    )
+    save_dir = output_root / run_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = save_dir / "surrogate_checkpoint.pt"
+    if (
+        WORKFLOW_ACTION == "resume_train"
+        and bool(training_config.get("prefer_existing_run_checkpoint", True))
+        and checkpoint_path.exists()
+    ):
+        checkpoint_to_load = checkpoint_path
+
+    print(f"\n========== Surrogate formal workflow: {WORKFLOW_ACTION} / {TRAINING_MODE} ==========")
+    print(f"输出目录: {save_dir}")
+    if checkpoint_to_load is not None:
+        print(f"读取 checkpoint: {checkpoint_to_load}")
+    print(
+        "物理定义: "
+        f"rpm={rpm:.6g}, omega={physics_config['omega']:.6g}, "
+        f"mu={physics_config['mu']:.6g}, rho={physics_config['rho']:.6g}, "
+        f"qv={physics_config['qv']:.6g}, g={physics_config['g']:.6g}"
+    )
+
+    # ============================================================
+    # 4. 后处理/可视化定义
+    # ============================================================
+    # show_pyvista_window=True 会弹出 PyVista 交互窗口；Matplotlib 图仍默认只保存不弹窗。
+    post_config = {
+        "spans": (0.4, 0.6),
+        "show_matplotlib": False,
+        "show_pyvista_window": True,
+        "plot_3d": True,
+        "passages_to_plot_3d": None,  # None=先算单流道，再复制到全部 n_blade 个周期。
+        "cfd_pressure_reference": "absolute",
+        "interpolation_chunk_size": data_config["interpolation_chunk_size"],
+    }
+
+    # ============================================================
+    # 5. 构造训练/部署样本
+    # ============================================================
+    if TRAINING_MODE == "physics_only":
+        blade_param_files = [folder / "blade_params.json" for folder in simulation_folders]
+        train_cases = make_pure_physics_debug_cases(
+            blade_params=blade_param_files,
+            n=data_config["n"],
+            **physics_config,
         )
     else:
-        print("No blade_params.json found. Use build_pure_physics_debug_trainer(...) or load_cases_from_pt(...).")
+        train_cases = make_supervised_simulation_cases(
+            simulation_folders,
+            n=data_config["n"],
+            theta_sector_index=data_config["theta_sector_index"],
+            interpolation_chunk_size=data_config["interpolation_chunk_size"],
+            **physics_config,
+        )
+    val_cases = train_cases
+    has_cfd_targets = all(_pick(train_cases[0], name) is not None for name in ["UR", "UT", "UZ", "P"])
+
+    first_config = FlowCaseConfig.from_mapping(train_cases[0])
+    run_summary = {
+        "workflow_action": WORKFLOW_ACTION,
+        "training_mode": TRAINING_MODE,
+        "simulation_folders": [str(folder) for folder in simulation_folders],
+        "checkpoint_to_load": str(checkpoint_to_load) if checkpoint_to_load is not None else None,
+        "checkpoint_to_save": str(checkpoint_path) if WORKFLOW_ACTION != "deploy" else None,
+        "physics_config": {"rpm": rpm, **physics_config, "g_star": first_config.g_star, "P0": first_config.P0},
+        "data_config": data_config,
+        "model_config": naming_model_config,
+        "training_config": training_config,
+        "post_config": post_config,
+        "case_summaries": [case_summary(case) for case in train_cases],
+    }
+    summary_path = save_dir / "run_config_summary.json"
+    summary_path.write_text(json.dumps(run_summary, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    print(f"运行配置摘要已保存到: {summary_path}")
+
+    # ============================================================
+    # 6. 建立/读取模型
+    # ============================================================
+    loaded_history: list[Mapping[str, float]] = []
+    if checkpoint_to_load is not None:
+        trainer = SurrogateModeling.from_checkpoint(
+            checkpoint_to_load,
+            train_cases,
+            device=training_config["device"],
+            batch_size=training_config["batch_size"],
+            load_optimizer=WORKFLOW_ACTION == "resume_train",
+            pressure_reference_mode=model_config["pressure_reference_mode"] if WORKFLOW_ACTION == "resume_train" else None,
+            pressure_supervision_mode=(
+                model_config["pressure_supervision_mode"] if WORKFLOW_ACTION == "resume_train" else None
+            ),
+            pressure_data_reference=model_config["pressure_data_reference"] if WORKFLOW_ACTION == "resume_train" else None,
+            pressure_smoothing=model_config["pressure_smoothing"] if WORKFLOW_ACTION == "resume_train" else None,
+            pressure_highpass_weight=(
+                training_config["pressure_highpass_weight"] if WORKFLOW_ACTION == "resume_train" else None
+            ),
+            pressure_highpass_normalized=(
+                training_config["pressure_highpass_normalized"] if WORKFLOW_ACTION == "resume_train" else None
+            ),
+        )
+        loaded_history = list((trainer.checkpoint_metadata or {}).get("history") or [])
+        if WORKFLOW_ACTION == "resume_train":
+            trainer.configure_training_schedule(
+                lr=training_config["lr"],
+                data_weight=training_config["data_weight"],
+                physics_weight=training_config["physics_weight"],
+                warmup_epochs=training_config["warmup_epochs"],
+                ramp_epochs=training_config["ramp_epochs"],
+                pressure_supervision_mode=model_config["pressure_supervision_mode"],
+                pressure_reference_mode=model_config["pressure_reference_mode"],
+                pressure_smoothing=model_config["pressure_smoothing"],
+                pressure_highpass_weight=training_config["pressure_highpass_weight"],
+                pressure_highpass_normalized=training_config["pressure_highpass_normalized"],
+            )
+    else:
+        trainer = SurrogateModeling(
+            train_cases=train_cases,
+            val_cases=val_cases,
+            input_mode=model_config["input_mode"],
+            batch_size=training_config["batch_size"],
+            lr=training_config["lr"],
+            modes=model_config["modes"],
+            high_modes=model_config["high_modes"],
+            width=model_config["width"],
+            depth=model_config["depth"],
+            z_padding=model_config["z_padding"],
+            operator_variant=model_config["operator_variant"],
+            fourier_feature_bands=model_config["fourier_feature_bands"],
+            hf_high_gate_init=model_config["hf_high_gate_init"],
+            hf_use_local_highpass=model_config["hf_use_local_highpass"],
+            pressure_smoothing=model_config["pressure_smoothing"],
+            pressure_reference_mode=model_config["pressure_reference_mode"],
+            pressure_supervision_mode=model_config["pressure_supervision_mode"],
+            pressure_data_reference=model_config["pressure_data_reference"],
+            pressure_highpass_weight=training_config["pressure_highpass_weight"],
+            pressure_highpass_normalized=training_config["pressure_highpass_normalized"],
+            data_weight=training_config["data_weight"],
+            physics_weight=training_config["physics_weight"],
+            warmup_epochs=training_config["warmup_epochs"],
+            ramp_epochs=training_config["ramp_epochs"],
+            use_kkt_projection=training_config["use_kkt_projection"],
+            kkt_projection_iters=training_config["kkt_projection_iters"],
+            kkt_projection_strength=training_config["kkt_projection_strength"],
+            learn_ibm_params=training_config["learn_ibm_params"],
+            ibm_c_range=training_config["ibm_c_range"],
+            ibm_epsilon_range=training_config["ibm_epsilon_range"],
+            micro_batch_size=training_config["micro_batch_size"],
+            slice_batch_size=training_config["slice_batch_size"],
+            auto_cuda_batching=training_config["auto_cuda_batching"],
+            cuda_memory_fraction=training_config["cuda_memory_fraction"],
+            use_activation_checkpointing=training_config["use_activation_checkpointing"],
+            device=training_config["device"],
+        )
+
+    # ============================================================
+    # 7. 训练或续训
+    # ============================================================
+    trainer.plot_blade_spans(
+        case_index=0,
+        spans=post_config["spans"],
+        show=post_config["show_matplotlib"],
+        save_path=save_dir / "blade_spans.png",
+    )
+
+    history: list[Mapping[str, float]] = list(loaded_history)
+    if WORKFLOW_ACTION in {"train", "resume_train"}:
+        smoke = trainer.smoke_test(do_backward=True)
+        print("Smoke test:", smoke)
+        new_history = trainer.fit(
+            epochs=training_config["epochs"],
+            print_interval=training_config["print_interval"],
+            start_epoch=len(loaded_history),
+            checkpoint_path=checkpoint_path,
+            checkpoint_interval=training_config["checkpoint_interval"],
+            history_prefix=loaded_history,
+            history_plot_path=save_dir / "training_loss_log.png",
+            show_history_plot=post_config["show_matplotlib"],
+            checkpoint_metadata={"run_summary_path": str(summary_path), "workflow_action": WORKFLOW_ACTION},
+        )
+        history = [*loaded_history, *new_history]
+        trainer.plot_training_history(
+            history,
+            show=post_config["show_matplotlib"],
+            save_path=save_dir / "training_loss_log.png",
+        )
+        trainer.save_checkpoint(
+            checkpoint_path,
+            history=history,
+            extra_metadata={"run_summary_path": str(summary_path), "workflow_action": WORKFLOW_ACTION},
+        )
+    else:
+        print("部署模式：已跳过训练，仅执行后处理。")
+
+    # ============================================================
+    # 8. CFD、预测和误差诊断
+    # ============================================================
+    if has_cfd_targets:
+        trainer.plot_cfd_spans(
+            case_index=0,
+            spans=post_config["spans"],
+            show=post_config["show_matplotlib"],
+            save_path=save_dir / "cfd_physical_spans.png",
+            pressure_reference=post_config["cfd_pressure_reference"],
+            interpolation_chunk_size=post_config["interpolation_chunk_size"],
+        )
+        trainer.compare_cfd_prediction_spans(
+            case_index=0,
+            spans=post_config["spans"],
+            show=post_config["show_matplotlib"],
+            save_path=save_dir / "cfd_vs_nn_error_spans.png",
+            summary_path=save_dir / "cfd_vs_nn_error_summary.json",
+            pressure_reference=post_config["cfd_pressure_reference"],
+            interpolation_chunk_size=post_config["interpolation_chunk_size"],
+        )
+    else:
+        print("当前 case 没有 CFD 标签，已跳过 CFD span 和误差对比图。")
+
+    # ============================================================
+    # 9. 神经网络预测后处理
+    # ============================================================
+    trainer.post_process_case(
+        case_index=0,
+        spans=post_config["spans"],
+        show=post_config["show_matplotlib"],
+        save_path=save_dir / "nn_physical_spans.png",
+        plot_3d=post_config["plot_3d"],
+        save_path_3d=save_dir / "nn_3d_streamlines_fullwheel.png",
+        passages_to_plot_3d=post_config["passages_to_plot_3d"],
+        show_3d=post_config["show_pyvista_window"],
+    )
+    trainer.plot_frequency_energy_trends(
+        case_index=0,
+        show=post_config["show_matplotlib"],
+        save_path=save_dir / "frequency_energy_trends.png",
+        summary_path=save_dir / "frequency_energy_summary.json",
+    )
+
+    # ============================================================
+    # 10. 可选：细网格部署
+    # ============================================================
+    run_fine_grid_deploy = False
+    if run_fine_grid_deploy:
+        fine_case = make_pure_physics_debug_case(
+            blade_params=simulation_folders[0] / "blade_params.json",
+            n=256,
+            **physics_config,
+        )
+        deploy_checkpoint = checkpoint_path if WORKFLOW_ACTION != "deploy" else checkpoint_to_load
+        if deploy_checkpoint is None:
+            raise RuntimeError("Fine-grid deployment requires a checkpoint.")
+        SurrogateModeling.deploy_from_checkpoint(
+            deploy_checkpoint,
+            fine_case,
+            show=post_config["show_matplotlib"],
+            show_3d=post_config["show_pyvista_window"],
+            save_path_2d=save_dir / "fine_grid_nn_spans.png",
+            save_path_3d=save_dir / "fine_grid_3d_streamlines_fullwheel.png",
+            spans=post_config["spans"],
+            plot_3d=True,
+            passages_to_plot_3d=None,
+        )
