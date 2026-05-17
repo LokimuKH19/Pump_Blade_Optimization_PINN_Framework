@@ -4,6 +4,9 @@ This filefolder facilitates an end-to-end mapping from the blade geometric defin
 
 ## Contents
 
+### QuickStart
+- `run_surrogate_modeling_ui.bat`
+
 ### Codes
 - `AnnularCoette.py`: Original annular coette flow (2D) problem solved with dimensionless SIMPLE. (Example only, for running available version, see in [symphonic](https://github.com/LokimuKH19/SymPhONIC) repo.)
 - `AnnularCoetteSurrogate.py`: The surrogate version of `AnnularCoette.py` which tests the theoretical accuracy of each neural operators in `NeuralOperators.py`.
@@ -21,6 +24,7 @@ This filefolder facilitates an end-to-end mapping from the blade geometric defin
 - `SurrogateModelingPlots.py`: all Matplotlib/PyVista image creation, post process, CFD comparison and spectrum analysis.
 - `SurrogateModelingKKT.py`: the creation and interface of `KKTProjectionOperators.py`
 - `SurrogateModelingLegacy.py`: old versions of main process and the pure physics debug workflow.
+- `SurrogateModelingUI.py`: the easy-use-tool of the main process based on Streamlit.
 
 ---
 ### Documents
@@ -65,4 +69,7 @@ Updated the main programme, allowing the usage of CFD data (Fluent .csv solution
 Finally, I figured out how to keep the semantical consistency of CFD data and surrogate modeling: THE FVM DISCRETION SHOULD BE STRICTLY FULFILLED. By referencing the contents in `Dimensionless Document.pdf` I modified the main program `SurrogateModeling.py`, ensuring the Rhie-Chow interpolation and other settings are realized as originally designed, and finally obtained physically explainable results in the filefolder `surrogate_formal/CFNO-VeryGoodResult`, where the comparison of CFD data and NN prediction demonstrates the accuracy of this surrogate model, as shown below:
 
 ![Comparison](./surrogate_formal/CFNO-VeryGoodResult/cfd_vs_nn_error_spans.png)
+
+### May 17th, 2026
+Updated an UI of the main process in `SurrogateModeling.py`
 
