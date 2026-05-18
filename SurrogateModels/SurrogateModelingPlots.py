@@ -13,7 +13,7 @@ import torch
 
 import NeuralOperators
 from SurrogateModelingConfig import FlowCaseConfig
-from SurrogateModelingData import _cfd_span_fields_from_case, _span_slice_from_grid
+from SurrogateModelingData import _cfd_span_fields_from_case, _physical_target_fields_from_case, _span_slice_from_grid
 from SurrogateModelingUtils import (
     _profile_mean_min_max,
     field_stats,
@@ -331,6 +331,7 @@ def plot_training_history(
     *,
     show: bool = True,
     save_path: str | Path | None = None,
+    history_plot_mode: str = "auto",
 ) -> None:
     # 训练损失曲线统一用对数纵轴来画。
     # 默认关心五条线：
@@ -346,30 +347,66 @@ def plot_training_history(
 
     has_supervised_target = any(sample["has_target"].item() > 0.5 for sample in self.train_dataset.samples)
     epochs = np.arange(1, len(history) + 1, dtype=float)
+    has_scaled_residuals = any(
+        f"{prefix}scaled_res_c" in item
+        for item in history
+        for prefix in ("train_", "val_")
+    )
+    mode = str(history_plot_mode).lower()
+    mode_aliases = {
+        "loss": "raw",
+        "mse": "raw",
+        "raw_loss": "raw",
+        "residual": "scaled",
+        "scaled_residual": "scaled",
+        "normalized": "scaled",
+        "normalised": "scaled",
+    }
+    mode = mode_aliases.get(mode, mode)
+    if mode not in {"auto", "raw", "scaled", "both"}:
+        raise ValueError("history_plot_mode must be 'auto', 'raw', 'scaled', or 'both'.")
+    show_scaled = has_scaled_residuals and mode in {"auto", "scaled", "both"}
+    show_raw = mode in {"raw", "both"} or not show_scaled
 
     curve_specs: list[tuple[str, str]] = []
     if has_supervised_target:
-        curve_specs.append(("loss_data", "Data"))
-    curve_specs.extend(
-        [
-            ("loss_c", "R_c"),
-            ("loss_r", "R_r"),
-            ("loss_theta", "R_theta"),
-            ("loss_z", "R_z"),
-        ]
-    )
+        curve_specs.append(("loss_data", "Data loss"))
+    if show_raw:
+        curve_specs.extend(
+            [
+                ("loss_c", "MSE R_c"),
+                ("loss_r", "MSE R_r"),
+                ("loss_theta", "MSE R_theta"),
+                ("loss_z", "MSE R_z"),
+            ]
+        )
+    if show_scaled:
+        curve_specs.extend(
+            [
+                ("scaled_res_c", "Scaled R_c"),
+                ("scaled_res_r", "Scaled R_r"),
+                ("scaled_res_theta", "Scaled R_theta"),
+                ("scaled_res_z", "Scaled R_z"),
+            ]
+        )
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5), squeeze=False)
+    if show_raw and show_scaled:
+        metric_title = "Raw Loss + Scaled Residual"
+    elif show_scaled:
+        metric_title = "Scaled Residual"
+    else:
+        metric_title = "Raw Loss"
     panel_specs = [
-        ("train_", "Training Loss History"),
-        ("val_", "Validation Loss History"),
+        ("train_", f"Training {metric_title} History"),
+        ("val_", f"Validation {metric_title} History"),
     ]
 
     for ax, (prefix, title) in zip(axes[0], panel_specs):
         plotted = False
         for key, label in curve_specs:
             full_key = f"{prefix}{key}"
-            if full_key not in history[0]:
+            if not any(full_key in item for item in history):
                 continue
 
             values = np.array([float(item.get(full_key, np.nan)) for item in history], dtype=float)
@@ -383,7 +420,7 @@ def plot_training_history(
 
         ax.set_title(title)
         ax.set_xlabel("Epoch")
-        ax.set_ylabel("Loss")
+        ax.set_ylabel("Loss / scaled residual" if show_scaled else "Loss")
         ax.set_yscale("log")
         ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.4)
         if plotted:
@@ -630,6 +667,119 @@ def plot_cfd_spans(
     else:
         plt.close(fig)
 
+def _field_similarity_metrics(
+    pred: np.ndarray,
+    cfd: np.ndarray,
+    valid: np.ndarray,
+) -> dict[str, float]:
+    valid = valid & np.isfinite(pred) & np.isfinite(cfd)
+    if not np.any(valid):
+        return {
+            "rmse": float("nan"),
+            "mae": float("nan"),
+            "relative_l2": float("nan"),
+            "nrmse_range": float("nan"),
+            "cosine_similarity": float("nan"),
+            "pearson_r": float("nan"),
+            "r2": float("nan"),
+            "similarity_score": float("nan"),
+        }
+
+    pred_v = np.asarray(pred[valid], dtype=float)
+    cfd_v = np.asarray(cfd[valid], dtype=float)
+    diff = pred_v - cfd_v
+    rmse = float(np.sqrt(np.mean(diff ** 2)))
+    mae = float(np.mean(np.abs(diff)))
+    cfd_l2 = float(np.sqrt(np.mean(cfd_v ** 2)) + 1e-12)
+    relative_l2 = float(np.sqrt(np.mean(diff ** 2)) / cfd_l2)
+    cfd_range = float(np.nanpercentile(cfd_v, 99) - np.nanpercentile(cfd_v, 1))
+    nrmse_range = float(rmse / max(cfd_range, 1e-12))
+
+    pred_norm = float(np.linalg.norm(pred_v))
+    cfd_norm = float(np.linalg.norm(cfd_v))
+    cosine = float(np.dot(pred_v, cfd_v) / max(pred_norm * cfd_norm, 1e-12))
+    if pred_v.size > 1 and np.std(pred_v) > 1e-12 and np.std(cfd_v) > 1e-12:
+        pearson = float(np.corrcoef(pred_v, cfd_v)[0, 1])
+    else:
+        pearson = float("nan")
+    ss_res = float(np.sum(diff ** 2))
+    ss_tot = float(np.sum((cfd_v - np.mean(cfd_v)) ** 2))
+    r2 = float(1.0 - ss_res / max(ss_tot, 1e-12))
+    similarity_score = float(np.clip(1.0 - relative_l2, 0.0, 1.0))
+
+    return {
+        "rmse": rmse,
+        "mae": mae,
+        "relative_l2": relative_l2,
+        "nrmse_range": nrmse_range,
+        "cosine_similarity": cosine,
+        "pearson_r": pearson,
+        "r2": r2,
+        "similarity_score": similarity_score,
+    }
+
+
+def _flow_similarity_diagnostics(
+    *,
+    pred_phy: Mapping[str, torch.Tensor | np.ndarray],
+    case: Mapping[str, Any],
+    mask: np.ndarray,
+    pressure_reference: str,
+) -> dict[str, Any]:
+    cfd_fields = _physical_target_fields_from_case(case, pressure_reference=pressure_reference)
+    pred_fields = {name: np.asarray(value, dtype=np.float32) for name, value in pred_phy.items()}
+    if pressure_reference == "training_origin":
+        pred_fields["P"] = pred_fields["P"] - float(pred_fields["P"][0, 0, 0])
+    elif pressure_reference != "absolute":
+        raise ValueError("pressure_reference must be 'training_origin' or 'absolute'.")
+
+    fluid = np.asarray(mask) < 0.5
+    fields: dict[str, Any] = {}
+    for name in ["UR", "UT", "UZ", "P"]:
+        fields[name] = _field_similarity_metrics(pred_fields[name], cfd_fields[name], fluid)
+
+    velocity_valid = fluid.copy()
+    pred_components = []
+    cfd_components = []
+    for name in ["UR", "UT", "UZ"]:
+        pred_value = pred_fields[name]
+        cfd_value = cfd_fields[name]
+        velocity_valid = velocity_valid & np.isfinite(pred_value) & np.isfinite(cfd_value)
+        pred_components.append(pred_value)
+        cfd_components.append(cfd_value)
+    if np.any(velocity_valid):
+        pred_speed = np.sqrt(sum(component ** 2 for component in pred_components))
+        cfd_speed = np.sqrt(sum(component ** 2 for component in cfd_components))
+        velocity_metrics = _field_similarity_metrics(pred_speed, cfd_speed, velocity_valid)
+        vec_diff_sq = sum((pred - cfd) ** 2 for pred, cfd in zip(pred_components, cfd_components))
+        vec_ref_sq = sum(cfd ** 2 for cfd in cfd_components)
+        vec_rel_l2 = float(
+            np.sqrt(np.mean(vec_diff_sq[velocity_valid]))
+            / max(float(np.sqrt(np.mean(vec_ref_sq[velocity_valid]))), 1e-12)
+        )
+        velocity_metrics["vector_relative_l2"] = vec_rel_l2
+        velocity_metrics["vector_similarity_score"] = float(np.clip(1.0 - vec_rel_l2, 0.0, 1.0))
+    else:
+        velocity_metrics = _field_similarity_metrics(np.zeros_like(mask, dtype=float), np.zeros_like(mask, dtype=float), velocity_valid)
+        velocity_metrics["vector_relative_l2"] = float("nan")
+        velocity_metrics["vector_similarity_score"] = float("nan")
+
+    component_scores = [
+        fields[name]["similarity_score"]
+        for name in ["UR", "UT", "UZ", "P"]
+        if np.isfinite(fields[name]["similarity_score"])
+    ]
+    if np.isfinite(velocity_metrics.get("vector_similarity_score", float("nan"))):
+        component_scores.append(float(velocity_metrics["vector_similarity_score"]))
+    overall = float(np.mean(component_scores)) if component_scores else float("nan")
+    return {
+        "description": "Full-grid CFD/NN similarity in fluid cells. similarity_score is clipped 1 - relative_l2.",
+        "pressure_reference": pressure_reference,
+        "field_metrics": fields,
+        "velocity_metrics": velocity_metrics,
+        "overall_similarity_score": overall,
+    }
+
 def compare_cfd_prediction_spans(
     self,
     case_index: int = 0,
@@ -666,6 +816,12 @@ def compare_cfd_prediction_spans(
         "pressure_supervision_mode": self.pressure_supervision_mode,
         "pressure_reference": pressure_reference,
         "units": {"UR": "m/s", "UT": "m/s", "UZ": "m/s", "P": "Pa"},
+        "flow_similarity": _flow_similarity_diagnostics(
+            pred_phy=pred_phy,
+            case=case_data,
+            mask=mask,
+            pressure_reference=pressure_reference,
+        ),
         "spans": {},
     }
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -721,6 +723,105 @@ class BladeFlowPhysicsLoss(nn.Module):
     def weighted_mse(self, residual: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return torch.sum((residual ** 2) * weight) / torch.clamp(torch.sum(weight), min=1e-12)
 
+    def scaled_l1_residual(
+        self,
+        residual: torch.Tensor,
+        equation_scale: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        numerator = torch.sum(torch.abs(residual) * weight)
+        denominator = torch.sum(torch.abs(equation_scale) * weight)
+        return numerator / torch.clamp(denominator, min=1e-30)
+
+    def _centered_face_velocities(
+        self,
+        ur: torch.Tensor,
+        ut: torch.Tensor,
+        uz: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        return {
+            "ur_e": self._face_plus(ur, dim=1),
+            "ur_w": self._face_minus(ur, dim=1),
+            "ut_n": self._face_plus(ut, dim=2, theta_overlap=True),
+            "ut_s": self._face_minus(ut, dim=2, theta_overlap=True),
+            "uz_t": self._face_plus(uz, dim=3),
+            "uz_b": self._face_minus(uz, dim=3),
+        }
+
+    def _continuity_equation_scale(
+        self,
+        face_velocity: Mapping[str, torch.Tensor],
+        batch: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor:
+        # NN training has no SIMPLE first-five-iteration baseline, so continuity uses a current mass-flux scale.
+        r_hat = batch["r_hat"]
+        k_theta = batch["K_theta"]
+        dR = expand_scalar(batch["dR"])
+        dTheta = expand_scalar(batch["dTheta"])
+        dZ = expand_scalar(batch["dZ"])
+        Lambda = expand_scalar(batch["Lambda"])
+        Ku = expand_scalar(batch["Ku"])
+        r_e = self._face_plus(r_hat, dim=1)
+        r_w = self._face_minus(r_hat, dim=1)
+
+        radial = (torch.abs(r_e * face_velocity["ur_e"]) + torch.abs(r_w * face_velocity["ur_w"])) / (
+            torch.clamp(r_hat, min=1e-12) * torch.clamp(dR, min=1e-12)
+        )
+        theta = torch.abs(k_theta) * (torch.abs(face_velocity["ut_n"]) + torch.abs(face_velocity["ut_s"])) / torch.clamp(
+            dTheta,
+            min=1e-12,
+        )
+        axial = torch.abs(Lambda * Ku) * (
+            torch.abs(face_velocity["uz_t"]) + torch.abs(face_velocity["uz_b"])
+        ) / torch.clamp(dZ, min=1e-12)
+        return radial + theta + axial
+
+    def _momentum_diagonal_scale(
+        self,
+        ur: torch.Tensor,
+        ut: torch.Tensor,
+        uz: torch.Tensor,
+        batch: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor:
+        # a_P scale used only for reporting Fluent-like residuals; training still uses raw MSE losses.
+        a_inv = self._momentum_diagonal_inverse(ur, ut, uz, batch)
+        return torch.reciprocal(torch.clamp(a_inv, min=1e-30))
+
+    def scaled_residual_metrics(
+        self,
+        pred: Mapping[str, torch.Tensor],
+        batch: Mapping[str, torch.Tensor],
+        residual_c: torch.Tensor,
+        residual_r: torch.Tensor,
+        residual_theta: torch.Tensor,
+        residual_z: torch.Tensor,
+        pde_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        ur = pred["UR"]
+        ut = pred["UT"]
+        uz = pred["UZ"]
+        p = pred["P"]
+
+        if self.physics_discretization == "fvm_rhie_chow":
+            face_velocity = self._rhie_chow_face_velocities(ur, ut, uz, p, batch)
+        else:
+            face_velocity = self._centered_face_velocities(ur, ut, uz)
+
+        continuity_scale = self._continuity_equation_scale(face_velocity, batch)
+        momentum_diagonal = self._momentum_diagonal_scale(ur, ut, uz, batch)
+        scaled_r = self.scaled_l1_residual(residual_r, momentum_diagonal * ur, pde_mask)
+        scaled_theta = self.scaled_l1_residual(residual_theta, momentum_diagonal * ut, pde_mask)
+        scaled_z = self.scaled_l1_residual(residual_z, momentum_diagonal * uz, pde_mask)
+        scaled_momentum = torch.mean(torch.stack([scaled_r, scaled_theta, scaled_z]))
+
+        return {
+            "scaled_res_c": self.scaled_l1_residual(residual_c, continuity_scale, pde_mask),
+            "scaled_res_r": scaled_r,
+            "scaled_res_theta": scaled_theta,
+            "scaled_res_z": scaled_z,
+            "scaled_res_momentum": scaled_momentum,
+        }
+
     def pressure_highpass(self, p: torch.Tensor) -> torch.Tensor:
         r_plus = neighbor_plus(p, dim=1, periodic=False)
         r_minus = neighbor_minus(p, dim=1, periodic=False)
@@ -1221,6 +1322,16 @@ class BladeFlowPhysicsLoss(nn.Module):
         loss_r = self.weighted_mse(residual_r, pde_mask)
         loss_theta = self.weighted_mse(residual_theta, pde_mask)
         loss_z = self.weighted_mse(residual_z, pde_mask)
+        with torch.no_grad():
+            scaled_residuals = self.scaled_residual_metrics(
+                pred,
+                batch,
+                residual_c,
+                residual_r,
+                residual_theta,
+                residual_z,
+                pde_mask,
+            )
 
         # 出口流量损失使用无量纲形式，这样和其余 PDE 残差的量纲更一致。
         q_hat_pred = self.outlet_flow_rate_hat(uz, batch)
@@ -1256,6 +1367,7 @@ class BladeFlowPhysicsLoss(nn.Module):
             "loss_bc_periodic": loss_bc_periodic,
             "loss_bc_blade": loss_bc_blade,
             "loss_phys": total,
+            **scaled_residuals,
             "q_hat_pred": torch.mean(q_hat_pred),
             "q_hat_target": torch.mean(q_hat_target),
             "rhie_chow_strength": torch.tensor(
@@ -2161,6 +2273,7 @@ class SurrogateModeling:
         history_prefix: Sequence[Mapping[str, float]] | None = None,
         history_plot_path: str | Path | None = None,
         show_history_plot: bool = False,
+        history_plot_mode: str = "auto",
         checkpoint_metadata: Mapping[str, Any] | None = None,
     ) -> list[dict[str, float]]:
         history: list[dict[str, float]] = []
@@ -2183,6 +2296,7 @@ class SurrogateModeling:
                     combined_history,
                     show=show_history_plot,
                     save_path=history_plot_path,
+                    history_plot_mode=history_plot_mode,
                 )
 
         try:
@@ -2205,11 +2319,15 @@ class SurrogateModeling:
                         f"train_data={train_log['loss_data']:.6e} | "
                         f"train_phys={train_log['loss_phys']:.6e} | "
                         f"train_qv={train_log['loss_qv']:.6e} | "
+                        f"train_scaled_c={train_log.get('scaled_res_c', float('nan')):.6e} | "
+                        f"train_scaled_mom={train_log.get('scaled_res_momentum', float('nan')):.6e} | "
                         f"train_ibm_C={train_log['ibm_C']:.6g} | "
                         f"train_ibm_eps={train_log['ibm_epsilon']:.6g} | "
                         f"train_bc_periodic={train_log['loss_bc_periodic']:.6e} | "
                         f"train_bc_blade={train_log['loss_bc_blade']:.6e} | "
                         f"val_total={val_log['loss_total']:.6e} | "
+                        f"val_scaled_c={val_log.get('scaled_res_c', float('nan')):.6e} | "
+                        f"val_scaled_mom={val_log.get('scaled_res_momentum', float('nan')):.6e} | "
                         f"phys_factor={train_log['physics_factor']:.3e}"
                     )
 
@@ -2345,6 +2463,7 @@ class SurrogateModeling:
         save_checkpoint_path: str | Path | None = None,
         plot_3d: bool = True,
         save_history_plot_path: str | Path | None = None,
+        history_plot_mode: str = "auto",
         plot_frequency_energy: bool = True,
     ) -> list[dict[str, float]]:
         # 纯物理调试模式下，先看叶片导入，再训练，再看训练后的场。
@@ -2371,7 +2490,12 @@ class SurrogateModeling:
         print("纯物理调试模式：先展示叶片，再开始训练。")
         self.plot_blade_spans(case_index=0, spans=preview_spans, show=show_plots, save_path=blade_plot_path)
         history = self.fit(epochs=epochs, print_interval=print_interval)
-        self.plot_training_history(history, show=show_plots, save_path=history_plot_path)
+        self.plot_training_history(
+            history,
+            show=show_plots,
+            save_path=history_plot_path,
+            history_plot_mode=history_plot_mode,
+        )
         if save_checkpoint_path is not None:
             self.save_checkpoint(save_checkpoint_path, history=history)
         self.post_process_case(
@@ -2399,6 +2523,34 @@ class SurrogateModeling:
     ) -> dict[str, torch.Tensor]:
         bundle = self._predict_case_bundle(case=case)
         return bundle["pred_phy"] if return_physical else bundle["pred_dim"]
+
+    @torch.no_grad()
+    def evaluate_cfd_physics_loss(
+        self,
+        case: Mapping[str, Any],
+    ) -> dict[str, float]:
+        dataset = BladeFlowDataset(
+            [case],
+            input_mode=self.train_dataset.input_mode,
+            pressure_reference=self.pressure_data_reference,
+        )
+        sample = dataset[0]
+        if float(sample["has_target"].item()) < 0.5:
+            raise ValueError("CFD physics loss requires UR/UT/UZ/P target fields in the case.")
+
+        batch = {key: value.unsqueeze(0).to(self.device) for key, value in sample.items()}
+        batch = self._prepare_runtime_batch(batch)
+        target = batch["y"]
+        pred = {
+            "UR": target[:, 0],
+            "UT": target[:, 1],
+            "UZ": target[:, 2],
+            "P": target[:, 3],
+        }
+        total, logs = self.physics_loss(pred, batch)
+        result = {"loss_phys": float(total.detach().cpu().item())}
+        result.update({key: float(value.detach().cpu().item()) for key, value in logs.items()})
+        return result
 
     @torch.no_grad()
     def save_checkpoint(
@@ -2749,6 +2901,57 @@ def resolve_checkpoint_path(path: str | Path | None, *, search_root: str | Path 
     return checkpoint_path
 
 
+def _main_config_path_from_args(argv: Sequence[str]) -> Path | None:
+    for index, arg in enumerate(argv[1:]):
+        if arg in {"--main-config", "--config"}:
+            value_index = index + 2
+            if value_index >= len(argv):
+                raise ValueError(f"{arg} requires a JSON config path.")
+            return Path(argv[value_index])
+        if arg.startswith("--main-config="):
+            return Path(arg.split("=", 1)[1])
+        if arg.startswith("--config="):
+            return Path(arg.split("=", 1)[1])
+    env_path = os.environ.get("SURROGATE_MODELING_CONFIG")
+    return Path(env_path) if env_path else None
+
+
+def load_main_config_override(argv: Sequence[str] | None = None) -> dict[str, Any]:
+    path = _main_config_path_from_args(sys.argv if argv is None else argv)
+    if path is None:
+        return {}
+    if not path.exists():
+        raise FileNotFoundError(f"Main config JSON does not exist: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError("Main config JSON must contain an object at the top level.")
+    print(f"读取 main 配置覆盖: {path}")
+    return payload
+
+
+def update_mapping_in_place(target: dict[str, Any], override: Mapping[str, Any] | None) -> None:
+    if not override:
+        return
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            update_mapping_in_place(target[key], value)
+        else:
+            target[key] = value
+
+
+def _path_list_from_config(values: Any) -> list[Path]:
+    if values is None:
+        return []
+    if isinstance(values, (str, Path)):
+        values = [values]
+    return [Path(str(item)) for item in values if str(item).strip()]
+
+
+def _path_or_none(value: Any) -> Path | None:
+    if value is None or str(value).strip() == "":
+        return None
+    return Path(str(value))
 
 
 if __name__ == "__main__":
@@ -2791,7 +2994,7 @@ if __name__ == "__main__":
         "interpolation_chunk_size": 250_000,
     }
     model_config = {
-        "operator_variant": "cfno",
+        "operator_variant": "fno3d",
         "input_mode": "both",
         "modes": 8,
         "high_modes": 16,
@@ -2800,7 +3003,7 @@ if __name__ == "__main__":
         "z_padding": 8,
         "fourier_feature_bands": (1, 2, 4, 8),
         "hf_high_gate_init": -1.0,
-        "hf_use_local_highpass": True,    # 开启高通模式，只在HF_CFNO中有效
+        "hf_use_local_highpass": True,    # 开启高通模式，只在operator_variant = HF_CFNO中有效
         "pressure_smoothing": 0.0,
         # pressure_supervision_mode:
         # value    : 回退到直接用 P 通道做数据监督。
@@ -2813,7 +3016,7 @@ if __name__ == "__main__":
         "pressure_data_reference": "absolute",
     }
     training_config = {
-        "epochs": 5000,  # train=总训练轮数；resume_train=本次追加轮数；deploy 会自动置 0。
+        "epochs": 4000,  # train=总训练轮数；resume_train=本次追加轮数；deploy 会自动置 0。
         "print_interval": 1,
         "checkpoint_interval": 50,  # 长训练时每隔若干 epoch 保存一次，异常/手动中断也会保存。
         "prefer_existing_run_checkpoint": True,  # 同一输出目录已有 checkpoint 时，resume_train 优先接着它跑。
@@ -2844,10 +3047,40 @@ if __name__ == "__main__":
         "data_only": {"data_weight": 1.0, "physics_weight": 0.0, "warmup_epochs": 0, "ramp_epochs": 0},
         "physics_only": {"data_weight": 0.0, "physics_weight": 1.0, "warmup_epochs": 0, "ramp_epochs": 0},
     }
+    main_config_override = load_main_config_override()
+    if main_config_override:
+        WORKFLOW_ACTION = str(main_config_override.get("workflow_action", WORKFLOW_ACTION))
+        TRAINING_MODE = str(main_config_override.get("training_mode", TRAINING_MODE))
+        CHECKPOINT_TO_LOAD = main_config_override.get("checkpoint_to_load", CHECKPOINT_TO_LOAD)
+        configured_folders = _path_list_from_config(main_config_override.get("simulation_folders"))
+        if configured_folders:
+            simulation_folders = configured_folders
+        cfd_csv_files = _path_list_from_config(
+            main_config_override.get("cfd_csv_files", main_config_override.get("cfd_csv", None))
+        )
+        if "rpm" in main_config_override:
+            rpm = float(main_config_override["rpm"])
+            physics_config["omega"] = float(rpm * 2.0 * np.pi / 60.0)
+        update_mapping_in_place(physics_config, main_config_override.get("physics_config"))
+        update_mapping_in_place(data_config, main_config_override.get("data_config"))
+        update_mapping_in_place(model_config, main_config_override.get("model_config"))
+        update_mapping_in_place(training_config, main_config_override.get("training_config"))
+    else:
+        cfd_csv_files = []
     if WORKFLOW_ACTION not in {"train", "resume_train", "deploy"}:
         raise ValueError("WORKFLOW_ACTION must be 'train', 'resume_train', or 'deploy'.")
     if TRAINING_MODE not in mode_presets:
         raise ValueError(f"Unknown TRAINING_MODE={TRAINING_MODE!r}; choose from {sorted(mode_presets)}.")
+    resolved_simulation_folders: list[Path] = []
+    for folder in simulation_folders:
+        blade_params = find_first_blade_params(folder)
+        if blade_params is None:
+            resolved_simulation_folders.append(Path(folder))
+        else:
+            resolved_simulation_folders.append(blade_params.parent)
+            if blade_params.parent != Path(folder):
+                print(f"在检查文件夹中找到 blade_params.json: {blade_params}")
+    simulation_folders = resolved_simulation_folders
     training_config.update(mode_presets[TRAINING_MODE])
     if (
         model_config["pressure_supervision_mode"] == "value"
@@ -2866,7 +3099,7 @@ if __name__ == "__main__":
     # ============================================================
     # 3. 正式输出目录
     # ============================================================
-    output_root = Path("surrogate_formal")
+    output_root = Path(main_config_override.get("output_root", "surrogate_formal"))
     checkpoint_request = CHECKPOINT_TO_LOAD
     if WORKFLOW_ACTION in {"resume_train", "deploy"} and checkpoint_request is None:
         checkpoint_request = "latest"
@@ -2924,15 +3157,17 @@ if __name__ == "__main__":
         "show_matplotlib": False,
         "show_pyvista_window": True,
         "plot_3d": True,
+        "history_plot_mode": "both",  # "auto", "raw", "scaled", or "both".
         "passages_to_plot_3d": None,  # None=先算单流道，再复制到全部 n_blade 个周期。
         "cfd_pressure_reference": "absolute",
         "interpolation_chunk_size": data_config["interpolation_chunk_size"],
     }
+    update_mapping_in_place(post_config, main_config_override.get("post_config"))
 
     # ============================================================
     # 5. 构造训练/部署样本
     # ============================================================
-    if TRAINING_MODE == "physics_only":
+    if TRAINING_MODE == "physics_only" and not cfd_csv_files:
         blade_param_files = [folder / "blade_params.json" for folder in simulation_folders]
         train_cases = make_pure_physics_debug_cases(
             blade_params=blade_param_files,
@@ -2940,13 +3175,21 @@ if __name__ == "__main__":
             **physics_config,
         )
     else:
-        train_cases = make_supervised_simulation_cases(
-            simulation_folders,
-            n=data_config["n"],
-            theta_sector_index=data_config["theta_sector_index"],
-            interpolation_chunk_size=data_config["interpolation_chunk_size"],
-            **physics_config,
-        )
+        train_cases = []
+        for index, folder in enumerate(simulation_folders):
+            csv_path = None
+            if cfd_csv_files:
+                csv_path = cfd_csv_files[index] if index < len(cfd_csv_files) else cfd_csv_files[-1]
+            train_cases.append(
+                make_supervised_simulation_case(
+                    folder,
+                    n=data_config["n"],
+                    theta_sector_index=data_config["theta_sector_index"],
+                    interpolation_chunk_size=data_config["interpolation_chunk_size"],
+                    csv_path=csv_path,
+                    **physics_config,
+                )
+            )
     val_cases = train_cases
     has_cfd_targets = all(_pick(train_cases[0], name) is not None for name in ["UR", "UT", "UZ", "P"])
 
@@ -2955,6 +3198,7 @@ if __name__ == "__main__":
         "workflow_action": WORKFLOW_ACTION,
         "training_mode": TRAINING_MODE,
         "simulation_folders": [str(folder) for folder in simulation_folders],
+        "cfd_csv_files": [str(path) for path in cfd_csv_files],
         "checkpoint_to_load": str(checkpoint_to_load) if checkpoint_to_load is not None else None,
         "checkpoint_to_save": str(checkpoint_path) if WORKFLOW_ACTION != "deploy" else None,
         "physics_config": {"rpm": rpm, **physics_config, "g_star": first_config.g_star, "P0": first_config.P0},
@@ -3087,6 +3331,7 @@ if __name__ == "__main__":
             history_prefix=loaded_history,
             history_plot_path=save_dir / "training_loss_log.png",
             show_history_plot=post_config["show_matplotlib"],
+            history_plot_mode=post_config["history_plot_mode"],
             checkpoint_metadata={"run_summary_path": str(summary_path), "workflow_action": WORKFLOW_ACTION},
         )
         history = [*loaded_history, *new_history]
@@ -3094,6 +3339,7 @@ if __name__ == "__main__":
             history,
             show=post_config["show_matplotlib"],
             save_path=save_dir / "training_loss_log.png",
+            history_plot_mode=post_config["history_plot_mode"],
         )
         trainer.save_checkpoint(
             checkpoint_path,
@@ -3107,6 +3353,14 @@ if __name__ == "__main__":
     # 8. CFD、预测和误差诊断
     # ============================================================
     if has_cfd_targets:
+        cfd_physics_loss = trainer.evaluate_cfd_physics_loss(train_cases[0])
+        cfd_physics_loss_path = save_dir / "cfd_physics_loss_summary.json"
+        cfd_physics_loss_path.write_text(
+            json.dumps(cfd_physics_loss, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"CFD 物理 loss 诊断已保存到: {cfd_physics_loss_path}")
+
         trainer.plot_cfd_spans(
             case_index=0,
             spans=post_config["spans"],
@@ -3115,7 +3369,7 @@ if __name__ == "__main__":
             pressure_reference=post_config["cfd_pressure_reference"],
             interpolation_chunk_size=post_config["interpolation_chunk_size"],
         )
-        trainer.compare_cfd_prediction_spans(
+        compare_diagnostics = trainer.compare_cfd_prediction_spans(
             case_index=0,
             spans=post_config["spans"],
             show=post_config["show_matplotlib"],
@@ -3123,6 +3377,11 @@ if __name__ == "__main__":
             summary_path=save_dir / "cfd_vs_nn_error_summary.json",
             pressure_reference=post_config["cfd_pressure_reference"],
             interpolation_chunk_size=post_config["interpolation_chunk_size"],
+        )
+        compare_diagnostics["cfd_physics_loss"] = cfd_physics_loss
+        (save_dir / "cfd_vs_nn_error_summary.json").write_text(
+            json.dumps(compare_diagnostics, indent=2, ensure_ascii=False),
+            encoding="utf-8",
         )
     else:
         print("当前 case 没有 CFD 标签，已跳过 CFD span 和误差对比图。")
@@ -3150,7 +3409,7 @@ if __name__ == "__main__":
     # ============================================================
     # 10. 可选：细网格部署
     # ============================================================
-    run_fine_grid_deploy = False
+    run_fine_grid_deploy = bool(main_config_override.get("run_fine_grid_deploy", False))
     if run_fine_grid_deploy:
         fine_case = make_pure_physics_debug_case(
             blade_params=simulation_folders[0] / "blade_params.json",
