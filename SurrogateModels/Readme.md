@@ -73,3 +73,5 @@ Finally, I figured out how to keep the semantical consistency of CFD data and su
 ### May 17th, 2026
 Updated an UI of the main process in `SurrogateModeling.py`
 
+### May 19th, 2026
+Aligned the definition of loss curves by introducing "scaled residuals" normalized by the continuity residual to achieve FLUENT-styled semantics.
