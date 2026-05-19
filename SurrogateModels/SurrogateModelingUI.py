@@ -206,7 +206,7 @@ def default_config() -> dict[str, Any]:
             "show_matplotlib": False,
             "show_pyvista_window": True,
             "plot_3d": True,
-            "history_plot_mode": "both",
+            "history_plot_mode": "all",
             "passages_to_plot_3d": None,
             "cfd_pressure_reference": "absolute",
             "interpolation_chunk_size": 250_000,
@@ -722,10 +722,18 @@ def render_post_tab(config: dict[str, Any]) -> None:
         spans = st.text_input("Span list", value=",".join(str(v) for v in post.get("spans", [0.4, 0.6])))
         post["spans"] = parse_float_list(spans, [0.4, 0.6])
     with col2:
+        history_options = ["all", "scaled_residual", "scaled_loss", "raw", "fluent_scaled", "auto"]
+        current_history_mode = str(post.get("history_plot_mode", "all")).lower()
+        if current_history_mode == "scaled":
+            current_history_mode = "scaled_loss"
+        if current_history_mode == "both":
+            current_history_mode = "all"
+        if current_history_mode not in history_options:
+            current_history_mode = "all"
         post["history_plot_mode"] = st.selectbox(
             "History curves",
-            ["both", "scaled", "raw", "auto"],
-            index=["both", "scaled", "raw", "auto"].index(post.get("history_plot_mode", "both")),
+            history_options,
+            index=history_options.index(current_history_mode),
         )
     with col3:
         post["cfd_pressure_reference"] = st.selectbox(

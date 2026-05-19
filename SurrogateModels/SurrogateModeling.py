@@ -66,6 +66,43 @@ from SurrogateModelingUtils import (
 # 1. blade_mask 提供清晰的固体拓扑；
 # 2. phi 提供适合硬约束和物理损失加权的平滑浸没边界信息。
 
+FLUENT_CONTINUITY_FIRST5_DEFAULT = (1.0, 6.6045e-1, 5.3537e-1, 4.3327e-1, 3.6179e-1)
+
+
+def _float_sequence_from_any(value: Any) -> tuple[float, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        tokens = value.replace(";", ",").split(",")
+    else:
+        try:
+            tokens = list(value)
+        except TypeError:
+            tokens = [value]
+    result: list[float] = []
+    for token in tokens:
+        if token is None:
+            continue
+        text = str(token).strip()
+        if text:
+            result.append(float(text))
+    return tuple(result)
+
+
+def _resolve_fluent_continuity_scale(
+    continuity_scale: float | None = None,
+    continuity_first5: Sequence[float] | str | None = None,
+) -> float | None:
+    if continuity_scale is not None:
+        value = float(continuity_scale)
+        return value if value > 0.0 else None
+    values = _float_sequence_from_any(continuity_first5)
+    if not values:
+        return None
+    value = max(abs(item) for item in values)
+    return float(value) if value > 0.0 else None
+
+
 class BladeFlowDataset(Dataset):
     # 每个样本至少需要：
     # n, rh, rs, h, mu, rho, omega, qv, n_blade
@@ -679,6 +716,8 @@ class BladeFlowPhysicsLoss(nn.Module):
         rhie_chow_strength: float = 0.35,
         momentum_diagonal_floor: float = 1.0,
         convection_interpolation: str = "central",
+        fluent_continuity_first5: Sequence[float] | str | None = None,
+        fluent_continuity_scale: float | None = None,
     ):
         super().__init__()
         self.pressure_highpass_weight = float(max(pressure_highpass_weight, 0.0))
@@ -691,6 +730,11 @@ class BladeFlowPhysicsLoss(nn.Module):
         self.convection_interpolation = str(convection_interpolation).lower()
         if self.convection_interpolation not in {"central", "upwind"}:
             raise ValueError("convection_interpolation must be 'central' or 'upwind'.")
+        self.fluent_continuity_first5 = _float_sequence_from_any(fluent_continuity_first5)
+        self.fluent_continuity_scale = _resolve_fluent_continuity_scale(
+            fluent_continuity_scale,
+            self.fluent_continuity_first5,
+        )
 
     def d1(
         self,
@@ -753,6 +797,12 @@ class BladeFlowPhysicsLoss(nn.Module):
         face_velocity: Mapping[str, torch.Tensor],
         batch: Mapping[str, torch.Tensor],
     ) -> torch.Tensor:
+        if self.fluent_continuity_scale is not None:
+            # Fluent continuity is scaled by a reference continuity imbalance
+            # taken from the first iterations. The monitor values users usually
+            # paste are already scaled; in that case max(first5)=1 simply makes
+            # this reported metric the mean absolute residual in our units.
+            return torch.full_like(batch["r_hat"], float(self.fluent_continuity_scale))
         # NN training has no SIMPLE first-five-iteration baseline, so continuity uses a current mass-flux scale.
         r_hat = batch["r_hat"]
         k_theta = batch["K_theta"]
@@ -787,6 +837,22 @@ class BladeFlowPhysicsLoss(nn.Module):
         a_inv = self._momentum_diagonal_inverse(ur, ut, uz, batch)
         return torch.reciprocal(torch.clamp(a_inv, min=1e-30))
 
+    def _momentum_velocity_magnitude_scales(
+        self,
+        ur: torch.Tensor,
+        ut: torch.Tensor,
+        uz: torch.Tensor,
+        batch: Mapping[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Fluent's pressure-based global scaling replaces a_P * phi_P with
+        # a_P * |V| for momentum equations. Our variables are nondimensionalized
+        # with u_omega for UR/UT and u_zo for UZ, so the same physical |V| maps
+        # to different dimensionless scales for radial/theta and axial residuals.
+        Ku = torch.clamp(torch.abs(expand_scalar(batch["Ku"])), min=1e-12)
+        velocity_mag_omega = torch.sqrt(torch.clamp(ur ** 2 + ut ** 2 + (Ku * uz) ** 2, min=1e-30))
+        velocity_mag_zo = torch.sqrt(torch.clamp((ur / Ku) ** 2 + (ut / Ku) ** 2 + uz ** 2, min=1e-30))
+        return velocity_mag_omega.detach(), velocity_mag_zo.detach()
+
     def scaled_residual_metrics(
         self,
         pred: Mapping[str, torch.Tensor],
@@ -809,9 +875,10 @@ class BladeFlowPhysicsLoss(nn.Module):
 
         continuity_scale = self._continuity_equation_scale(face_velocity, batch)
         momentum_diagonal = self._momentum_diagonal_scale(ur, ut, uz, batch)
-        scaled_r = self.scaled_l1_residual(residual_r, momentum_diagonal * ur, pde_mask)
-        scaled_theta = self.scaled_l1_residual(residual_theta, momentum_diagonal * ut, pde_mask)
-        scaled_z = self.scaled_l1_residual(residual_z, momentum_diagonal * uz, pde_mask)
+        velocity_mag_omega, velocity_mag_zo = self._momentum_velocity_magnitude_scales(ur, ut, uz, batch)
+        scaled_r = self.scaled_l1_residual(residual_r, momentum_diagonal * velocity_mag_omega, pde_mask)
+        scaled_theta = self.scaled_l1_residual(residual_theta, momentum_diagonal * velocity_mag_omega, pde_mask)
+        scaled_z = self.scaled_l1_residual(residual_z, momentum_diagonal * velocity_mag_zo, pde_mask)
         scaled_momentum = torch.mean(torch.stack([scaled_r, scaled_theta, scaled_z]))
 
         return {
@@ -820,6 +887,11 @@ class BladeFlowPhysicsLoss(nn.Module):
             "scaled_res_theta": scaled_theta,
             "scaled_res_z": scaled_z,
             "scaled_res_momentum": scaled_momentum,
+            "scaled_res_c_reference": torch.tensor(
+                float(self.fluent_continuity_scale) if self.fluent_continuity_scale is not None else float("nan"),
+                device=scaled_momentum.device,
+                dtype=scaled_momentum.dtype,
+            ),
         }
 
     def pressure_highpass(self, p: torch.Tensor) -> torch.Tensor:
@@ -1411,6 +1483,8 @@ class SurrogateModeling:
         rhie_chow_strength: float = 0.35,
         momentum_diagonal_floor: float = 1.0,
         convection_interpolation: str = "central",
+        fluent_continuity_first5: Sequence[float] | str | None = None,
+        fluent_continuity_scale: float | None = None,
         data_weight: float = 1.0,
         physics_weight: float = 0.1,
         warmup_epochs: int = 20,
@@ -1550,6 +1624,11 @@ class SurrogateModeling:
             "rhie_chow_strength": float(max(rhie_chow_strength, 0.0)),
             "momentum_diagonal_floor": float(max(momentum_diagonal_floor, 1e-8)),
             "convection_interpolation": str(convection_interpolation).lower(),
+            "fluent_continuity_first5": list(_float_sequence_from_any(fluent_continuity_first5)),
+            "fluent_continuity_scale": _resolve_fluent_continuity_scale(
+                fluent_continuity_scale,
+                fluent_continuity_first5,
+            ),
             "data_weight": data_weight,
             "physics_weight": physics_weight,
             "warmup_epochs": warmup_epochs,
@@ -1572,6 +1651,8 @@ class SurrogateModeling:
             rhie_chow_strength=rhie_chow_strength,
             momentum_diagonal_floor=momentum_diagonal_floor,
             convection_interpolation=convection_interpolation,
+            fluent_continuity_first5=fluent_continuity_first5,
+            fluent_continuity_scale=fluent_continuity_scale,
         ).to(self.device)
         self.kkt_projection = build_kkt_projection(
             enabled=bool(use_kkt_projection),
@@ -1630,6 +1711,15 @@ class SurrogateModeling:
             f"diag_floor={self.physics_loss.momentum_diagonal_floor:.6g}"
         )
         print(f"convection_interp    : {self.physics_loss.convection_interpolation}")
+        fluent_c_scale = self.physics_loss.fluent_continuity_scale
+        if fluent_c_scale is not None:
+            print(
+                "fluent_continuity    : "
+                f"first5={list(self.physics_loss.fluent_continuity_first5)}, "
+                f"scale={fluent_c_scale:.6g}"
+            )
+        else:
+            print("fluent_continuity    : current mass-flux scale")
         print(
             f"ibm_range             : C in {self.ibm_config['ibm_c_range']}, "
             f"epsilon in {self.ibm_config['ibm_epsilon_range']}"
@@ -2262,6 +2352,72 @@ class SurrogateModeling:
 
         return {key: value / max(count, 1) for key, value in logs.items()}
 
+    @staticmethod
+    def _history_continuity_loss_scale(history: Sequence[Mapping[str, float]]) -> float | None:
+        for record in history:
+            value = record.get("train_loss_c")
+            if value is None:
+                continue
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value) and value > 0.0:
+                return value
+        return None
+
+    @staticmethod
+    def _add_display_scaled_logs(log: dict[str, float], continuity_loss_scale: float) -> None:
+        scale = max(float(continuity_loss_scale), 1e-30)
+        rmse_scale = float(np.sqrt(scale))
+        log["scaled_loss_reference"] = scale
+        log["scaled_residual_reference"] = rmse_scale
+
+        for key, value in list(log.items()):
+            if not key.startswith("loss_"):
+                continue
+            try:
+                loss_value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(loss_value):
+                continue
+            log[f"scaled_{key}"] = loss_value / scale
+
+        residual_parts = {
+            "c": "loss_c",
+            "r": "loss_r",
+            "theta": "loss_theta",
+            "z": "loss_z",
+            "qv": "loss_qv",
+        }
+        for name, key in residual_parts.items():
+            value = log.get(key)
+            if value is None:
+                continue
+            try:
+                loss_value = max(float(value), 0.0)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(loss_value):
+                log[f"scaled_residual_{name}"] = float(np.sqrt(loss_value)) / rmse_scale
+
+        momentum_values = [
+            log.get("scaled_loss_r"),
+            log.get("scaled_loss_theta"),
+            log.get("scaled_loss_z"),
+        ]
+        if all(value is not None and np.isfinite(float(value)) for value in momentum_values):
+            log["scaled_loss_momentum"] = float(np.mean([float(value) for value in momentum_values]))
+
+        residual_momentum_values = [
+            log.get("scaled_residual_r"),
+            log.get("scaled_residual_theta"),
+            log.get("scaled_residual_z"),
+        ]
+        if all(value is not None and np.isfinite(float(value)) for value in residual_momentum_values):
+            log["scaled_residual_momentum"] = float(np.mean([float(value) for value in residual_momentum_values]))
+
     def fit(
         self,
         epochs: int = 200,
@@ -2279,6 +2435,7 @@ class SurrogateModeling:
         history: list[dict[str, float]] = []
         history_prefix_list = list(history_prefix or [])
         checkpoint_interval = int(max(checkpoint_interval, 0))
+        continuity_loss_scale = self._history_continuity_loss_scale(history_prefix_list)
 
         def save_progress(reason: str) -> None:
             if checkpoint_path is None:
@@ -2304,6 +2461,13 @@ class SurrogateModeling:
                 epoch = int(start_epoch) + local_epoch
                 train_log = self.run_epoch(self.train_loader, epoch, True)
                 val_log = self.run_epoch(self.val_loader, epoch, False)
+                if continuity_loss_scale is None:
+                    continuity_loss_scale = self._history_continuity_loss_scale(
+                        [{"train_loss_c": train_log.get("loss_c", float("nan"))}]
+                    )
+                if continuity_loss_scale is not None:
+                    self._add_display_scaled_logs(train_log, continuity_loss_scale)
+                    self._add_display_scaled_logs(val_log, continuity_loss_scale)
 
                 record: dict[str, float] = {}
                 for key, value in train_log.items():
@@ -2319,15 +2483,17 @@ class SurrogateModeling:
                         f"train_data={train_log['loss_data']:.6e} | "
                         f"train_phys={train_log['loss_phys']:.6e} | "
                         f"train_qv={train_log['loss_qv']:.6e} | "
-                        f"train_scaled_c={train_log.get('scaled_res_c', float('nan')):.6e} | "
-                        f"train_scaled_mom={train_log.get('scaled_res_momentum', float('nan')):.6e} | "
+                        f"train_scaled_loss_c={train_log.get('scaled_loss_c', float('nan')):.6e} | "
+                        f"train_scaled_res_c={train_log.get('scaled_residual_c', float('nan')):.6e} | "
+                        f"train_scaled_res_mom={train_log.get('scaled_residual_momentum', float('nan')):.6e} | "
                         f"train_ibm_C={train_log['ibm_C']:.6g} | "
                         f"train_ibm_eps={train_log['ibm_epsilon']:.6g} | "
                         f"train_bc_periodic={train_log['loss_bc_periodic']:.6e} | "
                         f"train_bc_blade={train_log['loss_bc_blade']:.6e} | "
                         f"val_total={val_log['loss_total']:.6e} | "
-                        f"val_scaled_c={val_log.get('scaled_res_c', float('nan')):.6e} | "
-                        f"val_scaled_mom={val_log.get('scaled_res_momentum', float('nan')):.6e} | "
+                        f"val_scaled_loss_c={val_log.get('scaled_loss_c', float('nan')):.6e} | "
+                        f"val_scaled_res_c={val_log.get('scaled_residual_c', float('nan')):.6e} | "
+                        f"val_scaled_res_mom={val_log.get('scaled_residual_momentum', float('nan')):.6e} | "
                         f"phys_factor={train_log['physics_factor']:.3e}"
                     )
 
@@ -2363,6 +2529,8 @@ class SurrogateModeling:
         rhie_chow_strength: float | None = None,
         momentum_diagonal_floor: float | None = None,
         convection_interpolation: str | None = None,
+        fluent_continuity_first5: Sequence[float] | str | None = None,
+        fluent_continuity_scale: float | None = None,
     ) -> None:
         # checkpoint 续训时常常只想沿用网络权重，但重新指定混合训练策略。
         # 这个方法不改变网络层数/宽度，只覆盖损失权重和压力处理策略。
@@ -2431,6 +2599,17 @@ class SurrogateModeling:
                 raise ValueError("convection_interpolation must be 'central' or 'upwind'.")
             self.physics_loss.convection_interpolation = value
             self.trainer_config["convection_interpolation"] = value
+        if fluent_continuity_first5 is not None or fluent_continuity_scale is not None:
+            first5 = (
+                _float_sequence_from_any(fluent_continuity_first5)
+                if fluent_continuity_first5 is not None
+                else self.physics_loss.fluent_continuity_first5
+            )
+            scale = _resolve_fluent_continuity_scale(fluent_continuity_scale, first5)
+            self.physics_loss.fluent_continuity_first5 = first5
+            self.physics_loss.fluent_continuity_scale = scale
+            self.trainer_config["fluent_continuity_first5"] = list(first5)
+            self.trainer_config["fluent_continuity_scale"] = scale
 
     def smoke_test(self, do_backward: bool = True) -> dict[str, float]:
         # 最小化检查，debug模式
@@ -2636,6 +2815,8 @@ class SurrogateModeling:
         rhie_chow_strength: float | None = None,
         momentum_diagonal_floor: float | None = None,
         convection_interpolation: str | None = None,
+        fluent_continuity_first5: Sequence[float] | str | None = None,
+        fluent_continuity_scale: float | None = None,
     ) -> "SurrogateModeling":
         # 用 checkpoint 重建一个可直接部署的新 trainer。
         path = Path(path)
@@ -2708,6 +2889,16 @@ class SurrogateModeling:
             if convection_interpolation is not None
             else trainer_config.get("convection_interpolation", "central")
         )
+        resolved_fluent_continuity_first5 = (
+            fluent_continuity_first5
+            if fluent_continuity_first5 is not None
+            else trainer_config.get("fluent_continuity_first5", None)
+        )
+        resolved_fluent_continuity_scale = (
+            float(fluent_continuity_scale)
+            if fluent_continuity_scale is not None
+            else trainer_config.get("fluent_continuity_scale", None)
+        )
 
         trainer = cls(
             train_cases=case_list,
@@ -2736,6 +2927,8 @@ class SurrogateModeling:
             rhie_chow_strength=resolved_rhie_chow_strength,
             momentum_diagonal_floor=resolved_momentum_diagonal_floor,
             convection_interpolation=resolved_convection_interpolation,
+            fluent_continuity_first5=resolved_fluent_continuity_first5,
+            fluent_continuity_scale=resolved_fluent_continuity_scale,
             data_weight=float(trainer_config.get("data_weight", 0.0)),
             physics_weight=float(trainer_config.get("physics_weight", 1.0)),
             warmup_epochs=int(trainer_config.get("warmup_epochs", 0)),
@@ -2969,8 +3162,8 @@ if __name__ == "__main__":
     seed_everything(42)
     simulation_folders = [
         Path("../BladeOptimizerLFR/CQ_20260514_115826_SIMULATION"),
+        Path("../BladeOptimizerLFR/CQ_20260519_160122_S01"),
         # 后续多叶片数据集继续追加同构文件夹：UI中需要允许用户添加
-        # Path("../BladeOptimizerLFR/CQ_xxxxx_SIMULATION"),
     ]
 
     # ============================================================
@@ -2994,7 +3187,7 @@ if __name__ == "__main__":
         "interpolation_chunk_size": 250_000,
     }
     model_config = {
-        "operator_variant": "fno3d",
+        "operator_variant": "cfno",
         "input_mode": "both",
         "modes": 8,
         "high_modes": 16,
@@ -3157,7 +3350,7 @@ if __name__ == "__main__":
         "show_matplotlib": False,
         "show_pyvista_window": True,
         "plot_3d": True,
-        "history_plot_mode": "both",  # "auto", "raw", "scaled", or "both".
+        "history_plot_mode": "all",  # all saves separate raw / scaled_loss / scaled_residual plots.
         "passages_to_plot_3d": None,  # None=先算单流道，再复制到全部 n_blade 个周期。
         "cfd_pressure_reference": "absolute",
         "interpolation_chunk_size": data_config["interpolation_chunk_size"],
@@ -3245,6 +3438,8 @@ if __name__ == "__main__":
             convection_interpolation=(
                 training_config["convection_interpolation"] if WORKFLOW_ACTION == "resume_train" else None
             ),
+            fluent_continuity_first5=training_config.get("fluent_continuity_first5"),
+            fluent_continuity_scale=training_config.get("fluent_continuity_scale"),
         )
         loaded_history = list((trainer.checkpoint_metadata or {}).get("history") or [])
         if WORKFLOW_ACTION == "resume_train":
@@ -3263,6 +3458,8 @@ if __name__ == "__main__":
                 rhie_chow_strength=training_config["rhie_chow_strength"],
                 momentum_diagonal_floor=training_config["momentum_diagonal_floor"],
                 convection_interpolation=training_config["convection_interpolation"],
+                fluent_continuity_first5=training_config.get("fluent_continuity_first5"),
+                fluent_continuity_scale=training_config.get("fluent_continuity_scale"),
             )
     else:
         trainer = SurrogateModeling(
@@ -3290,6 +3487,8 @@ if __name__ == "__main__":
             rhie_chow_strength=training_config["rhie_chow_strength"],
             momentum_diagonal_floor=training_config["momentum_diagonal_floor"],
             convection_interpolation=training_config["convection_interpolation"],
+            fluent_continuity_first5=training_config.get("fluent_continuity_first5"),
+            fluent_continuity_scale=training_config.get("fluent_continuity_scale"),
             data_weight=training_config["data_weight"],
             physics_weight=training_config["physics_weight"],
             warmup_epochs=training_config["warmup_epochs"],

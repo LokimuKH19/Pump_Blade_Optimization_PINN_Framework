@@ -347,97 +347,200 @@ def plot_training_history(
 
     has_supervised_target = any(sample["has_target"].item() > 0.5 for sample in self.train_dataset.samples)
     epochs = np.arange(1, len(history) + 1, dtype=float)
-    has_scaled_residuals = any(
-        f"{prefix}scaled_res_c" in item
-        for item in history
-        for prefix in ("train_", "val_")
-    )
+
+    def first_continuity_loss_scale() -> float | None:
+        for item in history:
+            for key in ("train_scaled_loss_reference", "train_loss_c"):
+                value = item.get(key)
+                if value is None:
+                    continue
+                value = float(value)
+                if np.isfinite(value) and value > 0.0:
+                    return value
+        return None
+
+    continuity_loss_scale = first_continuity_loss_scale()
     mode = str(history_plot_mode).lower()
     mode_aliases = {
         "loss": "raw",
         "mse": "raw",
         "raw_loss": "raw",
-        "residual": "scaled",
-        "scaled_residual": "scaled",
-        "normalized": "scaled",
-        "normalised": "scaled",
+        "scaled": "scaled_loss",
+        "normalized": "scaled_loss",
+        "normalised": "scaled_loss",
+        "residual": "scaled_residual",
+        "rmse": "scaled_residual",
+        "normalized_residual": "scaled_residual",
+        "normalised_residual": "scaled_residual",
+        "fluent": "fluent_scaled",
+        "fluent_scaled_residual": "fluent_scaled",
     }
     mode = mode_aliases.get(mode, mode)
-    if mode not in {"auto", "raw", "scaled", "both"}:
-        raise ValueError("history_plot_mode must be 'auto', 'raw', 'scaled', or 'both'.")
-    show_scaled = has_scaled_residuals and mode in {"auto", "scaled", "both"}
-    show_raw = mode in {"raw", "both"} or not show_scaled
-
-    curve_specs: list[tuple[str, str]] = []
-    if has_supervised_target:
-        curve_specs.append(("loss_data", "Data loss"))
-    if show_raw:
-        curve_specs.extend(
-            [
-                ("loss_c", "MSE R_c"),
-                ("loss_r", "MSE R_r"),
-                ("loss_theta", "MSE R_theta"),
-                ("loss_z", "MSE R_z"),
-            ]
-        )
-    if show_scaled:
-        curve_specs.extend(
-            [
-                ("scaled_res_c", "Scaled R_c"),
-                ("scaled_res_r", "Scaled R_r"),
-                ("scaled_res_theta", "Scaled R_theta"),
-                ("scaled_res_z", "Scaled R_z"),
-            ]
+    allowed_modes = {"auto", "raw", "scaled_loss", "scaled_residual", "fluent_scaled", "both", "all"}
+    if mode not in allowed_modes:
+        raise ValueError(
+            "history_plot_mode must be 'auto', 'raw', 'scaled_loss', "
+            "'scaled_residual', 'fluent_scaled', 'all', or 'both'."
         )
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), squeeze=False)
-    if show_raw and show_scaled:
-        metric_title = "Raw Loss + Scaled Residual"
-    elif show_scaled:
-        metric_title = "Scaled Residual"
+    if mode == "auto":
+        active_modes = ["raw", "scaled_loss", "scaled_residual"] if continuity_loss_scale is not None else ["raw"]
+    elif mode in {"both", "all"}:
+        active_modes = ["raw", "scaled_loss", "scaled_residual"] if continuity_loss_scale is not None else ["raw"]
     else:
-        metric_title = "Raw Loss"
-    panel_specs = [
-        ("train_", f"Training {metric_title} History"),
-        ("val_", f"Validation {metric_title} History"),
-    ]
+        active_modes = [mode]
+    if continuity_loss_scale is None:
+        active_modes = ["raw" if item in {"scaled_loss", "scaled_residual"} else item for item in active_modes]
+    active_modes = list(dict.fromkeys(active_modes))
 
-    for ax, (prefix, title) in zip(axes[0], panel_specs):
-        plotted = False
-        for key, label in curve_specs:
+    def values_for(prefix: str, kind: str, key: str) -> np.ndarray | None:
+        if kind == "raw":
             full_key = f"{prefix}{key}"
             if not any(full_key in item for item in history):
-                continue
+                return None
+            return np.array([float(item.get(full_key, np.nan)) for item in history], dtype=float)
 
-            values = np.array([float(item.get(full_key, np.nan)) for item in history], dtype=float)
-            if not np.any(np.isfinite(values)):
-                continue
+        if kind == "scaled_loss":
+            scaled_key = f"{prefix}scaled_{key}"
+            if any(scaled_key in item for item in history):
+                return np.array([float(item.get(scaled_key, np.nan)) for item in history], dtype=float)
+            raw = values_for(prefix, "raw", key)
+            if raw is None or continuity_loss_scale is None:
+                return None
+            return raw / max(float(continuity_loss_scale), 1e-30)
 
-            # 对数坐标不能直接画 0，这里只在绘图时做极小截断。
-            values = np.where(np.isfinite(values), np.maximum(values, 1e-30), np.nan)
-            ax.plot(epochs, values, linewidth=1.6, label=label)
-            plotted = True
+        if kind == "scaled_residual":
+            name = key.removeprefix("loss_")
+            scaled_key = f"{prefix}scaled_residual_{name}"
+            if any(scaled_key in item for item in history):
+                return np.array([float(item.get(scaled_key, np.nan)) for item in history], dtype=float)
+            raw = values_for(prefix, "raw", key)
+            if raw is None or continuity_loss_scale is None:
+                return None
+            return np.sqrt(np.maximum(raw, 0.0) / max(float(continuity_loss_scale), 1e-30))
 
-        ax.set_title(title)
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Loss / scaled residual" if show_scaled else "Loss")
-        ax.set_yscale("log")
-        ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.4)
-        if plotted:
-            ax.legend()
+        if kind == "fluent_scaled":
+            legacy_key = f"{prefix}scaled_res_{key.removeprefix('loss_')}"
+            if not any(legacy_key in item for item in history):
+                return None
+            return np.array([float(item.get(legacy_key, np.nan)) for item in history], dtype=float)
+
+        return None
+
+    def curve_specs_for(kind: str) -> list[tuple[str, str]]:
+        curve_specs: list[tuple[str, str]] = []
+        if kind == "raw":
+            if has_supervised_target:
+                curve_specs.append(("loss_data", "Data loss"))
+            curve_specs.extend(
+                [
+                    ("loss_c", "MSE R_c"),
+                    ("loss_r", "MSE R_r"),
+                    ("loss_theta", "MSE R_theta"),
+                    ("loss_z", "MSE R_z"),
+                ]
+            )
+        elif kind == "scaled_loss":
+            if has_supervised_target:
+                curve_specs.append(("loss_data", "Scaled data loss"))
+            curve_specs.extend(
+                [
+                    ("loss_phys", "Scaled physics loss"),
+                    ("loss_c", "Scaled loss R_c"),
+                    ("loss_r", "Scaled loss R_r"),
+                    ("loss_theta", "Scaled loss R_theta"),
+                    ("loss_z", "Scaled loss R_z"),
+                ]
+            )
+        elif kind == "scaled_residual":
+            curve_specs.extend(
+                [
+                    ("loss_c", "Scaled RMSE R_c"),
+                    ("loss_r", "Scaled RMSE R_r"),
+                    ("loss_theta", "Scaled RMSE R_theta"),
+                    ("loss_z", "Scaled RMSE R_z"),
+                ]
+            )
+        elif kind == "fluent_scaled":
+            curve_specs.extend(
+                [
+                    ("loss_c", "Fluent-like R_c"),
+                    ("loss_r", "Fluent-like R_r"),
+                    ("loss_theta", "Fluent-like R_theta"),
+                    ("loss_z", "Fluent-like R_z"),
+                ]
+            )
+        return curve_specs
+
+    metric_titles = {
+        "raw": "Raw Loss",
+        "scaled_loss": "Scaled Loss",
+        "scaled_residual": "Scaled Residual RMSE",
+        "fluent_scaled": "Fluent-like Scaled Residual",
+    }
+    y_labels = {
+        "raw": "Loss",
+        "scaled_loss": "Loss / initial train continuity loss",
+        "scaled_residual": "RMSE residual / initial train continuity RMSE",
+        "fluent_scaled": "Fluent-like scaled residual",
+    }
+    suffixes = {
+        "raw": "loss",
+        "scaled_loss": "scaled_loss",
+        "scaled_residual": "scaled_residual",
+        "fluent_scaled": "fluent_scaled",
+    }
+
+    base_save_path = Path(save_path) if save_path is not None else None
+    if base_save_path is not None:
+        base_save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for active_mode in active_modes:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5), squeeze=False)
+        metric_title = metric_titles[active_mode]
+        panel_specs = [
+            ("train_", f"Training {metric_title} History"),
+            ("val_", f"Validation {metric_title} History"),
+        ]
+        curve_specs = curve_specs_for(active_mode)
+
+        for ax, (prefix, title) in zip(axes[0], panel_specs):
+            plotted = False
+            for key, label in curve_specs:
+                values = values_for(prefix, active_mode, key)
+                if values is None:
+                    continue
+                if not np.any(np.isfinite(values)):
+                    continue
+
+                # 对数坐标不能直接画 0，这里只在绘图时做极小截断。
+                values = np.where(np.isfinite(values), np.maximum(values, 1e-30), np.nan)
+                ax.plot(epochs, values, linewidth=1.6, label=label)
+                plotted = True
+
+            ax.set_title(title)
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel(y_labels[active_mode])
+            ax.set_yscale("log")
+            ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.4)
+            if plotted:
+                ax.legend()
+            else:
+                ax.text(0.5, 0.5, "No curves", transform=ax.transAxes, ha="center", va="center")
+
+        fig.tight_layout()
+        if base_save_path is not None:
+            output_path = base_save_path
+            if len(active_modes) > 1:
+                output_path = base_save_path.with_name(
+                    f"{base_save_path.stem}_{suffixes[active_mode]}{base_save_path.suffix}"
+                )
+            plt.savefig(str(output_path), dpi=180, bbox_inches="tight")
+            print(f"{metric_title} 曲线已保存到: {output_path}")
+        if show:
+            plt.show()
         else:
-            ax.text(0.5, 0.5, "No curves", transform=ax.transAxes, ha="center", va="center")
-
-    fig.tight_layout()
-    if save_path is not None:
-        save_path = Path(save_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(str(save_path), dpi=180, bbox_inches="tight")
-        print(f"训练损失对数曲线已保存到: {save_path}")
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+            plt.close(fig)
 
 def _dct_along(x: torch.Tensor, dim: int) -> torch.Tensor:
     x_last = torch.movedim(x, dim, -1)
