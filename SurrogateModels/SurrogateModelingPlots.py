@@ -774,6 +774,9 @@ def _field_similarity_metrics(
     pred: np.ndarray,
     cfd: np.ndarray,
     valid: np.ndarray,
+    *,
+    local_scale: np.ndarray | None = None,
+    local_normalization: str | None = None,
 ) -> dict[str, float]:
     valid = valid & np.isfinite(pred) & np.isfinite(cfd)
     if not np.any(valid):
@@ -786,11 +789,30 @@ def _field_similarity_metrics(
             "pearson_r": float("nan"),
             "r2": float("nan"),
             "similarity_score": float("nan"),
+            "mean_normalized_abs_error": float("nan"),
+            "median_normalized_abs_error": float("nan"),
+            "p95_normalized_abs_error": float("nan"),
+            "mean_abs_local_normalized_residual": float("nan"),
+            "p95_abs_local_normalized_residual": float("nan"),
         }
 
     pred_v = np.asarray(pred[valid], dtype=float)
     cfd_v = np.asarray(cfd[valid], dtype=float)
     diff = pred_v - cfd_v
+    robust_scale = float(np.nanpercentile(np.maximum(np.abs(pred_v), np.abs(cfd_v)), 95))
+    robust_scale = max(
+        robust_scale,
+        float(np.sqrt(0.5 * (np.mean(pred_v ** 2) + np.mean(cfd_v ** 2)))),
+        1e-12,
+    )
+    _, normalized_stats = _normalized_abs_error_field(
+        pred,
+        cfd,
+        valid,
+        local_scale=local_scale,
+        normalization=local_normalization,
+    )
+    symmetric_abs_percentage_error = 2.0 * np.abs(diff) / np.maximum(np.abs(pred_v) + np.abs(cfd_v), 0.01 * robust_scale)
     rmse = float(np.sqrt(np.mean(diff ** 2)))
     mae = float(np.mean(np.abs(diff)))
     cfd_l2 = float(np.sqrt(np.mean(cfd_v ** 2)) + 1e-12)
@@ -815,11 +837,149 @@ def _field_similarity_metrics(
         "mae": mae,
         "relative_l2": relative_l2,
         "nrmse_range": nrmse_range,
+        "mean_symmetric_abs_percentage_error": float(np.mean(symmetric_abs_percentage_error)),
+        "p95_symmetric_abs_percentage_error": float(np.percentile(symmetric_abs_percentage_error, 95)),
         "cosine_similarity": cosine,
         "pearson_r": pearson,
         "r2": r2,
         "similarity_score": similarity_score,
+        **normalized_stats,
     }
+
+
+def _robust_field_scale(values: np.ndarray, valid: np.ndarray) -> float:
+    valid = valid & np.isfinite(values)
+    if not np.any(valid):
+        return 1.0
+    data = np.abs(np.asarray(values[valid], dtype=float))
+    p95 = float(np.nanpercentile(data, 95))
+    rms = float(np.sqrt(np.nanmean(data ** 2)))
+    return max(p95, rms, 1e-12)
+
+
+def _robust_field_range(values: np.ndarray, valid: np.ndarray) -> float:
+    valid = valid & np.isfinite(values)
+    if not np.any(valid):
+        return 1.0
+    data = np.asarray(values[valid], dtype=float)
+    return max(float(np.nanpercentile(data, 99) - np.nanpercentile(data, 1)), float(np.nanstd(data)), 1e-12)
+
+
+def _local_weighted_mean(values: np.ndarray, valid: np.ndarray, radius: int = 3) -> np.ndarray:
+    from scipy.ndimage import uniform_filter
+
+    values = np.asarray(values, dtype=np.float64)
+    valid = valid & np.isfinite(values)
+    weight = valid.astype(np.float64)
+    safe_values = np.where(valid, values, 0.0)
+    size = 2 * int(max(radius, 1)) + 1
+    numerator = uniform_filter(safe_values * weight, size=size, mode="nearest")
+    denominator = uniform_filter(weight, size=size, mode="nearest")
+    return numerator / np.maximum(denominator, 1e-12)
+
+
+def _local_weighted_rms(values: np.ndarray, valid: np.ndarray, radius: int = 3) -> np.ndarray:
+    return np.sqrt(np.maximum(_local_weighted_mean(np.asarray(values, dtype=np.float64) ** 2, valid, radius), 0.0))
+
+
+def _local_weighted_std(values: np.ndarray, valid: np.ndarray, radius: int = 3) -> np.ndarray:
+    mean = _local_weighted_mean(values, valid, radius)
+    mean_sq = _local_weighted_mean(np.asarray(values, dtype=np.float64) ** 2, valid, radius)
+    return np.sqrt(np.maximum(mean_sq - mean ** 2, 0.0))
+
+
+def _local_velocity_scale(
+    pred_components: Sequence[np.ndarray],
+    cfd_components: Sequence[np.ndarray],
+    valid: np.ndarray,
+    *,
+    radius: int = 3,
+    floor_fraction: float = 0.02,
+) -> tuple[np.ndarray, str]:
+    pred_speed_sq = sum(np.asarray(component, dtype=np.float64) ** 2 for component in pred_components)
+    cfd_speed_sq = sum(np.asarray(component, dtype=np.float64) ** 2 for component in cfd_components)
+    pred_rms = np.sqrt(np.maximum(_local_weighted_mean(pred_speed_sq, valid, radius), 0.0))
+    cfd_rms = np.sqrt(np.maximum(_local_weighted_mean(cfd_speed_sq, valid, radius), 0.0))
+    local_scale = np.sqrt(0.5 * (pred_rms ** 2 + cfd_rms ** 2))
+
+    speed_ref = np.sqrt(0.5 * (pred_speed_sq + cfd_speed_sq))
+    floor = floor_fraction * _robust_field_scale(speed_ref, valid)
+    scale = np.maximum(local_scale, floor)
+    return scale.astype(np.float32), (
+        "|NN-CFD| / max(local symmetric RMS speed, "
+        f"{floor_fraction:g} * robust global speed scale)"
+    )
+
+
+def _local_scalar_contrast_scale(
+    pred: np.ndarray,
+    cfd: np.ndarray,
+    valid: np.ndarray,
+    *,
+    radius: int = 3,
+    floor_fraction: float = 0.02,
+) -> tuple[np.ndarray, str]:
+    pred_std = _local_weighted_std(pred, valid, radius)
+    cfd_std = _local_weighted_std(cfd, valid, radius)
+    local_scale = np.sqrt(0.5 * (pred_std ** 2 + cfd_std ** 2))
+    robust_range = max(_robust_field_range(pred, valid), _robust_field_range(cfd, valid))
+    floor = floor_fraction * robust_range
+    scale = np.maximum(local_scale, floor)
+    return scale.astype(np.float32), (
+        "|NN-CFD| / max(local symmetric field contrast, "
+        f"{floor_fraction:g} * robust global field range)"
+    )
+
+
+def _normalized_abs_error_field(
+    pred: np.ndarray,
+    cfd: np.ndarray,
+    valid: np.ndarray,
+    *,
+    local_scale: np.ndarray | None = None,
+    normalization: str | None = None,
+) -> tuple[np.ndarray, dict[str, float]]:
+    valid = valid & np.isfinite(pred) & np.isfinite(cfd)
+    if local_scale is None:
+        scale = _robust_field_scale(np.maximum(np.abs(pred), np.abs(cfd)), valid)
+        denominator = np.maximum(np.maximum(np.abs(pred), np.abs(cfd)), 0.01 * scale)
+        normalization = normalization or "|NN-CFD| / max(max(|NN|, |CFD|), 0.01 * robust symmetric field scale)"
+    else:
+        scale = float(np.nanmedian(np.asarray(local_scale)[valid])) if np.any(valid) else 1.0
+        denominator = np.maximum(np.asarray(local_scale, dtype=np.float32), 1e-12)
+        normalization = normalization or "|NN-CFD| / local symmetric scale"
+    normalized_error = np.full_like(np.asarray(pred, dtype=np.float32), np.nan, dtype=np.float32)
+    normalized_error[valid] = (np.abs(pred[valid] - cfd[valid]) / denominator[valid]).astype(np.float32)
+    if np.any(valid):
+        values = np.asarray(normalized_error[valid], dtype=float)
+        stats = {
+            "normalization": normalization,
+            "robust_field_scale": float(scale),
+            "mean_normalized_abs_error": float(np.mean(values)),
+            "median_normalized_abs_error": float(np.median(values)),
+            "p95_normalized_abs_error": float(np.percentile(values, 95)),
+            "max_normalized_abs_error": float(np.max(values)),
+            "mean_abs_local_normalized_residual": float(np.mean(values)),
+            "median_abs_local_normalized_residual": float(np.median(values)),
+            "p95_abs_local_normalized_residual": float(np.percentile(values, 95)),
+            "rms_local_normalized_residual": float(np.sqrt(np.mean(values ** 2))),
+            "max_abs_local_normalized_residual": float(np.max(values)),
+        }
+    else:
+        stats = {
+            "normalization": normalization,
+            "robust_field_scale": float(scale),
+            "mean_normalized_abs_error": float("nan"),
+            "median_normalized_abs_error": float("nan"),
+            "p95_normalized_abs_error": float("nan"),
+            "max_normalized_abs_error": float("nan"),
+            "mean_abs_local_normalized_residual": float("nan"),
+            "median_abs_local_normalized_residual": float("nan"),
+            "p95_abs_local_normalized_residual": float("nan"),
+            "rms_local_normalized_residual": float("nan"),
+            "max_abs_local_normalized_residual": float("nan"),
+        }
+    return normalized_error, stats
 
 
 def _flow_similarity_diagnostics(
@@ -838,9 +998,6 @@ def _flow_similarity_diagnostics(
 
     fluid = np.asarray(mask) < 0.5
     fields: dict[str, Any] = {}
-    for name in ["UR", "UT", "UZ", "P"]:
-        fields[name] = _field_similarity_metrics(pred_fields[name], cfd_fields[name], fluid)
-
     velocity_valid = fluid.copy()
     pred_components = []
     cfd_components = []
@@ -851,9 +1008,44 @@ def _flow_similarity_diagnostics(
         pred_components.append(pred_value)
         cfd_components.append(cfd_value)
     if np.any(velocity_valid):
+        velocity_local_scale, velocity_normalization = _local_velocity_scale(pred_components, cfd_components, velocity_valid)
+    else:
+        velocity_local_scale = np.ones_like(mask, dtype=np.float32)
+        velocity_normalization = "local symmetric RMS speed"
+
+    for name in ["UR", "UT", "UZ"]:
+        fields[name] = _field_similarity_metrics(
+            pred_fields[name],
+            cfd_fields[name],
+            fluid,
+            local_scale=velocity_local_scale,
+            local_normalization=velocity_normalization,
+        )
+
+    pressure_valid = fluid & np.isfinite(pred_fields["P"]) & np.isfinite(cfd_fields["P"])
+    pressure_local_scale, pressure_normalization = _local_scalar_contrast_scale(
+        pred_fields["P"],
+        cfd_fields["P"],
+        pressure_valid,
+    )
+    fields["P"] = _field_similarity_metrics(
+        pred_fields["P"],
+        cfd_fields["P"],
+        fluid,
+        local_scale=pressure_local_scale,
+        local_normalization=pressure_normalization,
+    )
+
+    if np.any(velocity_valid):
         pred_speed = np.sqrt(sum(component ** 2 for component in pred_components))
         cfd_speed = np.sqrt(sum(component ** 2 for component in cfd_components))
-        velocity_metrics = _field_similarity_metrics(pred_speed, cfd_speed, velocity_valid)
+        velocity_metrics = _field_similarity_metrics(
+            pred_speed,
+            cfd_speed,
+            velocity_valid,
+            local_scale=velocity_local_scale,
+            local_normalization=velocity_normalization,
+        )
         vec_diff_sq = sum((pred - cfd) ** 2 for pred, cfd in zip(pred_components, cfd_components))
         vec_ref_sq = sum(cfd ** 2 for cfd in cfd_components)
         vec_rel_l2 = float(
@@ -862,6 +1054,26 @@ def _flow_similarity_diagnostics(
         )
         velocity_metrics["vector_relative_l2"] = vec_rel_l2
         velocity_metrics["vector_similarity_score"] = float(np.clip(1.0 - vec_rel_l2, 0.0, 1.0))
+        _, velocity_norm_stats = _normalized_abs_error_field(
+            pred_speed,
+            cfd_speed,
+            velocity_valid,
+            local_scale=velocity_local_scale,
+            normalization=velocity_normalization,
+        )
+        velocity_metrics.update(
+            {
+                "speed_mean_normalized_abs_error": velocity_norm_stats["mean_normalized_abs_error"],
+                "speed_median_normalized_abs_error": velocity_norm_stats["median_normalized_abs_error"],
+                "speed_p95_normalized_abs_error": velocity_norm_stats["p95_normalized_abs_error"],
+                "speed_mean_abs_local_normalized_residual": velocity_norm_stats[
+                    "mean_abs_local_normalized_residual"
+                ],
+                "speed_p95_abs_local_normalized_residual": velocity_norm_stats[
+                    "p95_abs_local_normalized_residual"
+                ],
+            }
+        )
     else:
         velocity_metrics = _field_similarity_metrics(np.zeros_like(mask, dtype=float), np.zeros_like(mask, dtype=float), velocity_valid)
         velocity_metrics["vector_relative_l2"] = float("nan")
@@ -875,12 +1087,43 @@ def _flow_similarity_diagnostics(
     if np.isfinite(velocity_metrics.get("vector_similarity_score", float("nan"))):
         component_scores.append(float(velocity_metrics["vector_similarity_score"]))
     overall = float(np.mean(component_scores)) if component_scores else float("nan")
+    normalized_error_values = [
+        fields[name]["mean_normalized_abs_error"]
+        for name in ["UR", "UT", "UZ", "P"]
+        if np.isfinite(fields[name].get("mean_normalized_abs_error", float("nan")))
+    ]
+    p95_normalized_error_values = [
+        fields[name]["p95_normalized_abs_error"]
+        for name in ["UR", "UT", "UZ", "P"]
+        if np.isfinite(fields[name].get("p95_normalized_abs_error", float("nan")))
+    ]
+    local_residual_values = [
+        fields[name]["mean_abs_local_normalized_residual"]
+        for name in ["UR", "UT", "UZ", "P"]
+        if np.isfinite(fields[name].get("mean_abs_local_normalized_residual", float("nan")))
+    ]
+    p95_local_residual_values = [
+        fields[name]["p95_abs_local_normalized_residual"]
+        for name in ["UR", "UT", "UZ", "P"]
+        if np.isfinite(fields[name].get("p95_abs_local_normalized_residual", float("nan")))
+    ]
     return {
-        "description": "Full-grid CFD/NN similarity in fluid cells. similarity_score is clipped 1 - relative_l2.",
+        "description": (
+            "Full-grid CFD/NN similarity in fluid cells. Local normalized residual metrics use "
+            "symmetric local velocity RMS for velocity components and symmetric local pressure contrast for pressure."
+        ),
         "pressure_reference": pressure_reference,
         "field_metrics": fields,
         "velocity_metrics": velocity_metrics,
         "overall_similarity_score": overall,
+        "overall_mean_normalized_abs_error": float(np.mean(normalized_error_values)) if normalized_error_values else float("nan"),
+        "overall_p95_normalized_abs_error": float(np.mean(p95_normalized_error_values)) if p95_normalized_error_values else float("nan"),
+        "overall_mean_abs_local_normalized_residual": (
+            float(np.mean(local_residual_values)) if local_residual_values else float("nan")
+        ),
+        "overall_p95_abs_local_normalized_residual": (
+            float(np.mean(p95_local_residual_values)) if p95_local_residual_values else float("nan")
+        ),
     }
 
 def compare_cfd_prediction_spans(
@@ -925,7 +1168,27 @@ def compare_cfd_prediction_spans(
             mask=mask,
             pressure_reference=pressure_reference,
         ),
+        "global_error_summary": {},
         "spans": {},
+    }
+    global_metrics = diagnostics["flow_similarity"]
+    diagnostics["global_error_summary"] = {
+        "description": (
+            "Full-field fluid-cell summary using local normalized residuals: velocity errors are scaled "
+            "by local symmetric RMS speed, pressure errors by local symmetric pressure contrast."
+        ),
+        "overall_mean_normalized_abs_error": global_metrics.get("overall_mean_normalized_abs_error", float("nan")),
+        "overall_p95_normalized_abs_error": global_metrics.get("overall_p95_normalized_abs_error", float("nan")),
+        "overall_mean_abs_local_normalized_residual": global_metrics.get(
+            "overall_mean_abs_local_normalized_residual",
+            float("nan"),
+        ),
+        "overall_p95_abs_local_normalized_residual": global_metrics.get(
+            "overall_p95_abs_local_normalized_residual",
+            float("nan"),
+        ),
+        "velocity_vector_relative_l2": global_metrics.get("velocity_metrics", {}).get("vector_relative_l2", float("nan")),
+        "overall_similarity_score": global_metrics.get("overall_similarity_score", float("nan")),
     }
 
     row = 0
@@ -941,6 +1204,8 @@ def compare_cfd_prediction_spans(
         fluid = ~blade_mask
         span_key = f"{float(span):.6g}"
         diagnostics["spans"][span_key] = {}
+        span_pred_slices: dict[str, np.ndarray] = {}
+        span_cfd_slices: dict[str, np.ndarray] = {}
 
         for name in field_names:
             if name == "P":
@@ -949,8 +1214,51 @@ def compare_cfd_prediction_spans(
             else:
                 pred_slice = _span_slice_from_grid(pred_phy[name], float(span))
                 cfd_slice = cfd_fields[name]
-            error = pred_slice - cfd_slice
+            span_pred_slices[name] = np.asarray(pred_slice, dtype=np.float32)
+            span_cfd_slices[name] = np.asarray(cfd_slice, dtype=np.float32)
+
+        velocity_valid = fluid.copy()
+        for name in ["UR", "UT", "UZ"]:
+            velocity_valid = (
+                velocity_valid
+                & np.isfinite(span_pred_slices[name])
+                & np.isfinite(span_cfd_slices[name])
+            )
+        if np.any(velocity_valid):
+            velocity_local_scale, velocity_normalization = _local_velocity_scale(
+                [span_pred_slices[name] for name in ["UR", "UT", "UZ"]],
+                [span_cfd_slices[name] for name in ["UR", "UT", "UZ"]],
+                velocity_valid,
+            )
+        else:
+            velocity_local_scale = np.ones_like(blade_mask, dtype=np.float32)
+            velocity_normalization = "local symmetric RMS speed"
+
+        pressure_valid = fluid & np.isfinite(span_pred_slices["P"]) & np.isfinite(span_cfd_slices["P"])
+        pressure_local_scale, pressure_normalization = _local_scalar_contrast_scale(
+            span_pred_slices["P"],
+            span_cfd_slices["P"],
+            pressure_valid,
+        )
+
+        for name in field_names:
+            pred_slice = span_pred_slices[name]
+            cfd_slice = span_cfd_slices[name]
             valid = fluid & np.isfinite(pred_slice) & np.isfinite(cfd_slice)
+            error = pred_slice - cfd_slice
+            if name in {"UR", "UT", "UZ"}:
+                local_scale = velocity_local_scale
+                local_normalization = velocity_normalization
+            else:
+                local_scale = pressure_local_scale
+                local_normalization = pressure_normalization
+            normalized_error, normalized_stats = _normalized_abs_error_field(
+                pred_slice,
+                cfd_slice,
+                valid,
+                local_scale=local_scale,
+                normalization=local_normalization,
+            )
             if np.any(valid):
                 err_valid = error[valid]
                 cfd_valid = cfd_slice[valid]
@@ -966,12 +1274,13 @@ def compare_cfd_prediction_spans(
                 "mae": mae,
                 "relative_rmse": rel_rmse,
                 "max_abs_error": max_abs,
+                **normalized_stats,
             }
 
             plot_mask = blade_mask.T
             cfd_plot = np.ma.array(cfd_slice.T, mask=plot_mask)
             pred_plot = np.ma.array(pred_slice.T, mask=plot_mask)
-            err_plot = np.ma.array(error.T, mask=plot_mask)
+            err_plot = np.ma.array(normalized_error.T, mask=plot_mask)
 
             combined = np.concatenate([np.asarray(cfd_plot.compressed()), np.asarray(pred_plot.compressed())])
             if combined.size and np.any(np.isfinite(combined)):
@@ -981,8 +1290,8 @@ def compare_cfd_prediction_spans(
                     vmin, vmax = None, None
             else:
                 vmin, vmax = None, None
-            err_abs = float(np.nanpercentile(np.abs(err_plot.compressed()), 98)) if err_plot.count() else 1.0
-            err_abs = max(err_abs, 1e-12)
+            err_abs = float(np.nanpercentile(err_plot.compressed(), 98)) if err_plot.count() else 1.0
+            err_abs = max(err_abs, 1e-6)
 
             image0 = axes[row, 0].imshow(
                 cfd_plot,
@@ -1004,11 +1313,16 @@ def compare_cfd_prediction_spans(
                 err_plot,
                 origin="lower",
                 aspect="auto",
-                cmap="coolwarm",
-                vmin=-err_abs,
+                cmap="magma",
+                vmin=0.0,
                 vmax=err_abs,
             )
-            for col, title in enumerate(["CFD", "NN", "NN - CFD"]):
+            titles = [
+                "CFD",
+                "NN",
+                f"|local normalized residual| p95={normalized_stats['p95_abs_local_normalized_residual']:.3g}",
+            ]
+            for col, title in enumerate(titles):
                 axes[row, col].contour(plot_mask.astype(float), levels=[0.5], colors="k", linewidths=0.6)
                 axes[row, col].set_title(f"{title} {labels[name]} @ span={span:.2f}")
                 axes[row, col].set_xlabel("Theta index")
@@ -1017,6 +1331,67 @@ def compare_cfd_prediction_spans(
             fig.colorbar(image1, ax=axes[row, 1], fraction=0.046, pad=0.04)
             fig.colorbar(image2, ax=axes[row, 2], fraction=0.046, pad=0.04)
             row += 1
+
+        span_norm_means = [
+            diagnostics["spans"][span_key][name]["mean_normalized_abs_error"]
+            for name in field_names
+            if np.isfinite(diagnostics["spans"][span_key][name]["mean_normalized_abs_error"])
+        ]
+        span_norm_p95s = [
+            diagnostics["spans"][span_key][name]["p95_normalized_abs_error"]
+            for name in field_names
+            if np.isfinite(diagnostics["spans"][span_key][name]["p95_normalized_abs_error"])
+        ]
+        velocity_valid = fluid.copy()
+        for name in ["UR", "UT", "UZ"]:
+            velocity_valid = (
+                velocity_valid
+                & np.isfinite(span_pred_slices[name])
+                & np.isfinite(span_cfd_slices[name])
+            )
+        if np.any(velocity_valid):
+            pred_speed = np.sqrt(sum(span_pred_slices[name] ** 2 for name in ["UR", "UT", "UZ"]))
+            cfd_speed = np.sqrt(sum(span_cfd_slices[name] ** 2 for name in ["UR", "UT", "UZ"]))
+            speed_metrics = _field_similarity_metrics(
+                pred_speed,
+                cfd_speed,
+                velocity_valid,
+                local_scale=velocity_local_scale,
+                local_normalization=velocity_normalization,
+            )
+            vec_diff_sq = sum(
+                (span_pred_slices[name] - span_cfd_slices[name]) ** 2
+                for name in ["UR", "UT", "UZ"]
+            )
+            vec_ref_sq = sum(span_cfd_slices[name] ** 2 for name in ["UR", "UT", "UZ"])
+            vector_relative_l2 = float(
+                np.sqrt(np.mean(vec_diff_sq[velocity_valid]))
+                / max(float(np.sqrt(np.mean(vec_ref_sq[velocity_valid]))), 1e-12)
+            )
+        else:
+            speed_metrics = {}
+            vector_relative_l2 = float("nan")
+        diagnostics["spans"][span_key]["summary"] = {
+            "mean_normalized_abs_error_over_fields": float(np.mean(span_norm_means)) if span_norm_means else float("nan"),
+            "p95_normalized_abs_error_over_fields": float(np.mean(span_norm_p95s)) if span_norm_p95s else float("nan"),
+            "mean_abs_local_normalized_residual_over_fields": (
+                float(np.mean(span_norm_means)) if span_norm_means else float("nan")
+            ),
+            "p95_abs_local_normalized_residual_over_fields": (
+                float(np.mean(span_norm_p95s)) if span_norm_p95s else float("nan")
+            ),
+            "velocity_vector_relative_l2": vector_relative_l2,
+            "velocity_speed_mean_normalized_abs_error": speed_metrics.get("mean_normalized_abs_error", float("nan")),
+            "velocity_speed_p95_normalized_abs_error": speed_metrics.get("p95_normalized_abs_error", float("nan")),
+            "velocity_speed_mean_abs_local_normalized_residual": speed_metrics.get(
+                "mean_abs_local_normalized_residual",
+                float("nan"),
+            ),
+            "velocity_speed_p95_abs_local_normalized_residual": speed_metrics.get(
+                "p95_abs_local_normalized_residual",
+                float("nan"),
+            ),
+        }
 
     fig.tight_layout()
     if save_path is not None:
@@ -1034,6 +1409,215 @@ def compare_cfd_prediction_spans(
     else:
         plt.close(fig)
     return diagnostics
+
+
+def _local_residual_stats(values: np.ndarray, valid: np.ndarray) -> dict[str, float]:
+    valid = valid & np.isfinite(values)
+    if not np.any(valid):
+        return {
+            "mean": float("nan"),
+            "median": float("nan"),
+            "p95": float("nan"),
+            "p99": float("nan"),
+            "rms": float("nan"),
+            "max": float("nan"),
+        }
+    data = np.asarray(values[valid], dtype=float)
+    return {
+        "mean": float(np.mean(data)),
+        "median": float(np.median(data)),
+        "p95": float(np.percentile(data, 95)),
+        "p99": float(np.percentile(data, 99)),
+        "rms": float(np.sqrt(np.mean(data ** 2))),
+        "max": float(np.max(data)),
+    }
+
+
+def _local_physics_residual_fields(
+    self,
+    pred: Mapping[str, torch.Tensor],
+    batch: Mapping[str, torch.Tensor],
+) -> tuple[dict[str, np.ndarray], np.ndarray, dict[str, Any]]:
+    residual_c, residual_r, residual_theta, residual_z = self.physics_loss.residual_fields(pred, batch)
+    pde_mask_t = self.physics_loss.build_pde_mask(batch["phi"])
+
+    ur = pred["UR"]
+    ut = pred["UT"]
+    uz = pred["UZ"]
+    p = pred["P"]
+    if self.physics_loss.physics_discretization == "fvm_rhie_chow":
+        face_velocity = self.physics_loss._rhie_chow_face_velocities(ur, ut, uz, p, batch)
+    else:
+        face_velocity = self.physics_loss._centered_face_velocities(ur, ut, uz)
+
+    continuity_scale = torch.clamp(torch.abs(self.physics_loss._continuity_equation_scale(face_velocity, batch)), min=1e-12)
+    momentum_diagonal = torch.clamp(torch.abs(self.physics_loss._momentum_diagonal_scale(ur, ut, uz, batch)), min=1e-12)
+    velocity_mag_omega, velocity_mag_zo = self.physics_loss._momentum_velocity_magnitude_scales(ur, ut, uz, batch)
+    active_mask = pde_mask_t > 0.5
+
+    def display_scale_floor(scale: torch.Tensor, floor_fraction: float = 0.02) -> torch.Tensor:
+        scale = torch.abs(scale)
+        finite = active_mask & torch.isfinite(scale)
+        if torch.any(finite):
+            values = scale[finite]
+            ref = torch.maximum(
+                torch.quantile(values, 0.95),
+                torch.sqrt(torch.clamp(torch.mean(values ** 2), min=1e-30)),
+            )
+            floor = torch.clamp(ref * floor_fraction, min=torch.tensor(1e-12, device=scale.device, dtype=scale.dtype))
+        else:
+            floor = torch.tensor(1e-12, device=scale.device, dtype=scale.dtype)
+        return torch.clamp(scale, min=floor)
+
+    continuity_scale = display_scale_floor(continuity_scale)
+    scale_r = display_scale_floor(momentum_diagonal * torch.abs(velocity_mag_omega))
+    scale_theta = display_scale_floor(momentum_diagonal * torch.abs(velocity_mag_omega))
+    scale_z = display_scale_floor(momentum_diagonal * torch.abs(velocity_mag_zo))
+
+    local_c = torch.abs(residual_c) / continuity_scale
+    local_r = torch.abs(residual_r) / scale_r
+    local_theta = torch.abs(residual_theta) / scale_theta
+    local_z = torch.abs(residual_z) / scale_z
+    local_momentum_rms = torch.sqrt(torch.clamp((local_r ** 2 + local_theta ** 2 + local_z ** 2) / 3.0, min=0.0))
+
+    fields = {
+        "continuity": local_c[0].detach().cpu().numpy().astype(np.float32),
+        "momentum_rms": local_momentum_rms[0].detach().cpu().numpy().astype(np.float32),
+        "radial": local_r[0].detach().cpu().numpy().astype(np.float32),
+        "theta": local_theta[0].detach().cpu().numpy().astype(np.float32),
+        "axial": local_z[0].detach().cpu().numpy().astype(np.float32),
+    }
+    pde_mask = (active_mask[0].detach().cpu().numpy() > 0.0)
+    meta = {
+        "normalization": {
+            "continuity": "|R_c| / max(local continuity flux scale, 0.02 * robust active-cell scale)",
+            "radial": "|R_r| / max(local momentum diagonal * local velocity scale, 0.02 * robust active-cell scale)",
+            "theta": "|R_theta| / max(local momentum diagonal * local velocity scale, 0.02 * robust active-cell scale)",
+            "axial": "|R_z| / max(local momentum diagonal * local velocity scale, 0.02 * robust active-cell scale)",
+            "momentum_rms": "sqrt(mean(local normalized momentum residual components^2))",
+        },
+        "physics_discretization": self.physics_loss.physics_discretization,
+        "convection_interpolation": self.physics_loss.convection_interpolation,
+        "rhie_chow_strength": float(self.physics_loss.rhie_chow_strength),
+    }
+    return fields, pde_mask, meta
+
+
+def plot_local_physics_residual_spans(
+    self,
+    case_index: int = 0,
+    case: Mapping[str, Any] | None = None,
+    spans: Sequence[float] = (0.2, 0.5, 0.8),
+    *,
+    source: str = "nn",
+    show: bool = True,
+    save_path: str | Path | None = None,
+    summary_path: str | Path | None = None,
+) -> dict[str, Any]:
+    source_key = str(source).lower()
+    if source_key not in {"nn", "cfd"}:
+        raise ValueError("source must be 'nn' or 'cfd'.")
+
+    with torch.no_grad():
+        if source_key == "nn":
+            bundle = self._predict_case_bundle(case_index=case_index, case=case)
+            case_data = bundle["case"]
+            batch = bundle["batch"]
+            pred = {key: value.unsqueeze(0).to(self.device) for key, value in bundle["pred_dim"].items()}
+            source_label = "NN"
+        else:
+            case_data, sample = self._resolve_case_sample(case_index=case_index, case=case)
+            if float(sample["has_target"].item()) < 0.5:
+                raise ValueError("CFD local residual plot requires UR/UT/UZ/P target fields in the case.")
+            batch = {key: value.unsqueeze(0).to(self.device) for key, value in sample.items()}
+            batch = self._prepare_runtime_batch(batch)
+            target = batch["y"]
+            pred = {
+                "UR": target[:, 0],
+                "UT": target[:, 1],
+                "UZ": target[:, 2],
+                "P": target[:, 3],
+            }
+            source_label = "CFD"
+
+        residual_fields, pde_mask, meta = _local_physics_residual_fields(self, pred, batch)
+
+    component_specs = [
+        ("continuity", "Continuity"),
+        ("momentum_rms", "Momentum RMS"),
+        ("radial", "Radial momentum"),
+        ("theta", "Theta momentum"),
+        ("axial", "Axial momentum"),
+    ]
+    diagnostics: dict[str, Any] = {
+        "source": source_key,
+        "description": (
+            "Local physics residual field. Each residual component is divided by its local equation scale, "
+            "so the value is a dimensionless local imbalance indicator rather than a CFD-NN point error."
+        ),
+        "case_summary": str(case_data.get("name", case_data.get("case_name", ""))) if isinstance(case_data, Mapping) else "",
+        **meta,
+        "global": {},
+        "spans": {},
+    }
+
+    for key, _ in component_specs:
+        diagnostics["global"][key] = _local_residual_stats(residual_fields[key], pde_mask)
+
+    fig, axes = plt.subplots(
+        len(spans),
+        len(component_specs),
+        figsize=(4.1 * len(component_specs), 3.2 * len(spans)),
+        squeeze=False,
+    )
+    for row, span in enumerate(spans):
+        span_key = f"{float(span):.6g}"
+        diagnostics["spans"][span_key] = {}
+        valid_slice = _span_slice_from_grid(pde_mask.astype(np.float32), float(span)) > 0.0
+        plot_mask = (~valid_slice).T
+        for col, (key, label) in enumerate(component_specs):
+            field_slice = _span_slice_from_grid(residual_fields[key], float(span))
+            valid = valid_slice & np.isfinite(field_slice)
+            stats = _local_residual_stats(field_slice, valid)
+            diagnostics["spans"][span_key][key] = stats
+
+            data = np.ma.array(field_slice.T, mask=plot_mask)
+            if data.count():
+                vmax = float(np.nanpercentile(data.compressed(), 98))
+                vmax = max(vmax, 1e-8)
+            else:
+                vmax = 1.0
+            image = axes[row, col].imshow(
+                data,
+                origin="lower",
+                aspect="auto",
+                cmap="magma",
+                vmin=0.0,
+                vmax=vmax,
+            )
+            axes[row, col].contour(plot_mask.astype(float), levels=[0.5], colors="k", linewidths=0.6)
+            axes[row, col].set_title(f"{source_label} {label}\nspan={span:.2f}, p95={stats['p95']:.3g}")
+            axes[row, col].set_xlabel("Theta index")
+            axes[row, col].set_ylabel("Z index")
+            fig.colorbar(image, ax=axes[row, col], fraction=0.046, pad=0.04)
+
+    fig.tight_layout()
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(str(save_path), dpi=160, bbox_inches="tight")
+        print(f"{source_label} local physics residual span plot saved to: {save_path}")
+    if summary_path is not None:
+        summary_path = Path(summary_path)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(diagnostics, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"{source_label} local physics residual summary saved to: {summary_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return diagnostics
+
 
 def post_process_case(
     self,

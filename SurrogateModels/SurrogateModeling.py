@@ -34,6 +34,7 @@ from SurrogateModelingPlots import (
     plot_blade_spans as _plot_blade_spans_impl,
     plot_cfd_spans as _plot_cfd_spans_impl,
     plot_frequency_energy_trends as _plot_frequency_energy_trends_impl,
+    plot_local_physics_residual_spans as _plot_local_physics_residual_spans_impl,
     plot_training_history as _plot_training_history_impl,
     post_process_case as _post_process_case_impl,
 )
@@ -1303,6 +1304,83 @@ class BladeFlowPhysicsLoss(nn.Module):
         loss_uz = self.weighted_mse(pred["UZ"], solid)
         return loss_ur + loss_ut + loss_uz
 
+    def residual_fields(
+        self,
+        pred: Mapping[str, torch.Tensor],
+        batch: Mapping[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ur = pred["UR"]
+        ut = pred["UT"]
+        uz = pred["UZ"]
+        p = pred["P"]
+
+        if self.physics_discretization == "fvm_rhie_chow":
+            return self.fvm_rhie_chow_residuals(pred, batch)
+
+        r_hat = batch["r_hat"]
+        k_theta = batch["K_theta"]
+        dR = expand_scalar(batch["dR"])
+        dTheta = expand_scalar(batch["dTheta"])
+        dZ = expand_scalar(batch["dZ"])
+        Eu = expand_scalar(batch["Eu_omega"])
+        Re = torch.clamp(expand_scalar(batch["Re_omega"]), min=1e-12)
+        Lambda = expand_scalar(batch["Lambda"])
+        Ku = expand_scalar(batch["Ku"])
+        delta = expand_scalar(batch["delta"])
+        sgn_omega = expand_scalar(batch["sgn_omega"])
+        g_star = expand_scalar(batch["g_star"])
+        absolute_frame = expand_scalar(batch["absolute_frame"])
+
+        dR_ur = self.d1(ur, dim=1, spacing=dR, periodic=False)
+        dTheta_ur = self.d1(ur, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
+        dZ_ur = self.d1(ur, dim=3, spacing=dZ, periodic=False)
+
+        dR_ut = self.d1(ut, dim=1, spacing=dR, periodic=False)
+        dTheta_ut = self.d1(ut, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
+        dZ_ut = self.d1(ut, dim=3, spacing=dZ, periodic=False)
+
+        dR_uz = self.d1(uz, dim=1, spacing=dR, periodic=False)
+        dTheta_uz = self.d1(uz, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
+        dZ_uz = self.d1(uz, dim=3, spacing=dZ, periodic=False)
+
+        dR_p = self.d1(p, dim=1, spacing=dR, periodic=False)
+        dTheta_p = self.d1(p, dim=2, spacing=dTheta, periodic=True, duplicate_endpoint=True)
+        dZ_p = self.d1(p, dim=3, spacing=dZ, periodic=False)
+
+        lap_ur = self.dimensionless_laplacian(ur, batch)
+        lap_ut = self.dimensionless_laplacian(ut, batch)
+        lap_uz = self.dimensionless_laplacian(uz, batch)
+
+        residual_c = self.d1(r_hat * ur, dim=1, spacing=dR, periodic=False) / torch.clamp(r_hat, min=1e-12)
+        residual_c = residual_c + k_theta * dTheta_ut + Lambda * Ku * dZ_uz
+
+        residual_r = ur * dR_ur + k_theta * ut * dTheta_ur + Lambda * Ku * uz * dZ_ur
+        residual_r = residual_r - (ut ** 2) / torch.clamp(r_hat, min=1e-12)
+        residual_r = residual_r + Eu * dR_p
+        residual_r = residual_r - (
+            lap_ur
+            - ur / torch.clamp(r_hat ** 2, min=1e-12)
+            - (2.0 * k_theta / torch.clamp(r_hat, min=1e-12)) * dTheta_ut
+        ) / Re
+
+        residual_theta = ur * dR_ut + k_theta * ut * dTheta_ut + Lambda * Ku * uz * dZ_ut
+        residual_theta = residual_theta + (ur * ut) / torch.clamp(r_hat, min=1e-12)
+        residual_theta = residual_theta + k_theta * Eu * dTheta_p
+        residual_theta = residual_theta - (
+            lap_ut
+            - ut / torch.clamp(r_hat ** 2, min=1e-12)
+            + (2.0 * k_theta / torch.clamp(r_hat, min=1e-12)) * dTheta_ur
+        ) / Re
+
+        residual_z = ur * dR_uz + k_theta * ut * dTheta_uz + Lambda * Ku * uz * dZ_uz
+        residual_z = residual_z + (Lambda / torch.clamp(Ku, min=1e-12)) * Eu * dZ_p
+        residual_z = residual_z - lap_uz / Re + g_star
+
+        rotating_weight = 1.0 - absolute_frame
+        residual_r = residual_r + rotating_weight * (-delta ** 2 * r_hat + 2.0 * sgn_omega * delta * ut)
+        residual_theta = residual_theta + rotating_weight * (-2.0 * sgn_omega * delta * ur)
+        return residual_c, residual_r, residual_theta, residual_z
+
     def forward(
         self,
         pred: Mapping[str, torch.Tensor],
@@ -1925,6 +2003,7 @@ class SurrogateModeling:
     plot_frequency_energy_trends = _plot_frequency_energy_trends_impl
     plot_cfd_spans = _plot_cfd_spans_impl
     compare_cfd_prediction_spans = _compare_cfd_prediction_spans_impl
+    plot_local_physics_residual_spans = _plot_local_physics_residual_spans_impl
     post_process_case = _post_process_case_impl
 
 
@@ -3568,6 +3647,14 @@ if __name__ == "__main__":
             pressure_reference=post_config["cfd_pressure_reference"],
             interpolation_chunk_size=post_config["interpolation_chunk_size"],
         )
+        trainer.plot_local_physics_residual_spans(
+            case_index=0,
+            spans=post_config["spans"],
+            source="cfd",
+            show=post_config["show_matplotlib"],
+            save_path=save_dir / "cfd_local_residual_spans.png",
+            summary_path=save_dir / "cfd_local_residual_summary.json",
+        )
         compare_diagnostics = trainer.compare_cfd_prediction_spans(
             case_index=0,
             spans=post_config["spans"],
@@ -3588,6 +3675,14 @@ if __name__ == "__main__":
     # ============================================================
     # 9. 神经网络预测后处理
     # ============================================================
+    trainer.plot_local_physics_residual_spans(
+        case_index=0,
+        spans=post_config["spans"],
+        source="nn",
+        show=post_config["show_matplotlib"],
+        save_path=save_dir / "nn_local_residual_spans.png",
+        summary_path=save_dir / "nn_local_residual_summary.json",
+    )
     trainer.post_process_case(
         case_index=0,
         spans=post_config["spans"],
