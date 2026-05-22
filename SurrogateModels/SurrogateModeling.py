@@ -104,6 +104,27 @@ def _resolve_fluent_continuity_scale(
     return float(value) if value > 0.0 else None
 
 
+CONVECTION_INTERPOLATION_ALIASES = {
+    "central": "central",
+    "centered": "central",
+    "upwind": "upwind",
+    "upwind1": "upwind",
+    "first_order_upwind": "upwind",
+    "1st_order_upwind": "upwind",
+    "upwind2": "upwind2",
+    "second_order_upwind": "upwind2",
+    "2nd_order_upwind": "upwind2",
+}
+
+
+def _normalize_convection_interpolation(value: str) -> str:
+    key = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    if key in CONVECTION_INTERPOLATION_ALIASES:
+        return CONVECTION_INTERPOLATION_ALIASES[key]
+    valid = ", ".join(sorted(set(CONVECTION_INTERPOLATION_ALIASES.values())))
+    raise ValueError(f"convection_interpolation must be one of: {valid}.")
+
+
 class BladeFlowDataset(Dataset):
     # 每个样本至少需要：
     # n, rh, rs, h, mu, rho, omega, qv, n_blade
@@ -728,9 +749,7 @@ class BladeFlowPhysicsLoss(nn.Module):
             raise ValueError("physics_discretization must be 'fvm_rhie_chow' or 'centered'.")
         self.rhie_chow_strength = float(max(rhie_chow_strength, 0.0))
         self.momentum_diagonal_floor = float(max(momentum_diagonal_floor, 1e-8))
-        self.convection_interpolation = str(convection_interpolation).lower()
-        if self.convection_interpolation not in {"central", "upwind"}:
-            raise ValueError("convection_interpolation must be 'central' or 'upwind'.")
+        self.convection_interpolation = _normalize_convection_interpolation(convection_interpolation)
         self.fluent_continuity_first5 = _float_sequence_from_any(fluent_continuity_first5)
         self.fluent_continuity_scale = _resolve_fluent_continuity_scale(
             fluent_continuity_scale,
@@ -980,6 +999,42 @@ class BladeFlowPhysicsLoss(nn.Module):
         minus = self._neighbor_minus_overlap(transported, dim, theta_overlap=theta_overlap)
         return torch.where(normal_velocity >= 0.0, minus, transported)
 
+    def _upwind2_plus(
+        self,
+        transported: torch.Tensor,
+        normal_velocity: torch.Tensor,
+        dim: int,
+        *,
+        theta_overlap: bool = False,
+    ) -> torch.Tensor:
+        min_points = 4 if theta_overlap else 3
+        if transported.shape[dim] < min_points:
+            return self._upwind_plus(transported, normal_velocity, dim, theta_overlap=theta_overlap)
+        minus = self._neighbor_minus_overlap(transported, dim, theta_overlap=theta_overlap)
+        plus = self._neighbor_plus_overlap(transported, dim, theta_overlap=theta_overlap)
+        plus2 = self._neighbor_plus_overlap(plus, dim, theta_overlap=theta_overlap)
+        from_left = 1.5 * transported - 0.5 * minus
+        from_right = 1.5 * plus - 0.5 * plus2
+        return torch.where(normal_velocity >= 0.0, from_left, from_right)
+
+    def _upwind2_minus(
+        self,
+        transported: torch.Tensor,
+        normal_velocity: torch.Tensor,
+        dim: int,
+        *,
+        theta_overlap: bool = False,
+    ) -> torch.Tensor:
+        min_points = 4 if theta_overlap else 3
+        if transported.shape[dim] < min_points:
+            return self._upwind_minus(transported, normal_velocity, dim, theta_overlap=theta_overlap)
+        minus = self._neighbor_minus_overlap(transported, dim, theta_overlap=theta_overlap)
+        minus2 = self._neighbor_minus_overlap(minus, dim, theta_overlap=theta_overlap)
+        plus = self._neighbor_plus_overlap(transported, dim, theta_overlap=theta_overlap)
+        from_left = 1.5 * minus - 0.5 * minus2
+        from_right = 1.5 * transported - 0.5 * plus
+        return torch.where(normal_velocity >= 0.0, from_left, from_right)
+
     def _momentum_diagonal_inverse(
         self,
         ur: torch.Tensor,
@@ -1114,13 +1169,20 @@ class BladeFlowPhysicsLoss(nn.Module):
             phi_s = self._face_minus(transported, dim=2, theta_overlap=True)
             phi_t = self._face_plus(transported, dim=3)
             phi_b = self._face_minus(transported, dim=3)
-        else:
+        elif self.convection_interpolation == "upwind":
             phi_e = self._upwind_plus(transported, face_velocity["ur_e"], dim=1)
             phi_w = self._upwind_minus(transported, face_velocity["ur_w"], dim=1)
             phi_n = self._upwind_plus(transported, face_velocity["ut_n"], dim=2, theta_overlap=True)
             phi_s = self._upwind_minus(transported, face_velocity["ut_s"], dim=2, theta_overlap=True)
             phi_t = self._upwind_plus(transported, face_velocity["uz_t"], dim=3)
             phi_b = self._upwind_minus(transported, face_velocity["uz_b"], dim=3)
+        else:
+            phi_e = self._upwind2_plus(transported, face_velocity["ur_e"], dim=1)
+            phi_w = self._upwind2_minus(transported, face_velocity["ur_w"], dim=1)
+            phi_n = self._upwind2_plus(transported, face_velocity["ut_n"], dim=2, theta_overlap=True)
+            phi_s = self._upwind2_minus(transported, face_velocity["ut_s"], dim=2, theta_overlap=True)
+            phi_t = self._upwind2_plus(transported, face_velocity["uz_t"], dim=3)
+            phi_b = self._upwind2_minus(transported, face_velocity["uz_b"], dim=3)
 
         radial = (r_e * face_velocity["ur_e"] * phi_e - r_w * face_velocity["ur_w"] * phi_w) / (
             torch.clamp(r_hat, min=1e-12) * torch.clamp(dR, min=1e-12)
@@ -1597,6 +1659,7 @@ class SurrogateModeling:
         self.pressure_data_reference = str(pressure_data_reference).lower()
         if self.pressure_data_reference not in {"training_origin", "absolute"}:
             raise ValueError("pressure_data_reference must be 'training_origin' or 'absolute'.")
+        convection_interpolation = _normalize_convection_interpolation(convection_interpolation)
         self.train_dataset = BladeFlowDataset(
             train_cases,
             input_mode=input_mode,
@@ -1701,7 +1764,7 @@ class SurrogateModeling:
             "physics_discretization": str(physics_discretization).lower(),
             "rhie_chow_strength": float(max(rhie_chow_strength, 0.0)),
             "momentum_diagonal_floor": float(max(momentum_diagonal_floor, 1e-8)),
-            "convection_interpolation": str(convection_interpolation).lower(),
+            "convection_interpolation": convection_interpolation,
             "fluent_continuity_first5": list(_float_sequence_from_any(fluent_continuity_first5)),
             "fluent_continuity_scale": _resolve_fluent_continuity_scale(
                 fluent_continuity_scale,
@@ -2673,9 +2736,7 @@ class SurrogateModeling:
             self.physics_loss.momentum_diagonal_floor = value
             self.trainer_config["momentum_diagonal_floor"] = value
         if convection_interpolation is not None:
-            value = str(convection_interpolation).lower()
-            if value not in {"central", "upwind"}:
-                raise ValueError("convection_interpolation must be 'central' or 'upwind'.")
+            value = _normalize_convection_interpolation(convection_interpolation)
             self.physics_loss.convection_interpolation = value
             self.trainer_config["convection_interpolation"] = value
         if fluent_continuity_first5 is not None or fluent_continuity_scale is not None:
@@ -2822,23 +2883,27 @@ class SurrogateModeling:
         # checkpoint 不仅保存权重，也保存部署时所需的模型结构与训练摘要。
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "checkpoint_version": 5,
-                "model_state_dict": self.model.state_dict(),
-                "ibm_mask_controller_state_dict": self.ibm_mask_controller.state_dict() if self.ibm_mask_controller is not None else None,
-                "optimizer_state_dict": self.optimizer.state_dict() if save_optimizer else None,
-                "input_mode": self.train_dataset.input_mode,
-                "model_config": self.model_config,
-                "trainer_config": self.trainer_config,
-                "ibm_config": self.ibm_config,
-                "train_case_summaries": [case_summary(case) for case in self.train_dataset.cases],
-                "val_case_summaries": [case_summary(case) for case in self.val_dataset.cases],
-                "history": list(history) if history is not None else None,
-                "extra_metadata": dict(extra_metadata or {}),
-            },
-            str(path),
-        )
+        tmp_path = path.with_name(f"{path.name}.tmp")
+        payload = {
+            "checkpoint_version": 5,
+            "model_state_dict": self.model.state_dict(),
+            "ibm_mask_controller_state_dict": self.ibm_mask_controller.state_dict() if self.ibm_mask_controller is not None else None,
+            "optimizer_state_dict": self.optimizer.state_dict() if save_optimizer else None,
+            "input_mode": self.train_dataset.input_mode,
+            "model_config": self.model_config,
+            "trainer_config": self.trainer_config,
+            "ibm_config": self.ibm_config,
+            "train_case_summaries": [case_summary(case) for case in self.train_dataset.cases],
+            "val_case_summaries": [case_summary(case) for case in self.val_dataset.cases],
+            "history": list(history) if history is not None else None,
+            "extra_metadata": dict(extra_metadata or {}),
+        }
+        try:
+            torch.save(payload, str(tmp_path))
+            os.replace(str(tmp_path), str(path))
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
         print(f"模型 checkpoint 已保存到: {path}")
 
     def load_checkpoint(
@@ -2848,7 +2913,7 @@ class SurrogateModeling:
         load_optimizer: bool = True,
     ) -> dict[str, Any]:
         path = Path(path)
-        payload = torch.load(str(path), map_location=self.device)
+        payload = load_checkpoint_payload(path, map_location=self.device)
         self.model.load_state_dict(payload["model_state_dict"])
         ibm_state = payload.get("ibm_mask_controller_state_dict")
         if self.ibm_mask_controller is not None and ibm_state is not None:
@@ -2899,7 +2964,7 @@ class SurrogateModeling:
     ) -> "SurrogateModeling":
         # 用 checkpoint 重建一个可直接部署的新 trainer。
         path = Path(path)
-        payload = torch.load(str(path), map_location="cpu")
+        payload = load_checkpoint_payload(path, map_location="cpu")
         case_list = [cases] if isinstance(cases, Mapping) else list(cases)
 
         model_config = dict(payload.get("model_config", {}))
@@ -3073,6 +3138,30 @@ def load_cases_from_pt(path: str | Path) -> list[Mapping[str, Any]]:
     return list(payload)
 
 
+def load_checkpoint_payload(path: str | Path, *, map_location: str | torch.device = "cpu") -> Mapping[str, Any]:
+    path = Path(path)
+    try:
+        payload = torch.load(str(path), map_location=map_location)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to read checkpoint. The file may be incomplete or corrupted "
+            f"(often caused by an interrupted save): {path}. "
+            "Delete or move this file, or choose another checkpoint."
+        ) from exc
+    if not isinstance(payload, Mapping) or "model_state_dict" not in payload:
+        raise RuntimeError(f"Invalid surrogate checkpoint format: {path}")
+    return payload
+
+
+def is_checkpoint_readable(path: str | Path) -> bool:
+    try:
+        load_checkpoint_payload(path, map_location="cpu")
+    except RuntimeError as exc:
+        print(f"Warning: skipping unreadable checkpoint: {path}\n  {exc}")
+        return False
+    return True
+
+
 def find_first_blade_params(root: str | Path = ".") -> Path | None:
     # 纯物理调试时，尽量自动找一个 blade_params.json。
     root = Path(root)
@@ -3156,7 +3245,10 @@ def find_latest_checkpoint(root: str | Path = "surrogate_formal") -> Path | None
     if not root.exists():
         return None
     matches = sorted(root.rglob("surrogate_checkpoint.pt"), key=lambda path: path.stat().st_mtime, reverse=True)
-    return matches[0] if matches else None
+    for checkpoint_path in matches:
+        if is_checkpoint_readable(checkpoint_path):
+            return checkpoint_path
+    return None
 
 
 def resolve_checkpoint_path(path: str | Path | None, *, search_root: str | Path = "surrogate_formal") -> Path | None:
@@ -3234,14 +3326,14 @@ if __name__ == "__main__":
     # train        : 从头训练并保存 checkpoint。
     # resume_train : 读取 checkpoint 后继续训练；CHECKPOINT_TO_LOAD=None 时自动找 surrogate_formal 下最新模型。
     # deploy       : 读取 checkpoint 直接部署/后处理；不会再训练。
-    WORKFLOW_ACTION = "train"
+    WORKFLOW_ACTION = "resume_train"
     TRAINING_MODE = "mixed"  # mixed / data_only / physics_only
-    CHECKPOINT_TO_LOAD = None  #  str|Path|None 也可以写成 "latest" 或某个 surrogate_checkpoint.pt
+    CHECKPOINT_TO_LOAD = "latest"  #  str|Path|None 或某个 surrogate_checkpoint.pt
 
     seed_everything(42)
     simulation_folders = [
         Path("../BladeOptimizerLFR/CQ_20260514_115826_SIMULATION"),
-        Path("../BladeOptimizerLFR/CQ_20260519_160122_S01"),
+        # Path("../BladeOptimizerLFR/CQ_20260519_160122_S01"),
         # 后续多叶片数据集继续追加同构文件夹：UI中需要允许用户添加
     ]
 
@@ -3288,7 +3380,7 @@ if __name__ == "__main__":
         "pressure_data_reference": "absolute",
     }
     training_config = {
-        "epochs": 4000,  # train=总训练轮数；resume_train=本次追加轮数；deploy 会自动置 0。
+        "epochs": 5000,  # train=总训练轮数；resume_train=本次追加轮数；deploy 会自动置 0。
         "print_interval": 1,
         "checkpoint_interval": 50,  # 长训练时每隔若干 epoch 保存一次，异常/手动中断也会保存。
         "prefer_existing_run_checkpoint": True,  # 同一输出目录已有 checkpoint 时，resume_train 优先接着它跑。
@@ -3300,7 +3392,7 @@ if __name__ == "__main__":
         "physics_discretization": "fvm_rhie_chow",
         "rhie_chow_strength": 0.35,
         "momentum_diagonal_floor": 1.0,
-        "convection_interpolation": "upwind",    # central (2nd ordered) | upwind (1st ordered)
+        "convection_interpolation": "upwind2",   # central | upwind (1st order) | upwind2 (2nd order)
         "use_kkt_projection": False,
         "kkt_projection_iters": 24,
         "kkt_projection_strength": 0.35,
@@ -3379,8 +3471,17 @@ if __name__ == "__main__":
 
     naming_model_config = dict(model_config)
     if checkpoint_to_load is not None:
-        checkpoint_payload_for_name = torch.load(str(checkpoint_to_load), map_location="cpu")
-        naming_model_config.update(dict(checkpoint_payload_for_name.get("model_config", {})))
+        try:
+            checkpoint_payload_for_name = load_checkpoint_payload(checkpoint_to_load, map_location="cpu")
+        except RuntimeError as exc:
+            if WORKFLOW_ACTION == "train":
+                print(f"Warning: ignoring unreadable checkpoint for fresh training: {checkpoint_to_load}\n  {exc}")
+                checkpoint_to_load = None
+                checkpoint_payload_for_name = None
+            else:
+                raise
+        if checkpoint_payload_for_name is not None:
+            naming_model_config.update(dict(checkpoint_payload_for_name.get("model_config", {})))
         if WORKFLOW_ACTION == "resume_train":
             # 架构信息可沿用 checkpoint；续训显式选择的压力策略必须以主程序配置为准。
             for key in (
@@ -3407,7 +3508,8 @@ if __name__ == "__main__":
         and bool(training_config.get("prefer_existing_run_checkpoint", True))
         and checkpoint_path.exists()
     ):
-        checkpoint_to_load = checkpoint_path
+        if is_checkpoint_readable(checkpoint_path):
+            checkpoint_to_load = checkpoint_path
 
     print(f"\n========== Surrogate formal workflow: {WORKFLOW_ACTION} / {TRAINING_MODE} ==========")
     print(f"输出目录: {save_dir}")

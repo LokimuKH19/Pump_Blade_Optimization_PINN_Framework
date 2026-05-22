@@ -56,6 +56,23 @@ THEME_CFG = {
         "border": "#D0D7DE",
     },
 }
+CONVECTION_OPTIONS = ["upwind2", "upwind", "central"]
+CONVECTION_ALIASES = {
+    "central": "central",
+    "centered": "central",
+    "upwind": "upwind",
+    "upwind1": "upwind",
+    "first_order_upwind": "upwind",
+    "1st_order_upwind": "upwind",
+    "upwind2": "upwind2",
+    "second_order_upwind": "upwind2",
+    "2nd_order_upwind": "upwind2",
+}
+
+
+def normalize_convection_interpolation(value: Any, default: str = "upwind2") -> str:
+    key = str(value if value is not None else default).strip().lower().replace("-", "_").replace(" ", "_")
+    return CONVECTION_ALIASES.get(key, default)
 
 
 def apply_theme(theme: str) -> None:
@@ -187,7 +204,7 @@ def default_config() -> dict[str, Any]:
             "physics_discretization": "fvm_rhie_chow",
             "rhie_chow_strength": 0.35,
             "momentum_diagonal_floor": 1.0,
-            "convection_interpolation": "upwind",
+            "convection_interpolation": "upwind2",
             "use_kkt_projection": False,
             "kkt_projection_iters": 24,
             "kkt_projection_strength": 0.35,
@@ -675,10 +692,16 @@ def render_training_tab(config: dict[str, Any]) -> None:
             index=["fvm_rhie_chow", "centered"].index(training.get("physics_discretization", "fvm_rhie_chow")),
         )
     with col2:
+        convection_value = normalize_convection_interpolation(training.get("convection_interpolation", "upwind2"))
         training["convection_interpolation"] = st.selectbox(
             "Convection",
-            ["upwind", "central"],
-            index=["upwind", "central"].index(training.get("convection_interpolation", "upwind")),
+            CONVECTION_OPTIONS,
+            index=CONVECTION_OPTIONS.index(convection_value),
+            format_func=lambda value: {
+                "upwind2": "upwind2 (2nd order)",
+                "upwind": "upwind (1st order)",
+                "central": "central",
+            }.get(value, value),
         )
     with col3:
         training["rhie_chow_strength"] = st.number_input("Rhie-Chow", min_value=0.0, max_value=5.0, value=float(training.get("rhie_chow_strength", 0.35)), step=0.05)
