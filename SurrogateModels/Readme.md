@@ -78,3 +78,7 @@ Updated an UI of the main process in `SurrogateModeling.py`
 
 ### May 19th, 2026
 Aligned the definition of loss curves by introducing "scaled residuals" normalized by the continuity residual to achieve FLUENT-styled semantics.
+
+### May 22nd, 2026
+Updated 2nd upwind discretion scheme.
+Fixed the problem that causes the model checkpoint *.pt file failure when the training is accidentally stopped.
