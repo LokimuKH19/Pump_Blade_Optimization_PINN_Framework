@@ -87,3 +87,4 @@ Fixed the problem that causes the model checkpoint *.pt file failure when the tr
 
 ### May 23rd, 2026
 Updated high-frequency branches towards FNO in `NeuralOperators.py`. For detailed discussion, plz check [HighFreq](https://github.com/LokimuKH19/SymPhONIC/blob/main/SIMPLE_P_Surrogate)
+Added the "best_restored" mode into the main programme to extract the best epoch during the training.
