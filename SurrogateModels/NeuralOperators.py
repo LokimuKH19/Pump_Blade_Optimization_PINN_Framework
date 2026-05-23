@@ -468,6 +468,34 @@ class HFCFNOBlock(nn.Module):
         return low + gate * (band + local) + fused
 
 
+class HFFNOBlock(nn.Module):
+    # FNO trunk plus the same gated high-frequency branches used by HF-CFNO.
+    # This isolates whether the Chebyshev path is actually needed.
+    def __init__(
+        self,
+        channels,
+        modes,
+        high_modes=4,
+        high_gate_init=-1.0,
+        use_local_highpass=True,
+    ):
+        super().__init__()
+        self.low_fno = SpectralConv2d(channels, channels, modes)
+        self.band_spectral = MultiBandSpectralConv2d(channels, channels, modes, high_modes=high_modes)
+        self.use_local_highpass = bool(use_local_highpass)
+        self.local_high = LocalHighPassBlock2d(channels) if self.use_local_highpass else None
+        self.fuse = nn.Conv2d(channels * 3, channels, 1)
+        self.high_gate = nn.Parameter(torch.tensor(float(high_gate_init)))
+
+    def forward(self, x):
+        low = self.low_fno(x)
+        band = self.band_spectral(x)
+        local = self.local_high(x) if self.local_high is not None else torch.zeros_like(band)
+        gate = torch.sigmoid(self.high_gate)
+        fused = self.fuse(torch.cat([low, band, local], dim=1))
+        return low + gate * (band + local) + fused
+
+
 # -------------------------
 # CFNO block: combine Fourier spectral conv and Chebyshev spectral conv per layer
 # -------------------------
@@ -532,6 +560,33 @@ class HFCFNOBlock3d(nn.Module):
 
     def forward(self, x):
         low = self.low_cfno(x)
+        band = self.band_spectral(x)
+        local = self.local_high(x) if self.local_high is not None else torch.zeros_like(band)
+        gate = torch.sigmoid(self.high_gate)
+        fused = self.fuse(torch.cat([low, band, local], dim=1))
+        return low + gate * (band + local) + fused
+
+
+class HFFNOBlock3d(nn.Module):
+    def __init__(
+        self,
+        channels,
+        modes,
+        high_modes=4,
+        high_gate_init=-1.0,
+        use_local_highpass=True,
+    ):
+        super().__init__()
+        high_modes = int(max(high_modes, 0))
+        self.low_fno = SpectralConv3d(channels, channels, modes)
+        self.band_spectral = SpectralConv3d(channels, channels, int(modes) + high_modes)
+        self.use_local_highpass = bool(use_local_highpass)
+        self.local_high = LocalHighPassBlock3d(channels) if self.use_local_highpass else None
+        self.fuse = nn.Conv3d(channels * 3, channels, 1)
+        self.high_gate = nn.Parameter(torch.tensor(float(high_gate_init)))
+
+    def forward(self, x):
+        low = self.low_fno(x)
         band = self.band_spectral(x)
         local = self.local_high(x) if self.local_high is not None else torch.zeros_like(band)
         gate = torch.sigmoid(self.high_gate)
@@ -710,6 +765,59 @@ class HF_CFNO2d_small(nn.Module):
         return x
 
 
+class HF_FNO2d_small(nn.Module):
+    # High-frequency enhanced FNO. Same high-frequency/filtering scaffold as
+    # HF-CFNO, but the low path is pure Fourier rather than CFNO.
+    def __init__(
+        self,
+        modes=8,
+        high_modes=None,
+        width=16,
+        depth=3,
+        input_features=1,
+        output_features=1,
+        fourier_feature_bands=(1, 2, 4, 8),
+        high_gate_init=-1.0,
+        use_local_highpass=True,
+    ):
+        super().__init__()
+        if high_modes is None:
+            high_modes = max(2, int(modes) // 2)
+        self.feature_grid = FourierFeatureGrid2d(fourier_feature_bands)
+        lifted_features = input_features + self.feature_grid.extra_channels
+        self.fc0 = nn.Linear(lifted_features, width)
+        self.blocks = nn.ModuleList(
+            [
+                HFFNOBlock(
+                    width,
+                    modes=modes,
+                    high_modes=high_modes,
+                    high_gate_init=high_gate_init,
+                    use_local_highpass=use_local_highpass,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.wconvs = nn.ModuleList([nn.Conv2d(width, width, 1) for _ in range(depth)])
+        hidden = max(64, width * 2)
+        self.fc1 = nn.Linear(width, hidden)
+        self.fc2 = nn.Linear(hidden, output_features)
+
+    def forward(self, x):
+        x = self.feature_grid(x)
+        x = x.permute(0, 2, 3, 1)
+        x = self.fc0(x)
+        x = x.permute(0, 3, 1, 2)
+        for blk, w in zip(self.blocks, self.wconvs):
+            y = blk(x)
+            x = F.gelu(y + w(x))
+        x = x.permute(0, 2, 3, 1)
+        x = F.gelu(self.fc1(x))
+        x = self.fc2(x)
+        x = x.permute(0, 3, 1, 2)
+        return x
+
+
 class FNO3d_small(nn.Module):
     def __init__(self, modes=8, width=16, depth=3, input_features=1, output_features=1):
         super().__init__()
@@ -819,6 +927,56 @@ class HF_CFNO3d_small(nn.Module):
                     cheb_modes=cheb_modes,
                     high_modes=high_modes,
                     alpha_init=alpha_init,
+                    high_gate_init=high_gate_init,
+                    use_local_highpass=use_local_highpass,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.wconvs = nn.ModuleList([nn.Conv3d(width, width, 1) for _ in range(depth)])
+        hidden = max(64, width * 2)
+        self.fc1 = nn.Linear(width, hidden)
+        self.fc2 = nn.Linear(hidden, output_features)
+
+    def forward(self, x):
+        x = self.feature_grid(x)
+        x = x.permute(0, 2, 3, 4, 1)
+        x = self.fc0(x)
+        x = x.permute(0, 4, 1, 2, 3)
+        for blk, w in zip(self.blocks, self.wconvs):
+            y = blk(x)
+            x = F.gelu(y + w(x))
+        x = x.permute(0, 2, 3, 4, 1)
+        x = F.gelu(self.fc1(x))
+        x = self.fc2(x)
+        return x.permute(0, 4, 1, 2, 3)
+
+
+class HF_FNO3d_small(nn.Module):
+    def __init__(
+        self,
+        modes=8,
+        high_modes=None,
+        width=16,
+        depth=3,
+        input_features=1,
+        output_features=1,
+        fourier_feature_bands=(1, 2, 4, 8),
+        high_gate_init=-1.0,
+        use_local_highpass=True,
+    ):
+        super().__init__()
+        if high_modes is None:
+            high_modes = max(2, int(modes) // 2)
+        self.feature_grid = FourierFeatureGrid3d(fourier_feature_bands)
+        lifted_features = input_features + self.feature_grid.extra_channels
+        self.fc0 = nn.Linear(lifted_features, width)
+        self.blocks = nn.ModuleList(
+            [
+                HFFNOBlock3d(
+                    width,
+                    modes=modes,
+                    high_modes=high_modes,
                     high_gate_init=high_gate_init,
                     use_local_highpass=use_local_highpass,
                 )

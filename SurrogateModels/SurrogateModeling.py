@@ -357,6 +357,18 @@ class SliceWiseFNOFlowModel(nn.Module):
                 input_features=input_channels,
                 output_features=4,
             )
+        elif self.operator_variant in {"hf_fno", "high_frequency_fno"}:
+            self.core = NeuralOperators.HF_FNO2d_small(
+                modes=modes,
+                high_modes=high_modes,
+                width=width,
+                depth=depth,
+                input_features=input_channels,
+                output_features=4,
+                fourier_feature_bands=tuple(int(v) for v in fourier_feature_bands),
+                high_gate_init=hf_high_gate_init,
+                use_local_highpass=hf_use_local_highpass,
+            )
         elif self.operator_variant in {"cno", "legacy_cno"}:
             self.core = NeuralOperators.CNO2d_small(
                 cheb_modes=(modes, modes),
@@ -405,6 +417,19 @@ class SliceWiseFNOFlowModel(nn.Module):
                 input_features=input_channels,
                 output_features=4,
             )
+        elif self.operator_variant in {"hf_fno3d", "hf_fno_3d", "high_frequency_fno3d", "3d_hf_fno"}:
+            self.is_3d_operator = True
+            self.core = NeuralOperators.HF_FNO3d_small(
+                modes=modes,
+                high_modes=high_modes,
+                width=width,
+                depth=depth,
+                input_features=input_channels,
+                output_features=4,
+                fourier_feature_bands=tuple(int(v) for v in fourier_feature_bands),
+                high_gate_init=hf_high_gate_init,
+                use_local_highpass=hf_use_local_highpass,
+            )
         elif self.operator_variant in {"cno3d", "cno_3d", "3d_cno"}:
             self.is_3d_operator = True
             self.core = NeuralOperators.CNO3d_small(
@@ -451,8 +476,8 @@ class SliceWiseFNOFlowModel(nn.Module):
         else:
             raise ValueError(
                 "operator_variant must be one of: "
-                "'fno', 'cno', 'wno', 'cfno', 'hf_cfno', "
-                "'fno3d', 'cno3d', 'wno3d', 'cfno3d', 'hf_cfno3d'."
+                "'fno', 'hf_fno', 'cno', 'wno', 'cfno', 'hf_cfno', "
+                "'fno3d', 'hf_fno3d', 'cno3d', 'wno3d', 'cfno3d', 'hf_cfno3d'."
             )
 
     @staticmethod
@@ -3326,9 +3351,9 @@ if __name__ == "__main__":
     # train        : 从头训练并保存 checkpoint。
     # resume_train : 读取 checkpoint 后继续训练；CHECKPOINT_TO_LOAD=None 时自动找 surrogate_formal 下最新模型。
     # deploy       : 读取 checkpoint 直接部署/后处理；不会再训练。
-    WORKFLOW_ACTION = "resume_train"
+    WORKFLOW_ACTION = "train"
     TRAINING_MODE = "mixed"  # mixed / data_only / physics_only
-    CHECKPOINT_TO_LOAD = "latest"  #  str|Path|None 或某个 surrogate_checkpoint.pt
+    CHECKPOINT_TO_LOAD = None  # str|Path|None 或某个 surrogate_checkpoint.pt
 
     seed_everything(42)
     simulation_folders = [
@@ -3358,7 +3383,7 @@ if __name__ == "__main__":
         "interpolation_chunk_size": 250_000,
     }
     model_config = {
-        "operator_variant": "cfno",
+        "operator_variant": "hf_cfno",
         "input_mode": "both",
         "modes": 8,
         "high_modes": 16,
@@ -3380,7 +3405,7 @@ if __name__ == "__main__":
         "pressure_data_reference": "absolute",
     }
     training_config = {
-        "epochs": 5000,  # train=总训练轮数；resume_train=本次追加轮数；deploy 会自动置 0。
+        "epochs": 500,  # train=总训练轮数；resume_train=本次追加轮数；deploy 会自动置 0。
         "print_interval": 1,
         "checkpoint_interval": 50,  # 长训练时每隔若干 epoch 保存一次，异常/手动中断也会保存。
         "prefer_existing_run_checkpoint": True,  # 同一输出目录已有 checkpoint 时，resume_train 优先接着它跑。
@@ -3529,8 +3554,8 @@ if __name__ == "__main__":
     post_config = {
         "spans": (0.4, 0.6),
         "show_matplotlib": False,
-        "show_pyvista_window": True,
-        "plot_3d": True,
+        "show_pyvista_window": False,
+        "plot_3d": False,
         "history_plot_mode": "all",  # all saves separate raw / scaled_loss / scaled_residual plots.
         "passages_to_plot_3d": None,  # None=先算单流道，再复制到全部 n_blade 个周期。
         "cfd_pressure_reference": "absolute",

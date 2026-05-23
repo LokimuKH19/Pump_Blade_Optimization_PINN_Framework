@@ -177,7 +177,7 @@ def default_config() -> dict[str, Any]:
             "interpolation_chunk_size": 250_000,
         },
         "model_config": {
-            "operator_variant": "fno3d",
+            "operator_variant": "hf_cfno",
             "input_mode": "both",
             "modes": 8,
             "high_modes": 16,
@@ -193,7 +193,7 @@ def default_config() -> dict[str, Any]:
             "pressure_data_reference": "absolute",
         },
         "training_config": {
-            "epochs": 4000,
+            "epochs": 500,
             "print_interval": 1,
             "checkpoint_interval": 50,
             "prefer_existing_run_checkpoint": True,
@@ -221,8 +221,8 @@ def default_config() -> dict[str, Any]:
         "post_config": {
             "spans": [0.4, 0.6],
             "show_matplotlib": False,
-            "show_pyvista_window": True,
-            "plot_3d": True,
+            "show_pyvista_window": False,
+            "plot_3d": False,
             "history_plot_mode": "all",
             "passages_to_plot_3d": None,
             "cfd_pressure_reference": "absolute",
@@ -585,13 +585,26 @@ def render_model_tab(config: dict[str, Any]) -> None:
         )
 
     st.subheader("Operator")
-    variants = ["fno", "cno", "wno", "cfno", "hf_cfno", "fno3d", "cno3d", "wno3d", "cfno3d", "hf_cfno3d"]
+    variants = [
+        "fno",
+        "hf_fno",
+        "cno",
+        "wno",
+        "cfno",
+        "hf_cfno",
+        "fno3d",
+        "hf_fno3d",
+        "cno3d",
+        "wno3d",
+        "cfno3d",
+        "hf_cfno3d",
+    ]
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         model["operator_variant"] = st.selectbox(
             "Operator",
             variants,
-            index=variants.index(model.get("operator_variant", "fno3d")) if model.get("operator_variant", "fno3d") in variants else 5,
+            index=variants.index(model.get("operator_variant", "hf_cfno")) if model.get("operator_variant", "hf_cfno") in variants else variants.index("hf_cfno"),
         )
     with col2:
         model["input_mode"] = st.selectbox("Input", ["both", "mask", "phi"], index=["both", "mask", "phi"].index(model.get("input_mode", "both")))
@@ -664,7 +677,7 @@ def render_training_tab(config: dict[str, Any]) -> None:
             "Epochs",
             min_value=0,
             max_value=200_000,
-            value=0 if action == "deploy" else int(training.get("epochs", 4000)),
+            value=0 if action == "deploy" else int(training.get("epochs", 500)),
             step=10,
             disabled=action == "deploy",
         )
@@ -774,8 +787,8 @@ def render_post_tab(config: dict[str, Any]) -> None:
         )
 
     post["show_matplotlib"] = st.checkbox("Show Matplotlib windows", value=bool(post.get("show_matplotlib", False)))
-    post["show_pyvista_window"] = st.checkbox("Show PyVista window", value=bool(post.get("show_pyvista_window", True)))
-    post["plot_3d"] = st.checkbox("Generate 3D streamlines", value=bool(post.get("plot_3d", True)))
+    post["show_pyvista_window"] = st.checkbox("Show PyVista window", value=bool(post.get("show_pyvista_window", False)))
+    post["plot_3d"] = st.checkbox("Generate 3D streamlines", value=bool(post.get("plot_3d", False)))
     passages_enabled = st.checkbox("Limit copied passages", value=post.get("passages_to_plot_3d") is not None)
     post["passages_to_plot_3d"] = parse_optional_int(
         st.number_input("Passages to plot", min_value=1, max_value=128, value=int(post.get("passages_to_plot_3d") or 1), step=1),
@@ -798,7 +811,7 @@ def main() -> None:
     summary_cols[0].metric("Workflow", config["workflow_action"])
     summary_cols[1].metric("Mode", config["training_mode"])
     summary_cols[2].metric("Grid n", config["data_config"].get("n", 64))
-    summary_cols[3].metric("Operator", config["model_config"].get("operator_variant", "fno3d"))
+    summary_cols[3].metric("Operator", config["model_config"].get("operator_variant", "hf_cfno"))
 
     tabs = st.tabs(["Cases", "Physics", "Model", "Training", "Post", "Launch"])
     with tabs[0]:
