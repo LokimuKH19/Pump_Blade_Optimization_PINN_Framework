@@ -2603,6 +2603,43 @@ class SurrogateModeling:
         history_prefix_list = list(history_prefix or [])
         checkpoint_interval = int(max(checkpoint_interval, 0))
         continuity_loss_scale = self._history_continuity_loss_scale(history_prefix_list)
+        best_metric = float("inf")
+        best_epoch: int | None = None
+        best_model_state: dict[str, torch.Tensor] | None = None
+        best_ibm_state: dict[str, torch.Tensor] | None = None
+        best_optimizer_state: dict[str, Any] | None = None
+
+        def clone_tensor_tree_to_cpu(value: Any) -> Any:
+            if torch.is_tensor(value):
+                return value.detach().cpu().clone()
+            if isinstance(value, dict):
+                return {key: clone_tensor_tree_to_cpu(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [clone_tensor_tree_to_cpu(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(clone_tensor_tree_to_cpu(item) for item in value)
+            return value
+
+        def remember_best(epoch_number: int, metric: float) -> None:
+            nonlocal best_metric, best_epoch, best_model_state, best_ibm_state, best_optimizer_state
+            best_metric = float(metric)
+            best_epoch = int(epoch_number)
+            best_model_state = clone_tensor_tree_to_cpu(self.model.state_dict())
+            best_ibm_state = (
+                clone_tensor_tree_to_cpu(self.ibm_mask_controller.state_dict())
+                if self.ibm_mask_controller is not None
+                else None
+            )
+            best_optimizer_state = clone_tensor_tree_to_cpu(self.optimizer.state_dict())
+
+        def restore_best() -> None:
+            if best_model_state is None:
+                return
+            self.model.load_state_dict(best_model_state)
+            if self.ibm_mask_controller is not None and best_ibm_state is not None:
+                self.ibm_mask_controller.load_state_dict(best_ibm_state)
+            if best_optimizer_state is not None:
+                self.optimizer.load_state_dict(best_optimizer_state)
 
         def save_progress(reason: str) -> None:
             if checkpoint_path is None:
@@ -2612,6 +2649,9 @@ class SurrogateModeling:
                 "checkpoint_reason": reason,
                 "completed_new_epochs": len(history),
                 "start_epoch": int(start_epoch),
+                "best_epoch": best_epoch,
+                "best_val_loss_total": best_metric if np.isfinite(best_metric) else None,
+                "restored_best_state": reason in {"completed_best_state", "keyboard_interrupt_best_state"},
                 **dict(checkpoint_metadata or {}),
             }
             self.save_checkpoint(checkpoint_path, history=combined_history, extra_metadata=metadata)
@@ -2642,6 +2682,9 @@ class SurrogateModeling:
                 for key, value in val_log.items():
                     record[f"val_{key}"] = value
                 history.append(record)
+                val_metric = float(val_log.get("loss_total", float("inf")))
+                if np.isfinite(val_metric) and val_metric < best_metric:
+                    remember_best(epoch + 1, val_metric)
 
                 if local_epoch == 0 or (local_epoch + 1) % print_interval == 0:
                     print(
@@ -2668,13 +2711,18 @@ class SurrogateModeling:
                     save_progress("periodic")
         except KeyboardInterrupt:
             print("\n训练被中断，正在保存当前进度。")
+            restore_best()
+            save_progress("keyboard_interrupt_best_state")
             save_progress("keyboard_interrupt")
             raise
         except BaseException:
             save_progress("exception")
             raise
 
-        save_progress("completed")
+        restore_best()
+        if best_epoch is not None:
+            print(f"Restored best state from epoch {best_epoch} with val_loss_total={best_metric:.6e}.")
+        save_progress("completed_best_state")
 
         return history
 
