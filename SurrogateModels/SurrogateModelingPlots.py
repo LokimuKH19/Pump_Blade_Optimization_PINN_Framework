@@ -348,18 +348,31 @@ def plot_training_history(
     has_supervised_target = any(sample["has_target"].item() > 0.5 for sample in self.train_dataset.samples)
     epochs = np.arange(1, len(history) + 1, dtype=float)
 
-    def first_continuity_loss_scale() -> float | None:
-        for item in history:
-            for key in ("train_scaled_loss_reference", "train_loss_c"):
-                value = item.get(key)
-                if value is None:
-                    continue
-                value = float(value)
-                if np.isfinite(value) and value > 0.0:
-                    return value
-        return None
+    def display_loss_scale() -> float | None:
+        residual_reference = None
 
-    continuity_loss_scale = first_continuity_loss_scale()
+        def update_candidate(value: Any, *, is_loss: bool = False) -> None:
+            nonlocal residual_reference
+            if value is None:
+                return
+            value = float(value)
+            if not (np.isfinite(value) and value > 0.0):
+                return
+            candidate = float(np.sqrt(value)) if is_loss else value
+            residual_reference = (
+                candidate
+                if residual_reference is None
+                else max(float(residual_reference), candidate)
+            )
+
+        for item in history:
+            for key in ("train_scaled_residual_reference", "val_scaled_residual_reference", "scaled_residual_reference"):
+                update_candidate(item.get(key))
+            for key in ("train_scaled_loss_reference", "val_scaled_loss_reference", "scaled_loss_reference"):
+                update_candidate(item.get(key), is_loss=True)
+        return None if residual_reference is None else float(residual_reference) ** 2
+
+    continuity_loss_scale = display_loss_scale()
     mode = str(history_plot_mode).lower()
     mode_aliases = {
         "loss": "raw",

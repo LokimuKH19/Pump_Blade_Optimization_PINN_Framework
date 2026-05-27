@@ -2519,24 +2519,56 @@ class SurrogateModeling:
 
         return {key: value / max(count, 1) for key, value in logs.items()}
 
-    @staticmethod
-    def _history_continuity_loss_scale(history: Sequence[Mapping[str, float]]) -> float | None:
-        for record in history:
-            value = record.get("train_loss_c")
+    _DISPLAY_NORMALIZATION_LOSS_KEYS = ("loss_c", "loss_r", "loss_theta", "loss_z", "loss_data")
+
+    @classmethod
+    def _display_residual_reference_from_log(cls, log: Mapping[str, float]) -> float | None:
+        candidates: list[float] = []
+        for key in cls._DISPLAY_NORMALIZATION_LOSS_KEYS:
+            value = log.get(key)
             if value is None:
                 continue
             try:
-                value = float(value)
+                loss_value = max(float(value), 0.0)
             except (TypeError, ValueError):
                 continue
-            if np.isfinite(value) and value > 0.0:
-                return value
-        return None
+            if np.isfinite(loss_value):
+                candidates.append(float(np.sqrt(loss_value)))
+        return max(candidates) if candidates else None
 
     @staticmethod
-    def _add_display_scaled_logs(log: dict[str, float], continuity_loss_scale: float) -> None:
-        scale = max(float(continuity_loss_scale), 1e-30)
-        rmse_scale = float(np.sqrt(scale))
+    def _history_display_residual_reference(history: Sequence[Mapping[str, float]]) -> float | None:
+        reference: float | None = None
+
+        def update_candidate(value: Any, *, is_loss: bool = False) -> None:
+            nonlocal reference
+            if value is None:
+                return
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return
+            if not (np.isfinite(numeric) and numeric > 0.0):
+                return
+            candidate = float(np.sqrt(numeric)) if is_loss else numeric
+            reference = candidate if reference is None else max(reference, candidate)
+
+        for record in history:
+            for key in ("train_scaled_residual_reference", "val_scaled_residual_reference", "scaled_residual_reference"):
+                update_candidate(record.get(key))
+            for key in ("train_scaled_loss_reference", "val_scaled_loss_reference", "scaled_loss_reference"):
+                update_candidate(record.get(key), is_loss=True)
+        return reference
+
+    def _initial_display_residual_reference(self, epoch: int) -> float | None:
+        # Treat the untrained model as epoch 0 for the Fluent-style display scale.
+        initial_log = self.run_epoch(self.train_loader, epoch, False)
+        return self._display_residual_reference_from_log(initial_log)
+
+    @staticmethod
+    def _add_display_scaled_logs(log: dict[str, float], residual_reference: float) -> None:
+        rmse_scale = max(float(residual_reference), 1e-15)
+        scale = rmse_scale ** 2
         log["scaled_loss_reference"] = scale
         log["scaled_residual_reference"] = rmse_scale
 
@@ -2602,7 +2634,14 @@ class SurrogateModeling:
         history: list[dict[str, float]] = []
         history_prefix_list = list(history_prefix or [])
         checkpoint_interval = int(max(checkpoint_interval, 0))
-        continuity_loss_scale = self._history_continuity_loss_scale(history_prefix_list)
+        residual_reference = self._history_display_residual_reference(history_prefix_list)
+        if residual_reference is None:
+            residual_reference = self._initial_display_residual_reference(int(start_epoch))
+            if residual_reference is not None:
+                print(
+                    "Fluent-style residual normalization epoch 0 reference: "
+                    f"{residual_reference:.6e}"
+                )
         best_metric = float("inf")
         best_epoch: int | None = None
         best_model_state: dict[str, torch.Tensor] | None = None
@@ -2668,13 +2707,17 @@ class SurrogateModeling:
                 epoch = int(start_epoch) + local_epoch
                 train_log = self.run_epoch(self.train_loader, epoch, True)
                 val_log = self.run_epoch(self.val_loader, epoch, False)
-                if continuity_loss_scale is None:
-                    continuity_loss_scale = self._history_continuity_loss_scale(
-                        [{"train_loss_c": train_log.get("loss_c", float("nan"))}]
-                    )
-                if continuity_loss_scale is not None:
-                    self._add_display_scaled_logs(train_log, continuity_loss_scale)
-                    self._add_display_scaled_logs(val_log, continuity_loss_scale)
+                if epoch < 5:
+                    candidate_reference = self._display_residual_reference_from_log(train_log)
+                    if candidate_reference is not None:
+                        residual_reference = (
+                            candidate_reference
+                            if residual_reference is None
+                            else max(residual_reference, candidate_reference)
+                        )
+                if residual_reference is not None:
+                    self._add_display_scaled_logs(train_log, residual_reference)
+                    self._add_display_scaled_logs(val_log, residual_reference)
 
                 record: dict[str, float] = {}
                 for key, value in train_log.items():
@@ -2696,6 +2739,7 @@ class SurrogateModeling:
                         f"train_scaled_loss_c={train_log.get('scaled_loss_c', float('nan')):.6e} | "
                         f"train_scaled_res_c={train_log.get('scaled_residual_c', float('nan')):.6e} | "
                         f"train_scaled_res_mom={train_log.get('scaled_residual_momentum', float('nan')):.6e} | "
+                        f"res_norm_ref={train_log.get('scaled_residual_reference', float('nan')):.6e} | "
                         f"train_ibm_C={train_log['ibm_C']:.6g} | "
                         f"train_ibm_eps={train_log['ibm_epsilon']:.6g} | "
                         f"train_bc_periodic={train_log['loss_bc_periodic']:.6e} | "
