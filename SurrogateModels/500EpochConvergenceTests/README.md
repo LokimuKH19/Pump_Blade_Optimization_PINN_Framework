@@ -12,6 +12,8 @@ This section summarizes five 500-epoch mixed-training experiments under the same
 | `500EpochHF-FNO-1567458Paras-BESTSTATE` | HF-FNO | 8 | 16 | 17 | 6 | 1,567,458 | Best validation-loss state restored |
 | `500EpochHF-CFNO-1490160Paras` | HF-CFNO | 8 | 16 | 16 | 6 | 1,490,160 | High-frequency CFNO reference |
 
+Note that though the HF-Branch is only applied in the width direction, demonstrating satisfying enough results.
+
 The real-valued parameter equivalent counts each complex-valued spectral parameter as two real degrees of freedom.
 
 ### 2. Main Quantitative Results
