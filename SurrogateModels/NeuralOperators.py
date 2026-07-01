@@ -309,9 +309,25 @@ class MultiBandSpectralConv2d(nn.Module):
             self.weights_high_neg = nn.Parameter(
                 scale * torch.randn(in_channels, out_channels, self.low_modes, self.high_modes, dtype=torch.cfloat)
             )
+            self.weights_high_y_pos = nn.Parameter(
+                scale * torch.randn(in_channels, out_channels, self.high_modes, self.low_modes, dtype=torch.cfloat)
+            )
+            self.weights_high_y_neg = nn.Parameter(
+                scale * torch.randn(in_channels, out_channels, self.high_modes, self.low_modes, dtype=torch.cfloat)
+            )
+            self.weights_high_xy_pos = nn.Parameter(
+                scale * torch.randn(in_channels, out_channels, self.high_modes, self.high_modes, dtype=torch.cfloat)
+            )
+            self.weights_high_xy_neg = nn.Parameter(
+                scale * torch.randn(in_channels, out_channels, self.high_modes, self.high_modes, dtype=torch.cfloat)
+            )
         else:
             self.register_parameter("weights_high_pos", None)
             self.register_parameter("weights_high_neg", None)
+            self.register_parameter("weights_high_y_pos", None)
+            self.register_parameter("weights_high_y_neg", None)
+            self.register_parameter("weights_high_xy_pos", None)
+            self.register_parameter("weights_high_xy_neg", None)
 
     def compl_mul2d(self, input, weights):
         return torch.einsum("bixy,ioxy->boxy", input, weights)
@@ -324,19 +340,25 @@ class MultiBandSpectralConv2d(nn.Module):
 
         mh = min(self.low_modes, H)
         mw = min(self.low_modes, freq_w)
-        out_ft[:, :, :mh, :mw] = self.compl_mul2d(
-            x_ft[:, :, :mh, :mw],
-            self.weights_low_pos[:, :, :mh, :mw],
-        )
-        if mh > 0:
+        if mh > 0 and mw > 0:
+            out_ft[:, :, :mh, :mw] = self.compl_mul2d(
+                x_ft[:, :, :mh, :mw],
+                self.weights_low_pos[:, :, :mh, :mw],
+            )
             out_ft[:, :, -mh:, :mw] = self.compl_mul2d(
                 x_ft[:, :, -mh:, :mw],
                 self.weights_low_neg[:, :, :mh, :mw],
             )
 
-        high_available = max(freq_w - mw, 0)
-        hw = min(self.high_modes, high_available)
-        if hw > 0:
+        x_high_available = max(freq_w - mw, 0)
+        hw = min(self.high_modes, x_high_available)
+        y_pos_end = H // 2 + 1
+        y_neg_start = H // 2 + 1
+        y_pos_available = max(y_pos_end - mh, 0)
+        y_neg_available = max((H - mh) - y_neg_start, 0)
+        hy = min(self.high_modes, y_pos_available, y_neg_available)
+
+        if mh > 0 and hw > 0:
             out_ft[:, :, :mh, -hw:] = out_ft[:, :, :mh, -hw:] + self.compl_mul2d(
                 x_ft[:, :, :mh, -hw:],
                 self.weights_high_pos[:, :, :mh, :hw],
@@ -345,6 +367,27 @@ class MultiBandSpectralConv2d(nn.Module):
                 x_ft[:, :, -mh:, -hw:],
                 self.weights_high_neg[:, :, :mh, :hw],
             )
+        if hy > 0:
+            y_pos_start = y_pos_end - hy
+            y_neg_end = y_neg_start + hy
+            if mw > 0:
+                out_ft[:, :, y_pos_start:y_pos_end, :mw] = out_ft[:, :, y_pos_start:y_pos_end, :mw] + self.compl_mul2d(
+                    x_ft[:, :, y_pos_start:y_pos_end, :mw],
+                    self.weights_high_y_pos[:, :, :hy, :mw],
+                )
+                out_ft[:, :, y_neg_start:y_neg_end, :mw] = out_ft[:, :, y_neg_start:y_neg_end, :mw] + self.compl_mul2d(
+                    x_ft[:, :, y_neg_start:y_neg_end, :mw],
+                    self.weights_high_y_neg[:, :, :hy, :mw],
+                )
+            if hw > 0:
+                out_ft[:, :, y_pos_start:y_pos_end, -hw:] = out_ft[:, :, y_pos_start:y_pos_end, -hw:] + self.compl_mul2d(
+                    x_ft[:, :, y_pos_start:y_pos_end, -hw:],
+                    self.weights_high_xy_pos[:, :, :hy, :hw],
+                )
+                out_ft[:, :, y_neg_start:y_neg_end, -hw:] = out_ft[:, :, y_neg_start:y_neg_end, -hw:] + self.compl_mul2d(
+                    x_ft[:, :, y_neg_start:y_neg_end, -hw:],
+                    self.weights_high_xy_neg[:, :, :hy, :hw],
+                )
 
         return torch.fft.irfft2(out_ft, s=(H, W), norm="forward")
 
