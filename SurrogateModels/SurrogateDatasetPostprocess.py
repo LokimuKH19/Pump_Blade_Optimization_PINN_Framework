@@ -45,7 +45,7 @@ DEFAULT_GENERATOR_CASE = {
     "rs": 0.08,
     "h": 0.125,
     "z0": 0.0,
-    "mu": 0.006,
+    "mu": 0.0016,
     "rho": 10650.0,
     "omega": -420.0 * math.pi / 60.0,
     "qv": 0.16,
