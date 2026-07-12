@@ -2,6 +2,8 @@
 
 This section summarizes five 500-epoch mixed-training experiments under the same single-case setting. All experiments use a grid resolution of $n=64$, data loss weight $1.0$, physics loss weight $0.1$, and the finite-volume Rhie-Chow physics loss with second-order upwind convection.
 
+This result is generated at `rho=10650, mu=0.006` for comparison only. (In formal cases we used `mu=0.0016`)
+
 ### 1. Experimental Setup
 
 | Experiment | Actual Operator | Modes | High Modes | Width | Depth | Real-Valued Parameter Equivalent | Notes |
