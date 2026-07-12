@@ -69,6 +69,62 @@ from SurrogateModelingUtils import (
 
 FLUENT_CONTINUITY_FIRST5_DEFAULT = (1.0, 6.6045e-1, 5.3537e-1, 4.3327e-1, 3.6179e-1)
 
+_LEGACY_HF_ZERO_FILL_SUFFIXES = (
+    ".band_spectral.weights_high_y_pos",
+    ".band_spectral.weights_high_y_neg",
+    ".band_spectral.weights_high_xy_pos",
+    ".band_spectral.weights_high_xy_neg",
+)
+
+
+def prepare_model_state_dict_for_load(
+    model: nn.Module,
+    checkpoint_state: Mapping[str, torch.Tensor],
+    *,
+    checkpoint_version: int | None,
+    operator_variant: str,
+) -> tuple[dict[str, torch.Tensor], str | None]:
+    """Return a strict-loadable state dict, with one audited legacy migration.
+
+    Older 2-D HF checkpoints predate the high-y/high-xy Fourier bands now
+    present in ``MultiBandSpectralConv2d``.  Those bands enter the current
+    forward pass additively, so filling the complete set with zeros exactly
+    preserves the legacy forward calculation.  Every other incompatibility is
+    intentionally left to ``load_state_dict(strict=True)`` to reject.
+    """
+
+    saved = dict(checkpoint_state)
+    current = model.state_dict()
+    current_keys = set(current)
+    saved_keys = set(saved)
+    missing = current_keys - saved_keys
+    unexpected = saved_keys - current_keys
+    shape_mismatches = {
+        key
+        for key in current_keys & saved_keys
+        if tuple(current[key].shape) != tuple(saved[key].shape)
+    }
+
+    expected_legacy_missing = {
+        key
+        for key in current_keys
+        if key.endswith(_LEGACY_HF_ZERO_FILL_SUFFIXES)
+    }
+    can_zero_fill_legacy_hf = (
+        checkpoint_version == 5
+        and str(operator_variant).lower() in {"hf_cfno", "hf_fno"}
+        and bool(expected_legacy_missing)
+        and missing == expected_legacy_missing
+        and not unexpected
+        and not shape_mismatches
+    )
+    if can_zero_fill_legacy_hf:
+        for key in sorted(expected_legacy_missing):
+            saved[key] = torch.zeros_like(current[key])
+        return saved, "legacy_hf_directional_bands_zero_filled"
+
+    return saved, None
+
 
 def _float_sequence_from_any(value: Any) -> tuple[float, ...]:
     if value is None:
@@ -641,13 +697,6 @@ class SliceWiseFNOFlowModel(nn.Module):
 
 class AdaptiveIBMMaskController(nn.Module):
     # Current version learns span-wise profiles C(r) and epsilon(r).
-    # 这里不把 ibm_C 和 ibm_epsilon 当成完全写死的常数。
-    # 做法是：给它们一个允许范围，然后根据当前样本的几何/工况特征，
-    # 学出每个样本各自的一对“等效 IBM 过渡层参数”。
-    #
-    # 注意这里仍然保持“单个样本内空间上统一”的 C / epsilon。
-    # 也就是说，我们先从“不同流场、不同叶型可以不同”这一步做起，
-    # 不直接把它扩成空间分布场，避免把训练问题一下子搞得过硬。
     def __init__(
         self,
         *,
@@ -1616,7 +1665,6 @@ class BladeFlowPhysicsLoss(nn.Module):
 
 
 
-
 class SurrogateModeling:
     # 训练器同时支持两种模式：
     # 1. 有监督样本：数据损失 + 物理损失
@@ -1809,6 +1857,7 @@ class SurrogateModeling:
             "ibm_hidden": int(ibm_hidden),
         }
         self.checkpoint_metadata: dict[str, Any] | None = None
+        self.checkpoint_compatibility_migration: str | None = None
 
         self.physics_loss = BladeFlowPhysicsLoss(
             pressure_highpass_weight=pressure_highpass_weight,
@@ -1922,7 +1971,12 @@ class SurrogateModeling:
             f"epsilon mean/min/max={ibm_epsilon_mean:.6g}/{ibm_epsilon_min:.6g}/{ibm_epsilon_max:.6g}"
         )
         if "blade_params" in case:
-            print(f"sample_blade_params   : {case['blade_params']}")
+            blade_params_value = case["blade_params"]
+            if isinstance(blade_params_value, Mapping):
+                layer_count = len(blade_params_value.get("blade_layers", []))
+                print(f"sample_blade_params   : <inline mapping, {layer_count} layers>")
+            else:
+                print(f"sample_blade_params   : {blade_params_value}")
         print("===============================================\n")
 
     def _current_ibm_params(self, batch: Mapping[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -3031,7 +3085,18 @@ class SurrogateModeling:
     ) -> dict[str, Any]:
         path = Path(path)
         payload = load_checkpoint_payload(path, map_location=self.device)
-        self.model.load_state_dict(payload["model_state_dict"])
+        model_state, compatibility_migration = prepare_model_state_dict_for_load(
+            self.model,
+            payload["model_state_dict"],
+            checkpoint_version=payload.get("checkpoint_version"),
+            operator_variant=str(self.model_config.get("operator_variant", "")),
+        )
+        self.model.load_state_dict(model_state, strict=True)
+        if compatibility_migration is not None:
+            print(
+                "Checkpoint compatibility migration applied: "
+                f"{compatibility_migration}. Original file was not modified."
+            )
         ibm_state = payload.get("ibm_mask_controller_state_dict")
         if self.ibm_mask_controller is not None and ibm_state is not None:
             try:
@@ -3054,6 +3119,7 @@ class SurrogateModeling:
         if "ibm_config" in payload:
             self.ibm_config = dict(payload["ibm_config"])
         self.checkpoint_metadata = payload
+        self.checkpoint_compatibility_migration = compatibility_migration
         print(f"模型 checkpoint 已读取: {path}")
         return payload
 
@@ -3450,7 +3516,8 @@ if __name__ == "__main__":
     seed_everything(42)
     simulation_folders = [
         Path("../BladeOptimizerLFR/CQ_20260514_115826_SIMULATION"),
-        # Path("../BladeOptimizerLFR/CQ_20260519_160122_S01"),
+        Path("../BladeOptimizerLFR/CQ_20260519_160122_S01"),
+        Path("../BladeOptimizerLFR/CQ_20260711_155234_S02"),
         # 后续多叶片数据集继续追加同构文件夹：UI中需要允许用户添加
     ]
 
@@ -3459,7 +3526,7 @@ if __name__ == "__main__":
     # ============================================================
     rpm = -210.0
     physics_config = {
-        "mu": 0.006,
+        "mu": 0.0016,
         "rho": 10650.0,
         "omega": float(rpm * 2.0 * np.pi / 60.0),
         "qv": 0.025,
@@ -3497,7 +3564,7 @@ if __name__ == "__main__":
         "pressure_data_reference": "absolute",
     }
     training_config = {
-        "epochs": 500,  # train=总训练轮数；resume_train=本次追加轮数；deploy 会自动置 0。
+        "epochs": 1200,  # train=总训练轮数；resume_train=本次追加轮数；deploy 会自动置 0。
         "print_interval": 1,
         "checkpoint_interval": 50,  # 长训练时每隔若干 epoch 保存一次，异常/手动中断也会保存。
         "prefer_existing_run_checkpoint": True,  # 同一输出目录已有 checkpoint 时，resume_train 优先接着它跑。
