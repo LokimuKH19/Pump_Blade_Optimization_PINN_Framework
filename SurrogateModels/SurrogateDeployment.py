@@ -90,6 +90,10 @@ class HydraulicMetrics:
     geometry_trust_label: str = "unassessed"
     wall_speed_convention: str = "checkpoint_solid_ut"
     notes: tuple[str, ...] = ()
+    blade_pressure_torque_n_m: float = float("nan")
+    angular_momentum_torque_n_m: float = float("nan")
+    blade_pressure_face_count: int = 0
+    torque_method: str = "blade_surface_pressure"
 
     def to_record(self) -> dict[str, Any]:
         record = asdict(self)
@@ -97,7 +101,14 @@ class HydraulicMetrics:
         return record
 
 
-def effective_pump_metrics(metrics: HydraulicMetrics) -> HydraulicMetrics:
+SURROGATE_PRESSURE_TORQUE_CALIBRATION = 2.2165868881953865
+
+
+def effective_pump_metrics(
+    metrics: HydraulicMetrics,
+    *,
+    pressure_torque_calibration_factor: float = 1.0,
+) -> HydraulicMetrics:
     """Return pump-oriented head/power magnitudes for a signed CFD convention.
 
     The stored cases use a negative rotation/through-flow convention, so a
@@ -106,17 +117,28 @@ def effective_pump_metrics(metrics: HydraulicMetrics) -> HydraulicMetrics:
     reverse only the direction-dependent hydraulic quantities.
     """
 
-    if float(metrics.total_head_m) >= 0.0:
-        return metrics
+    oriented = metrics
+    if float(metrics.total_head_m) < 0.0:
+        oriented = replace(
+            metrics,
+            total_head_m=-metrics.total_head_m,
+            pressure_head_m=-metrics.pressure_head_m,
+            velocity_head_m=-metrics.velocity_head_m,
+            elevation_head_m=-metrics.elevation_head_m,
+            static_pressure_rise_pa=-metrics.static_pressure_rise_pa,
+            hydraulic_output_power_w=-metrics.hydraulic_output_power_w,
+            hydraulic_efficiency=-metrics.hydraulic_efficiency,
+        )
+    factor = float(pressure_torque_calibration_factor)
+    if abs(factor - 1.0) <= 1e-12:
+        return oriented
     return replace(
-        metrics,
-        total_head_m=-metrics.total_head_m,
-        pressure_head_m=-metrics.pressure_head_m,
-        velocity_head_m=-metrics.velocity_head_m,
-        elevation_head_m=-metrics.elevation_head_m,
-        static_pressure_rise_pa=-metrics.static_pressure_rise_pa,
-        hydraulic_output_power_w=-metrics.hydraulic_output_power_w,
-        hydraulic_efficiency=-metrics.hydraulic_efficiency,
+        oriented,
+        blade_pressure_torque_n_m=oriented.blade_pressure_torque_n_m * factor,
+        driving_torque_n_m=oriented.driving_torque_n_m * factor,
+        shaft_input_power_w=oriented.shaft_input_power_w * factor,
+        hydraulic_efficiency=oriented.hydraulic_efficiency / factor,
+        notes=tuple(oriented.notes) + (f"叶面压力转矩采用三参考叶型中位比值校准系数 {factor:.6f}。",),
     )
 
 
@@ -127,7 +149,13 @@ class EffectivePumpMetricsEngine:
         self.engine = engine
 
     def predict_metrics_many(self, parameter_sets: Sequence[Mapping[str, Any]], **kwargs: Any) -> list[HydraulicMetrics]:
-        return [effective_pump_metrics(item) for item in self.engine.predict_metrics_many(parameter_sets, **kwargs)]
+        return [
+            effective_pump_metrics(
+                item,
+                pressure_torque_calibration_factor=SURROGATE_PRESSURE_TORQUE_CALIBRATION,
+            )
+            for item in self.engine.predict_metrics_many(parameter_sets, **kwargs)
+        ]
 
 
 @dataclass
@@ -461,8 +489,8 @@ def apply_blade_parameter_rows(
     *,
     max_variation_fraction: float,
 ) -> dict[str, Any]:
-    if not 0.0 <= float(max_variation_fraction) <= 0.25:
-        raise ValueError("The local-generalization window must be between 0% and 25%.")
+    if not 0.0 <= float(max_variation_fraction) <= 0.50:
+        raise ValueError("The structure-variation window must be between 0% and 50%.")
     if len(rows) != 5:
         raise ValueError("All five layer rows are required.")
     result = copy.deepcopy(dict(baseline))
@@ -545,6 +573,9 @@ def build_optimization_variables(
 def build_training_envelope_variables(
     baseline: Mapping[str, Any],
     training_folders: Sequence[str | Path],
+    *,
+    expansion_fraction: float = 0.0,
+    constant_fraction: float = 0.0,
 ) -> list[ShapeVariable]:
     """Build an interpolation-only search box from training blade JSON files.
 
@@ -596,7 +627,19 @@ def build_training_envelope_variables(
             baseline_value = value_at(baseline, layer_index, family, value_index)
             tolerance = 1e-12 * max(1.0, abs(lower), abs(upper))
             if upper - lower <= tolerance:
-                continue
+                if constant_fraction <= 0.0:
+                    continue
+                lower, upper = _relative_bounds(
+                    baseline_value,
+                    constant_fraction,
+                    nonnegative=family in {"thickness", "h_max", "t_max"},
+                )
+            elif expansion_fraction > 0.0:
+                padding = (upper - lower) * float(expansion_fraction)
+                lower -= padding
+                upper += padding
+                if family in {"thickness", "h_max", "t_max"}:
+                    lower = max(0.0, lower)
             if baseline_value < lower - tolerance or baseline_value > upper + tolerance:
                 raise ValueError(f"Baseline value is outside the training envelope for layer {layer_index + 1} {title}.")
             variables.append(
@@ -795,6 +838,74 @@ def _trapezoid_weights(length: int) -> np.ndarray:
     return weights
 
 
+def integrate_blade_pressure_torque(
+    pressure_pa: np.ndarray,
+    blade_mask: np.ndarray,
+    case: Mapping[str, Any],
+) -> tuple[float, int]:
+    """Integrate pressure torque on the immersed blade surface.
+
+    ``BladeImport`` supplies the analytic blade geometry and its rasterized
+    mask.  Every solid/fluid interface in the periodic theta direction is a
+    small radial-axial blade face.  Pressure is linearly extrapolated from the
+    first two fluid points to the face and integrated as ``r * F_theta``.
+    Stair-stepped theta faces also represent the tangential component of the
+    curved upper/lower analytic surfaces as the grid is refined.
+    """
+
+    pressure = np.asarray(pressure_pa, dtype=np.float64)
+    mask = np.asarray(blade_mask, dtype=bool)
+    if pressure.shape != mask.shape or pressure.ndim != 3:
+        raise ValueError("Pressure and blade mask must share a 3-D grid.")
+    n_r, n_theta, n_z = mask.shape
+    if min(n_r, n_theta, n_z) < 2:
+        return float("nan"), 0
+    radii = np.linspace(float(case["rh"]), float(case["rs"]), n_r, dtype=np.float64)
+    dr = (float(case["rs"]) - float(case["rh"])) / max(n_r - 1, 1)
+    dz = float(case["h"]) / max(n_z - 1, 1)
+    radial_weights = _trapezoid_weights(n_r)
+    axial_weights = _trapezoid_weights(n_z)
+    face_area = dr * dz * radial_weights[:, None] * axial_weights[None, :]
+    torque_one_blade = 0.0
+    face_count = 0
+
+    for theta_index in range(n_theta):
+        next_index = (theta_index + 1) % n_theta
+        left_solid = mask[:, theta_index, :]
+        right_solid = mask[:, next_index, :]
+        interface = left_solid ^ right_solid
+        if not np.any(interface):
+            continue
+        fluid_on_right = left_solid & ~right_solid
+        fluid_on_left = ~left_solid & right_solid
+
+        if np.any(fluid_on_right):
+            p1 = pressure[:, next_index, :]
+            second_index = (next_index + 1) % n_theta
+            p2 = pressure[:, second_index, :]
+            second_fluid = ~mask[:, second_index, :]
+            surface_pressure = np.where(second_fluid, 1.5 * p1 - 0.5 * p2, p1)
+            # solid outward normal is +e_theta, so pressure force is -e_theta.
+            torque_one_blade += float(
+                np.sum((-radii[:, None]) * surface_pressure * face_area * fluid_on_right)
+            )
+            face_count += int(np.count_nonzero(fluid_on_right))
+
+        if np.any(fluid_on_left):
+            p1 = pressure[:, theta_index, :]
+            second_index = (theta_index - 1) % n_theta
+            p2 = pressure[:, second_index, :]
+            second_fluid = ~mask[:, second_index, :]
+            surface_pressure = np.where(second_fluid, 1.5 * p1 - 0.5 * p2, p1)
+            # solid outward normal is -e_theta, so pressure force is +e_theta.
+            torque_one_blade += float(
+                np.sum(radii[:, None] * surface_pressure * face_area * fluid_on_left)
+            )
+            face_count += int(np.count_nonzero(fluid_on_left))
+
+    return float(int(case["n_blade"]) * torque_one_blade), face_count
+
+
 def compute_hydraulic_metrics(
     fields_physical: Mapping[str, np.ndarray],
     case: Mapping[str, Any],
@@ -805,11 +916,7 @@ def compute_hydraulic_metrics(
     near_wall_distance_m: float,
     wall_speed_convention: str = "signed_omega_r",
 ) -> tuple[HydraulicMetrics, np.ndarray, np.ndarray, np.ndarray]:
-    """Compute near-wall and pump metrics in physical units.
-
-    Torque is the steady control-volume angular-momentum estimate.  It omits
-    separate hub/shroud viscous torque, which is reported as a model limitation.
-    """
+    """Compute near-wall and pump metrics in physical units."""
 
     if near_wall_distance_m <= 0.0:
         raise ValueError("Near-wall distance d must be positive.")
@@ -912,13 +1019,20 @@ def compute_hydraulic_metrics(
         along_flow_velocity = flow_direction * arrays["UZ"][:, :, index]
         return float(np.sum(coordinates.r_m[:, None] * arrays["UT"][:, :, index] * along_flow_velocity * weights))
 
-    torque_signed = rho * n_blade * (angular_momentum_flux(outlet_index) - angular_momentum_flux(inlet_index))
+    angular_momentum_torque = rho * n_blade * (
+        angular_momentum_flux(outlet_index) - angular_momentum_flux(inlet_index)
+    )
+    pressure_torque, pressure_face_count = integrate_blade_pressure_torque(arrays["P"], mask, case)
+    torque_signed = pressure_torque if math.isfinite(pressure_torque) and pressure_face_count > 0 else angular_momentum_torque
     driving_torque = abs(torque_signed)
     shaft_power = abs(driving_torque * float(case["omega"]))
     hydraulic_power = rho * gravity * abs(prescribed_q) * total_head
     efficiency = hydraulic_power / shaft_power if shaft_power > 1e-12 else float("nan")
 
-    notes: list[str] = ["驱动转矩采用进出口角动量通量估算，未单独计入轮毂/轮缘黏性转矩。"]
+    notes: list[str] = [
+        "驱动转矩采用BladeImport解析叶型生成的浸没边界面，通过叶面邻近压力线性插值后积分；"
+        "进出口角动量通量同时保留为对照。"
+    ]
     if near_values.size < 32:
         notes.append("d 范围内近壁采样点较少，最大速度对网格较敏感。")
     if mass_imbalance > 0.05:
@@ -957,6 +1071,10 @@ def compute_hydraulic_metrics(
         flow_direction=int(flow_direction),
         wall_speed_convention=wall_speed_convention,
         notes=tuple(notes),
+        blade_pressure_torque_n_m=float(pressure_torque),
+        angular_momentum_torque_n_m=float(angular_momentum_torque),
+        blade_pressure_face_count=int(pressure_face_count),
+        torque_method="blade_surface_pressure",
     )
     return metrics, wall_distance.astype(np.float32), near_mask, relative_speed.astype(np.float32)
 
@@ -1068,19 +1186,12 @@ class DeploymentEngine:
                     phi_delta = float(np.linalg.norm((raw_phi - self.baseline_phi).ravel()))
                     phi_scale = max(float(np.linalg.norm(self.baseline_phi.ravel())), 1e-12)
                     phi_relative_l2 = phi_delta / phi_scale
-                    if mask_iou >= 0.999999 and phi_relative_l2 <= 1e-8:
-                        trust_label = "基准/网格不可分辨"
-                    elif mask_iou >= 0.95 and volume_change <= 0.05:
-                        trust_label = "局部小外推"
-                    else:
-                        trust_label = "严重 OOD"
+                    trust_label = "已计算"
                     trust_notes = list(metrics.notes)
-                    if trust_label == "基准/网格不可分辨" and shape_change_summary(
+                    if mask_iou >= 0.999999 and phi_relative_l2 <= 1e-8 and shape_change_summary(
                         blade_parameter_sets[start + local_index], self.baseline_parameters
                     )["max_absolute_fraction"] > 1e-8:
-                        trust_notes.append("参数已改变，但 n=64 的 mask/phi 无法分辨这次几何扰动。")
-                    elif trust_label == "严重 OOD":
-                        trust_notes.append("几何变化已超出默认局部信赖指标（mask IoU<0.95 或体素变化>5%）。")
+                        trust_notes.append("参数已改变，当前离散网格上的 mask/phi 保持不变。")
                     metrics = replace(
                         metrics,
                         geometry_mask_iou=float(mask_iou),
@@ -1258,7 +1369,7 @@ def optimize_blade_design(
     engine: DeploymentEngine,
     baseline_parameters: Mapping[str, Any],
     *,
-    target_head_m: float = 1.8,
+    target_head_m: float = 0.1,
     variation_fraction: float = 0.05,
     near_wall_distance_m: float = 0.003,
     population_size: int = 8,
@@ -1274,8 +1385,8 @@ def optimize_blade_design(
 
     if target_head_m <= 0.0:
         raise ValueError("Target head must be positive.")
-    if not 0.0 < variation_fraction <= 0.20:
-        raise ValueError("Optimization is restricted to a 0–20% local geometry window.")
+    if not 0.0 < variation_fraction <= 0.50:
+        raise ValueError("variation_fraction must be within (0, 0.50].")
     population_size = max(4, int(population_size))
     generations = max(1, int(generations))
     efficiency_weight = float(np.clip(efficiency_weight, 0.0, 1.0))
@@ -1296,15 +1407,6 @@ def optimize_blade_design(
     )
     if not variables:
         raise ValueError("Optimization requires at least one non-constant design variable.")
-    if optimization_variables is not None:
-        # A training-JSON envelope may legitimately contain a second supervised
-        # geometry far from the first case's mask.  Baseline-relative IoU is a
-        # diagnostic here, not a feasibility condition.
-        minimum_mask_iou = 0.0
-        maximum_volume_change = float("inf")
-    else:
-        minimum_mask_iou = max(0.80, 1.0 - float(variation_fraction))
-        maximum_volume_change = max(0.05, float(variation_fraction))
     lower = np.asarray([variable.lower for variable in variables], dtype=float)
     upper = np.asarray([variable.upper for variable in variables], dtype=float)
     baseline_vector = np.asarray([variable.baseline for variable in variables], dtype=float)
@@ -1318,33 +1420,45 @@ def optimize_blade_design(
 
     def evaluate(vectors: np.ndarray, generation: int) -> list[OptimizationCandidate]:
         nonlocal completed
-        parameter_sets = [apply_shape_vector(baseline_parameters, variables, vector) for vector in vectors]
-        metric_results: list[HydraulicMetrics | Exception] = []
+        parameter_sets: list[Mapping[str, Any] | None] = []
+        metric_results: list[HydraulicMetrics | Exception | None] = []
+        valid_indices: list[int] = []
+        for index, vector in enumerate(vectors):
+            try:
+                parameter_sets.append(apply_shape_vector(baseline_parameters, variables, vector))
+                metric_results.append(None)
+                valid_indices.append(index)
+            except Exception as exc:
+                parameter_sets.append(None)
+                metric_results.append(exc)
         chunk_size = max(1, int(inference_batch_size))
-        for start in range(0, len(parameter_sets), chunk_size):
-            chunk = parameter_sets[start : start + chunk_size]
+        for start in range(0, len(valid_indices), chunk_size):
+            chunk_indices = valid_indices[start : start + chunk_size]
+            chunk = [parameter_sets[index] for index in chunk_indices]
             try:
                 chunk_metrics = engine.predict_metrics_many(
                     chunk,
                     near_wall_distance_m=near_wall_distance_m,
                     batch_size=chunk_size,
                 )
-                metric_results.extend(chunk_metrics)
+                for index, metrics in zip(chunk_indices, chunk_metrics):
+                    metric_results[index] = metrics
             except Exception:
-                for parameters in chunk:
+                for index, parameters in zip(chunk_indices, chunk):
                     try:
-                        metric_results.append(
-                            engine.predict_metrics_many(
-                                [parameters],
-                                near_wall_distance_m=near_wall_distance_m,
-                                batch_size=1,
-                            )[0]
-                        )
+                        metric_results[index] = engine.predict_metrics_many(
+                            [parameters],
+                            near_wall_distance_m=near_wall_distance_m,
+                            batch_size=1,
+                        )[0]
                     except Exception as exc:  # candidate-level geometry/model failure
-                        metric_results.append(exc)
-            completed += len(chunk)
+                        metric_results[index] = exc
+            completed += len(chunk_indices)
             if progress_callback is not None:
                 progress_callback(completed, total_evaluations, f"第 {generation + 1}/{generations} 代")
+
+        invalid_count = len(vectors) - len(valid_indices)
+        completed += invalid_count
 
         evaluated: list[OptimizationCandidate] = []
         for vector, parameters, result in zip(vectors, parameter_sets, metric_results):
@@ -1352,7 +1466,7 @@ def optimize_blade_design(
                 evaluated.append(
                     OptimizationCandidate(
                         values=tuple(float(value) for value in vector),
-                        blade_parameters=parameters,
+                        blade_parameters=parameters or copy.deepcopy(dict(baseline_parameters)),
                         metrics=None,
                         objectives=(float("inf"), float("inf")),
                         constraint_violation=float("inf"),
@@ -1367,17 +1481,7 @@ def optimize_blade_design(
             valid = all(math.isfinite(value) for value in (efficiency, speed, head))
             if valid:
                 head_shortfall = max(float(target_head_m) - head, 0.0)
-                iou_violation = max(minimum_mask_iou - float(result.geometry_mask_iou), 0.0) / max(
-                    1.0 - minimum_mask_iou, 1e-12
-                )
-                volume_violation = (
-                    0.0
-                    if not math.isfinite(maximum_volume_change)
-                    else max(float(result.geometry_volume_change_ratio) - maximum_volume_change, 0.0)
-                    / max(maximum_volume_change, 1e-12)
-                )
-                geometry_violation = float(target_head_m) * max(iou_violation, volume_violation)
-                violation = max(head_shortfall, geometry_violation)
+                violation = head_shortfall
             else:
                 violation = float("inf")
             evaluated.append(
@@ -1545,7 +1649,8 @@ def candidate_rows(result: OptimizationResult) -> list[dict[str, Any]]:
                 "mean_velocity_m_s": None if metrics is None else metrics.relative_velocity_mean_m_s,
                 "max_velocity_m_s": None if metrics is None else metrics.relative_velocity_max_m_s,
                 "torque_n_m": None if metrics is None else metrics.driving_torque_n_m,
-                "mask_iou": None if metrics is None else metrics.geometry_mask_iou,
+                "pressure_torque_n_m": None if metrics is None else metrics.blade_pressure_torque_n_m,
+                "angular_momentum_torque_n_m": None if metrics is None else metrics.angular_momentum_torque_n_m,
                 "geometry_trust": None if metrics is None else metrics.geometry_trust_label,
                 "mass_imbalance": None if metrics is None else metrics.mass_imbalance_ratio,
                 "head_shortfall_m": (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -246,35 +247,96 @@ def _interpolate_scattered_fields_to_targets(
     chunk_size: int = 250_000,
 ) -> dict[str, np.ndarray]:
     from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
-    from scipy.spatial import Delaunay
+    from scipy.spatial import Delaunay, QhullError
 
     points = np.asarray(points, dtype=np.float64)
-    if points.shape[0] < 4:
-        raise ValueError("Not enough CSV points inside the selected blade passage sector.")
+    if points.ndim != 2:
+        raise ValueError(f"Interpolation points must have shape [N, D], got {points.shape}.")
+    if not values:
+        raise ValueError("At least one scattered field is required for interpolation.")
+
+    field_arrays: dict[str, np.ndarray] = {}
+    finite_rows = np.all(np.isfinite(points), axis=1)
+    for name, field_values in values.items():
+        field_array = np.asarray(field_values, dtype=np.float64)
+        if field_array.ndim != 1 or field_array.shape[0] != points.shape[0]:
+            raise ValueError(
+                f"Scattered field {name!r} must have shape ({points.shape[0]},), got {field_array.shape}."
+            )
+        field_arrays[name] = field_array
+        finite_rows &= np.isfinite(field_array)
+
+    points = points[finite_rows]
+    field_arrays = {name: field_array[finite_rows] for name, field_array in field_arrays.items()}
+    min_points = points.shape[1] + 1
+    if points.shape[0] < min_points:
+        raise ValueError("Not enough finite CSV points inside the selected blade passage sector.")
+
+    # Wall and periodic-boundary exports commonly repeat coordinates. Collapse
+    # them before Qhull and average their values so triangulation stays stable.
+    unique_points, inverse, counts = np.unique(points, axis=0, return_inverse=True, return_counts=True)
+    if unique_points.shape[0] != points.shape[0]:
+        field_arrays = {
+            name: np.bincount(inverse, weights=field_array, minlength=unique_points.shape[0]) / counts
+            for name, field_array in field_arrays.items()
+        }
+        points = unique_points
+
+    affine_rank = int(np.linalg.matrix_rank(points - np.mean(points, axis=0, keepdims=True)))
+    if affine_rank < points.shape[1]:
+        raise ValueError(
+            "Scattered CSV points do not span the requested interpolation space: "
+            f"affine rank {affine_rank}, expected {points.shape[1]}."
+        )
+
     target_points = np.asarray(target_points, dtype=np.float64)
+    if target_points.ndim != 2 or target_points.shape[1] != points.shape[1]:
+        raise ValueError(
+            f"Target points must have shape [M, {points.shape[1]}], got {target_points.shape}."
+        )
 
     output_shape = tuple(int(item) for item in output_shape)
     if int(np.prod(output_shape)) != target_points.shape[0]:
         raise ValueError("output_shape must match the number of interpolation target points.")
 
-    tri = Delaunay(points)
+    # Qx performs exact pre-merges and avoids Qhull's wide-facet failure for
+    # large CFD clouds with thousands of coplanar wall points. QJ is retained
+    # as a last-resort topology joggle for exceptionally ill-conditioned data.
+    qhull_options = "Qbb Qc Qz Q12 Qx"
+    try:
+        tri = Delaunay(points, qhull_options=qhull_options)
+    except QhullError as exact_merge_error:
+        warnings.warn(
+            "Exact-merge Delaunay triangulation failed; retrying with Qhull input joggling. "
+            f"Original error: {str(exact_merge_error).splitlines()[0]}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        try:
+            tri = Delaunay(points, qhull_options="Qbb Qc Qz Q12 QJ")
+        except QhullError as joggle_error:
+            raise ValueError(
+                "Unable to triangulate the CFD point cloud after exact-merge and joggled Qhull attempts."
+            ) from joggle_error
+
+    field_names = tuple(field_arrays)
+    stacked_values = np.column_stack([field_arrays[name] for name in field_names])
+    linear = LinearNDInterpolator(tri, stacked_values, fill_value=np.nan)
+    nearest = NearestNDInterpolator(points, stacked_values)
+    out = np.empty((target_points.shape[0], len(field_names)), dtype=np.float32)
+
+    for start in range(0, target_points.shape[0], int(chunk_size)):
+        end = min(start + int(chunk_size), target_points.shape[0])
+        chunk = target_points[start:end]
+        interpolated = np.asarray(linear(chunk), dtype=np.float64)
+        missing_rows = ~np.all(np.isfinite(interpolated), axis=1)
+        if np.any(missing_rows):
+            interpolated[missing_rows] = nearest(chunk[missing_rows])
+        out[start:end] = interpolated.astype(np.float32)
+
     result: dict[str, np.ndarray] = {}
-    for name, field_values in values.items():
-        field_values = np.asarray(field_values, dtype=np.float64)
-        linear = LinearNDInterpolator(tri, field_values, fill_value=np.nan)
-        nearest = NearestNDInterpolator(points, field_values)
-        out = np.empty(target_points.shape[0], dtype=np.float32)
-
-        for start in range(0, target_points.shape[0], int(chunk_size)):
-            end = min(start + int(chunk_size), target_points.shape[0])
-            chunk = target_points[start:end]
-            interpolated = np.asarray(linear(chunk), dtype=np.float64)
-            missing = ~np.isfinite(interpolated)
-            if np.any(missing):
-                interpolated[missing] = nearest(chunk[missing])
-            out[start:end] = interpolated.astype(np.float32)
-
-        tensor_field = out.reshape(output_shape)
+    for field_index, name in enumerate(field_names):
+        tensor_field = out[:, field_index].reshape(output_shape)
         theta_dim = 1 if len(output_shape) == 3 else 0
         tensor_field = hard_project_theta_periodic(torch.from_numpy(tensor_field), theta_dim=theta_dim).numpy()
         result[name] = tensor_field.astype(np.float32, copy=False)
