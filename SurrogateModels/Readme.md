@@ -96,7 +96,7 @@ Added the "best_restored" mode into the main programme to extract the best epoch
 ### May 27th, 2026
 Updated a more fluent styled scaling methods in training logs (using the maximum loss of the first 5 epochs of training)
 
-### July 12th, 2026
+### July 12nd, 2026
 Updated a demo of NSGA-II blade parameter design based on the proposed PINO.
 
 This design result will be further used in experiments that directly compares the corrosion of blades with and without optimized shape.
@@ -104,3 +104,6 @@ This design result will be further used in experiments that directly compares th
 A rotor with optional interceptions for various blades (T91) will be immersed in a cylinder tank filled with LBE at 250℃ and rotate at 210rpm for the same timespan.
 
 Then EDS/WDS will be applied to measure the concentration and distribution of Pb/Bi in the steel, telling whether this optimization would be considered effective in real applications of LFRs.
+
+### July 13rd, 2026
+Fixed the issue that Qnull in `SurrogateModelingData.py` would likely to fail when too many quasi-coplanar points is dealing with during preprocessing.
