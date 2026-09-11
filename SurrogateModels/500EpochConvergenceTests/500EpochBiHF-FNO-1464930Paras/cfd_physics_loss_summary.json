@@ -1,0 +1,22 @@
+{
+  "loss_phys": 14.439618110656738,
+  "loss_c": 2.595384359359741,
+  "loss_r": 4.115567207336426,
+  "loss_theta": 3.2720420360565186,
+  "loss_z": 4.453939437866211,
+  "loss_qv": 0.0026842541992664337,
+  "loss_p_highpass": 4.288298077881336e-05,
+  "loss_p_highpass_ratio": 0.0005441131070256233,
+  "loss_p_highpass_penalty": 0.0005441131070256233,
+  "loss_bc_periodic": 0.0,
+  "loss_bc_blade": 1.399064064025879,
+  "scaled_res_c": 0.011753611266613007,
+  "scaled_res_r": 0.0053536416962742805,
+  "scaled_res_theta": 0.005204136483371258,
+  "scaled_res_z": 0.010273371823132038,
+  "scaled_res_momentum": 0.0069437166675925255,
+  "scaled_res_c_reference": NaN,
+  "q_hat_pred": 3.5507543087005615,
+  "q_hat_target": 3.6025640964508057,
+  "rhie_chow_strength": 0.3499999940395355
+}
