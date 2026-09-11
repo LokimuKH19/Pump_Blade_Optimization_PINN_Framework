@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
+from SurrogateModelingSplit import default_split_config, discover_case_folders, plan_dataset_split
 
 
 ROOT = Path(__file__).resolve().parent
@@ -157,11 +158,17 @@ def default_config() -> dict[str, Any]:
         if simulation_candidates
         else str((ROOT / "../BladeOptimizerLFR/CQ_20260514_115826_SIMULATION").resolve())
     )
+    reference_folders = [
+        ROOT.parent / "BladeOptimizerLFR" / name
+        for name in ("CQ_20260514_115826_SIMULATION", "CQ_20260519_160122_S01", "CQ_20260711_155234_S02")
+    ]
+    defaults = [str(folder) for folder in reference_folders if (folder / "blade_params.json").is_file()]
     return {
         "workflow_action": "train",
         "training_mode": "mixed",
         "checkpoint_to_load": None,
-        "simulation_folders": [default_sim],
+        "simulation_folders": defaults or [default_sim],
+        "split_config": default_split_config(),
         "cfd_csv_files": [],
         "output_root": "surrogate_formal",
         "rpm": -210.0,
@@ -234,7 +241,18 @@ def default_config() -> dict[str, Any]:
 
 def load_config(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+        overrides = json.load(handle)
+    config = default_config()
+
+    def merge(target: dict[str, Any], source: dict[str, Any]) -> None:
+        for key, value in source.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                merge(target[key], value)
+            else:
+                target[key] = value
+
+    merge(config, overrides)
+    return config
 
 
 def save_config(config: dict[str, Any], name: str | None = None) -> Path:
@@ -544,6 +562,69 @@ def render_simulation_picker(config: dict[str, Any]) -> None:
     config["cfd_csv_files"] = csv_files
 
 
+def preview_dataset_split(config: dict[str, Any]) -> dict[str, Any]:
+    settings = {**default_split_config(), **config.get("split_config", {})}
+    folders = discover_case_folders(config["simulation_folders"], recursive=settings["recursive"])
+    if config.get("cfd_csv_files") and len(config["cfd_csv_files"]) != len(folders):
+        raise ValueError("CSV 列表必须留空或与展开、去重后的案例目录一一对应。")
+    saved = None
+    if config["workflow_action"] == "deploy":
+        settings["mode"] = "all_train"
+    elif config["workflow_action"] == "resume_train":
+        request = config.get("checkpoint_to_load")
+        checkpoint = find_latest_checkpoint(ROOT / config["output_root"]) if request in {None, "latest"} else ROOT / request
+        if checkpoint is not None:
+            manifest_path = checkpoint.parent / "dataset_split.json"
+            if manifest_path.is_file():
+                saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return plan_dataset_split(folders, settings, saved_manifest=saved)
+
+
+def render_split_controls(config: dict[str, Any]) -> str | None:
+    st.subheader("训练 / 验证 / 测试划分")
+    settings = {**default_split_config(), **config.get("split_config", {})}
+    modes = {"ratio": "按比例自动划分", "manual": "手工指定目录", "manifest": "读取保存的划分", "all_train": "全部用于训练"}
+    settings["mode"] = st.selectbox(
+        "划分方式", list(modes), index=list(modes).index(settings["mode"]), format_func=modes.get,
+    )
+    settings["recursive"] = st.checkbox("递归扫描总目录中的全部 CFD 案例", value=bool(settings["recursive"]))
+    cols = st.columns(2)
+    settings["group_by"] = cols[0].selectbox(
+        "划分单位", ["blade", "folder"], index=["blade", "folder"].index(settings["group_by"]),
+        format_func=lambda key: {"blade": "按叶型分组（相同叶型留在同一集合）", "folder": "按案例目录分组"}[key],
+    )
+    settings["seed"] = int(cols[1].number_input("划分随机种子", min_value=0, value=int(settings["seed"]), step=1))
+    if settings["mode"] == "ratio":
+        ratios = st.columns(3)
+        for col, split, label in zip(ratios, ("train", "val", "test"), ("训练比例", "验证比例", "测试比例")):
+            settings[f"{split}_ratio"] = col.number_input(label, min_value=0.0, max_value=1.0, value=float(settings[f"{split}_ratio"]), step=0.05, format="%.2f")
+        st.caption("比例按分组数分配；每个正比例集合至少分得一组。3 个叶型的 80%/10%/10% 会分为 1/1/1；100 个不同叶型会分为 80/10/10。")
+    elif settings["mode"] == "manual":
+        for split, label in (("train", "训练目录"), ("val", "验证目录"), ("test", "测试目录")):
+            value = st.text_area(label, value="\n".join(settings[f"{split}_folders"]), height=90)
+            settings[f"{split}_folders"] = [line.strip() for line in value.splitlines() if line.strip()]
+        st.caption("每行一个目录，三组需完整覆盖上方案例列表。验证集和测试集可以留空。")
+    elif settings["mode"] == "manifest":
+        settings["manifest_path"] = st.text_input("dataset_split.json 路径", value=str(settings.get("manifest_path") or ""))
+    else:
+        st.caption("全部案例参与训练，保留最后一轮权重；不生成验证损失或测试指标。")
+    config["split_config"] = settings
+    st.caption("验证集每轮评估并用于保存最佳权重；测试集只在训练结束后评估，输出逐案例及平均指标。续训沿用 checkpoint 的划分清单。")
+    try:
+        manifest = preview_dataset_split(config)
+        preview_cols = st.columns(3)
+        for col, split, label in zip(preview_cols, ("train", "val", "test"), ("训练案例", "验证案例", "测试案例")):
+            col.metric(label, manifest["counts"][split])
+        st.dataframe([
+            {"集合": row["split"], "案例目录": row["folder"], "叶型组": row["group_id"][:12]}
+            for row in manifest["records"]
+        ], hide_index=True, width="stretch")
+        return None
+    except (ValueError, OSError, KeyError) as exc:
+        st.error(str(exc))
+        return str(exc)
+
+
 def render_physics_tab(config: dict[str, Any]) -> None:
     physics = config["physics_config"]
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -816,6 +897,7 @@ def main() -> None:
     tabs = st.tabs(["Cases", "Physics", "Model", "Training", "Post", "Launch"])
     with tabs[0]:
         render_simulation_picker(config)
+        split_error = render_split_controls(config)
     with tabs[1]:
         render_physics_tab(config)
     with tabs[2]:
@@ -836,7 +918,7 @@ def main() -> None:
                 st.session_state["last_config_path"] = str(path)
                 st.success(f"已保存: {path}")
         with col2:
-            if st.button("保存并启动", type="primary", use_container_width=True):
+            if st.button("保存并启动", type="primary", use_container_width=True, disabled=split_error is not None):
                 path = save_config(config, config_name)
                 pid, log_path = launch_run(path)
                 st.session_state["last_config_path"] = str(path)

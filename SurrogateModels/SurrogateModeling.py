@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ from torch.utils.data import DataLoader, Dataset
 import NeuralOperators
 from BladeImport import build_blade_boundary
 from SurrogateModelingConfig import FlowCaseConfig
+from SurrogateModelingSplit import default_split_config, discover_case_folders, plan_dataset_split
 from SurrogateModelingData import (
     find_unique_simulation_csv,
     make_pure_physics_debug_case,
@@ -1674,6 +1676,7 @@ class SurrogateModeling:
         train_cases: Sequence[Mapping[str, Any]],
         val_cases: Sequence[Mapping[str, Any]] | None = None,
         *,
+        test_cases: Sequence[Mapping[str, Any]] | None = None,
         input_mode: str = "both",
         batch_size: int = 2,
         lr: float = 1e-3,
@@ -1743,6 +1746,10 @@ class SurrogateModeling:
             input_mode=input_mode,
             pressure_reference=self.pressure_data_reference,
         )
+        # Test geometry/tensors are built only for the final evaluation.
+        self.test_cases = list(test_cases or [])
+        self.dataset_split: dict[str, Any] | None = None
+        self.best_epoch: int | None = None
 
         self.train_loader = DataLoader(self.train_dataset, batch_size=batch_size, shuffle=True)
         self.val_loader = DataLoader(self.val_dataset, batch_size=batch_size, shuffle=False)
@@ -2744,6 +2751,7 @@ class SurrogateModeling:
                 "start_epoch": int(start_epoch),
                 "best_epoch": best_epoch,
                 "best_val_loss_total": best_metric if np.isfinite(best_metric) else None,
+                "selection_metric": "val_loss_total" if len(self.val_dataset) else "last_epoch",
                 "restored_best_state": reason in {"completed_best_state", "keyboard_interrupt_best_state"},
                 **dict(checkpoint_metadata or {}),
             }
@@ -2760,7 +2768,7 @@ class SurrogateModeling:
             for local_epoch in range(int(epochs)):
                 epoch = int(start_epoch) + local_epoch
                 train_log = self.run_epoch(self.train_loader, epoch, True)
-                val_log = self.run_epoch(self.val_loader, epoch, False)
+                val_log = self.run_epoch(self.val_loader, epoch, False) if len(self.val_dataset) else {}
                 if epoch < 5:
                     candidate_reference = self._display_residual_reference_from_log(train_log)
                     if candidate_reference is not None:
@@ -2771,7 +2779,8 @@ class SurrogateModeling:
                         )
                 if residual_reference is not None:
                     self._add_display_scaled_logs(train_log, residual_reference)
-                    self._add_display_scaled_logs(val_log, residual_reference)
+                    if val_log:
+                        self._add_display_scaled_logs(val_log, residual_reference)
 
                 record: dict[str, float] = {}
                 for key, value in train_log.items():
@@ -2798,7 +2807,7 @@ class SurrogateModeling:
                         f"train_ibm_eps={train_log['ibm_epsilon']:.6g} | "
                         f"train_bc_periodic={train_log['loss_bc_periodic']:.6e} | "
                         f"train_bc_blade={train_log['loss_bc_blade']:.6e} | "
-                        f"val_total={val_log['loss_total']:.6e} | "
+                        f"val_total={val_log.get('loss_total', float('nan')):.6e} | "
                         f"val_scaled_loss_c={val_log.get('scaled_loss_c', float('nan')):.6e} | "
                         f"val_scaled_res_c={val_log.get('scaled_residual_c', float('nan')):.6e} | "
                         f"val_scaled_res_mom={val_log.get('scaled_residual_momentum', float('nan')):.6e} | "
@@ -2818,12 +2827,37 @@ class SurrogateModeling:
             raise
 
         restore_best()
+        self.best_epoch = best_epoch
         if best_epoch is not None:
             print(f"Restored best state from epoch {best_epoch} with val_loss_total={best_metric:.6e}.")
+        else:
+            print("未配置验证集：保留最后一轮权重。")
         save_progress("completed_best_state")
 
         return history
 
+
+    def evaluate_test_cases(self, *, epoch: int = 0) -> dict[str, Any]:
+        """Evaluate held-out cases once, without weight updates or model selection."""
+        if not self.test_cases:
+            return {"status": "not_configured", "case_count": 0, "metrics": {}, "cases": []}
+        rows = []
+        totals: dict[str, float] = {}
+        for case in self.test_cases:
+            dataset = BladeFlowDataset(
+                [case], input_mode=self.train_dataset.input_mode,
+                pressure_reference=self.pressure_data_reference,
+            )
+            metrics = self.run_epoch(DataLoader(dataset, batch_size=1, shuffle=False), epoch, False)
+            rows.append({"case": case_summary(case), "metrics": metrics})
+            for key, value in metrics.items():
+                totals[key] = totals.get(key, 0.0) + value
+        return {
+            "status": "evaluated", "case_count": len(rows),
+            "evaluation_epoch": epoch + 1,
+            "metrics": {key: value / len(rows) for key, value in totals.items()},
+            "cases": rows,
+        }
 
     def configure_training_schedule(
         self,
@@ -3066,6 +3100,8 @@ class SurrogateModeling:
             "ibm_config": self.ibm_config,
             "train_case_summaries": [case_summary(case) for case in self.train_dataset.cases],
             "val_case_summaries": [case_summary(case) for case in self.val_dataset.cases],
+            "test_case_summaries": [case_summary(case) for case in self.test_cases],
+            "dataset_split": self.dataset_split,
             "history": list(history) if history is not None else None,
             "extra_metadata": dict(extra_metadata or {}),
         }
@@ -3129,6 +3165,8 @@ class SurrogateModeling:
         path: str | Path,
         cases: Sequence[Mapping[str, Any]] | Mapping[str, Any],
         *,
+        val_cases: Sequence[Mapping[str, Any]] | None = None,
+        test_cases: Sequence[Mapping[str, Any]] | None = None,
         device: str = "cuda",
         batch_size: int = 1,
         load_optimizer: bool = False,
@@ -3229,7 +3267,8 @@ class SurrogateModeling:
 
         trainer = cls(
             train_cases=case_list,
-            val_cases=case_list,
+            val_cases=val_cases if val_cases is not None else case_list,
+            test_cases=test_cases,
             input_mode=input_mode,
             batch_size=batch_size,
             lr=float(trainer_config.get("lr", 1e-3)),
@@ -3520,6 +3559,24 @@ if __name__ == "__main__":
         Path("../BladeOptimizerLFR/CQ_20260711_155234_S02"),
         # 后续多叶片数据集继续追加同构文件夹：UI中需要允许用户添加
     ]
+    # 训练 / 验证 / 测试划分入口（按完整 CFD 案例，不拆空间网格点）。
+    # ratio: 自动划分；manual: 填写下方三组目录；manifest: 复用清单；all_train: 全部训练。
+    # blade 将相同叶型 JSON 的不同工况/复制目录放在同一组；folder 按案例目录分组。
+    # 小样本时，每个正比例集合至少分得一组；3 个叶型默认得到 1/1/1。
+    split_config = {
+        **default_split_config(),
+        "mode": "ratio",
+        "train_ratio": 0.80,
+        "val_ratio": 0.10,
+        "test_ratio": 0.10,
+        "seed": 42,
+        "group_by": "blade",
+        "recursive": False,  # True: simulation_folders 可填总目录，扫描所有子案例。
+        "train_folders": [],
+        "val_folders": [],
+        "test_folders": [],
+        "manifest_path": None,  # 某次运行输出的 dataset_split.json。
+    }
 
     # ============================================================
     # 1. 物理定义
@@ -3613,22 +3670,16 @@ if __name__ == "__main__":
         update_mapping_in_place(data_config, main_config_override.get("data_config"))
         update_mapping_in_place(model_config, main_config_override.get("model_config"))
         update_mapping_in_place(training_config, main_config_override.get("training_config"))
+        update_mapping_in_place(split_config, main_config_override.get("split_config"))
     else:
         cfd_csv_files = []
     if WORKFLOW_ACTION not in {"train", "resume_train", "deploy"}:
         raise ValueError("WORKFLOW_ACTION must be 'train', 'resume_train', or 'deploy'.")
     if TRAINING_MODE not in mode_presets:
         raise ValueError(f"Unknown TRAINING_MODE={TRAINING_MODE!r}; choose from {sorted(mode_presets)}.")
-    resolved_simulation_folders: list[Path] = []
-    for folder in simulation_folders:
-        blade_params = find_first_blade_params(folder)
-        if blade_params is None:
-            resolved_simulation_folders.append(Path(folder))
-        else:
-            resolved_simulation_folders.append(blade_params.parent)
-            if blade_params.parent != Path(folder):
-                print(f"在检查文件夹中找到 blade_params.json: {blade_params}")
-    simulation_folders = resolved_simulation_folders
+    simulation_folders = discover_case_folders(simulation_folders, recursive=bool(split_config["recursive"]))
+    if cfd_csv_files and len(cfd_csv_files) != len(simulation_folders):
+        raise ValueError("CFD CSV 列表必须留空或与展开、去重后的案例目录一一对应。")
     training_config.update(mode_presets[TRAINING_MODE])
     if (
         model_config["pressure_supervision_mode"] == "value"
@@ -3675,7 +3726,21 @@ if __name__ == "__main__":
                 "pressure_smoothing",
             ):
                 naming_model_config[key] = model_config[key]
+    # 部署只使用输入案例；训练/续训按同一个划分入口，续训优先恢复 checkpoint 内的清单。
+    resume_split = None
+    if WORKFLOW_ACTION == "resume_train" and checkpoint_to_load is not None:
+        resume_split = checkpoint_payload_for_name.get("dataset_split")
+    dataset_split = plan_dataset_split(
+        simulation_folders,
+        {**split_config, "mode": "all_train"} if WORKFLOW_ACTION == "deploy" else split_config,
+        saved_manifest=resume_split,
+    )
+    split_signature = hashlib.sha256(
+        json.dumps(dataset_split, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:10]
     run_suffix = simulation_folders[0].name if len(simulation_folders) == 1 else f"{len(simulation_folders)}cases"
+    if WORKFLOW_ACTION != "deploy":
+        run_suffix += f"_split-{split_signature}"
     run_name = build_formal_run_name(
         action=WORKFLOW_ACTION,
         training_mode=TRAINING_MODE,
@@ -3694,6 +3759,14 @@ if __name__ == "__main__":
     ):
         if is_checkpoint_readable(checkpoint_path):
             checkpoint_to_load = checkpoint_path
+
+    split_path = save_dir / "dataset_split.json"
+    split_path.write_text(json.dumps(dataset_split, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"数据划分已保存到: {split_path}")
+    print(f"训练 / 验证 / 测试案例数: {dataset_split['counts']}")
+    if "--split-only" in sys.argv:
+        # 只读取叶型 JSON、生成清单；适合大量 CFD 导入前检查分组。
+        raise SystemExit(0)
 
     print(f"\n========== Surrogate formal workflow: {WORKFLOW_ACTION} / {TRAINING_MODE} ==========")
     print(f"输出目录: {save_dir}")
@@ -3727,18 +3800,18 @@ if __name__ == "__main__":
     # ============================================================
     if TRAINING_MODE == "physics_only" and not cfd_csv_files:
         blade_param_files = [folder / "blade_params.json" for folder in simulation_folders]
-        train_cases = make_pure_physics_debug_cases(
+        all_cases = make_pure_physics_debug_cases(
             blade_params=blade_param_files,
             n=data_config["n"],
             **physics_config,
         )
     else:
-        train_cases = []
+        all_cases = []
         for index, folder in enumerate(simulation_folders):
             csv_path = None
             if cfd_csv_files:
-                csv_path = cfd_csv_files[index] if index < len(cfd_csv_files) else cfd_csv_files[-1]
-            train_cases.append(
+                csv_path = cfd_csv_files[index]
+            all_cases.append(
                 make_supervised_simulation_case(
                     folder,
                     n=data_config["n"],
@@ -3748,7 +3821,16 @@ if __name__ == "__main__":
                     **physics_config,
                 )
             )
-    val_cases = train_cases
+    case_partitions = {name: [] for name in ("train", "val", "test")}
+    cases_by_folder = {str(folder): case for folder, case in zip(simulation_folders, all_cases)}
+    for record in dataset_split["records"]:
+        case = cases_by_folder[record["folder"]]
+        record["simulation_csv"] = case.get("simulation_csv")
+        case_partitions[record["split"]].append(case)
+    train_cases = case_partitions["train"]
+    val_cases = case_partitions["val"]
+    test_cases = case_partitions["test"]
+    split_path.write_text(json.dumps(dataset_split, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     has_cfd_targets = all(_pick(train_cases[0], name) is not None for name in ["UR", "UT", "UZ", "P"])
 
     first_config = FlowCaseConfig.from_mapping(train_cases[0])
@@ -3765,6 +3847,12 @@ if __name__ == "__main__":
         "training_config": training_config,
         "post_config": post_config,
         "case_summaries": [case_summary(case) for case in train_cases],
+        "split_config": split_config,
+        "dataset_split_path": str(split_path),
+        "dataset_split": dataset_split,
+        "train_case_summaries": [case_summary(case) for case in train_cases],
+        "val_case_summaries": [case_summary(case) for case in val_cases],
+        "test_case_summaries": [case_summary(case) for case in test_cases],
     }
     summary_path = save_dir / "run_config_summary.json"
     summary_path.write_text(json.dumps(run_summary, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
@@ -3778,6 +3866,8 @@ if __name__ == "__main__":
         trainer = SurrogateModeling.from_checkpoint(
             checkpoint_to_load,
             train_cases,
+            val_cases=val_cases,
+            test_cases=test_cases,
             device=training_config["device"],
             batch_size=training_config["batch_size"],
             load_optimizer=WORKFLOW_ACTION == "resume_train",
@@ -3830,6 +3920,7 @@ if __name__ == "__main__":
         trainer = SurrogateModeling(
             train_cases=train_cases,
             val_cases=val_cases,
+            test_cases=test_cases,
             input_mode=model_config["input_mode"],
             batch_size=training_config["batch_size"],
             lr=training_config["lr"],
@@ -3872,6 +3963,8 @@ if __name__ == "__main__":
             device=training_config["device"],
         )
 
+    trainer.dataset_split = dataset_split
+
     # ============================================================
     # 7. 训练或续训
     # ============================================================
@@ -3912,6 +4005,15 @@ if __name__ == "__main__":
         )
     else:
         print("部署模式：已跳过训练，仅执行后处理。")
+
+    # 测试集只在训练完成、最佳验证权重恢复后评估，不参与每轮选权重。
+    if WORKFLOW_ACTION in {"train", "resume_train"}:
+        evaluation_epoch = max((trainer.best_epoch or len(history)) - 1, 0)
+        test_result = trainer.evaluate_test_cases(epoch=evaluation_epoch)
+        test_result["dataset_split_path"] = str(split_path)
+        test_path = save_dir / "test_metrics.json"
+        test_path.write_text(json.dumps(test_result, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        print(f"测试集评估已保存到: {test_path}")
 
     # ============================================================
     # 8. CFD、预测和误差诊断
