@@ -4,6 +4,8 @@ This section summarizes five 500-epoch mixed-training experiments under the same
 
 This result is generated at `rho=10650, mu=0.006` for comparison only. (In formal cases we used `mu=0.0016`)
 
+Note that in the paper the HF versions are configured in those filefolders with "Bi", where the band branches are applied at 2 directions.(The followings are only 1, however, no significant changes are observed between 1d and 2d band branches)
+
 ### 1. Experimental Setup
 
 | Experiment | Actual Operator | Modes | High Modes | Width | Depth | Real-Valued Parameter Equivalent | Notes |
